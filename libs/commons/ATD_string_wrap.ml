@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* This module is here to help using the 'string wrap <ocaml module=Xxx>'
  * feature of atdgen.
  * See https://atd.readthedocs.io/en/stable/atdgen-reference.html#using-a-custom-wrapper
@@ -6,21 +18,23 @@
 open Common
 
 module Fpath = struct
-  type t = Fpath.t [@@deriving show]
+  type t = Fpath.t [@@deriving eq, ord, show]
 
   let unwrap = Fpath.to_string
   let wrap = Fpath.v
+  let to_yojson = Fpath_.to_yojson
+  let of_yojson = Fpath_.of_yojson
 end
 
 module Uri = struct
-  type t = Uri.t [@@deriving show]
+  type t = Uri.t [@@deriving eq, ord, show]
 
   let unwrap = Uri.to_string
   let wrap = Uri.of_string
 end
 
 module Uuidm = struct
-  type t = Uuidm.t [@@deriving show]
+  type t = Uuidm.t [@@deriving eq, ord, show]
 
   let unwrap = Uuidm.to_string
 
@@ -31,70 +45,44 @@ module Uuidm = struct
 end
 
 module Sha1 = struct
-  type t = Digestif.SHA1.t
+  type t = Digestif.SHA1.t [@@deriving eq, show]
+
+  let compare a b =
+    String.compare
+      (Digestif.SHA1.to_raw_string a)
+      (Digestif.SHA1.to_raw_string b)
 
   let unwrap = Digestif.SHA1.to_hex
   let wrap = Digestif.SHA1.of_hex
 end
 
 module Sha256 = struct
-  type t = Digestif.SHA256.t
+  type t = Digestif.SHA256.t [@@deriving eq, show]
+
+  let compare a b =
+    String.compare
+      (Digestif.SHA256.to_raw_string a)
+      (Digestif.SHA256.to_raw_string b)
 
   let unwrap = Digestif.SHA256.to_hex
   let wrap = Digestif.SHA256.of_hex
 end
 
 module Datetime = struct
-  type t = Unix.tm
+  type t = Timedesc.Timestamp.t [@@deriving eq, ord]
 
-  let unwrap (tm : Unix.tm) : string =
-    Common.spf "%04d-%02d-%02dT%02d:%02d:%02d+00:00" (1900 + tm.tm_year)
-      (1 + tm.tm_mon) tm.tm_mday tm.tm_hour tm.tm_min tm.tm_sec
+  let unwrap tm : string = Timedesc.Timestamp.to_rfc3339 tm
 
-  let wrap s : Unix.tm =
-    (* TODO? should the end always be +00:00 given we generate GMT/UTC time?
-     * Should we enforce it in the regexp?
-     *)
-    if
-      s
-      =~ "^\\([0-9]+\\)-\\([0-9]+\\)-\\([0-9]+\\)T\\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\)[-+][0-9]+:[0-9]+$"
-    then (
-      let year, mon, day, hour, min, sec = Common.matched6 s in
-      (* mostly the inverse of unwrap above *)
-      let tm =
-        Unix.
-          {
-            tm_year = int_of_string year - 1900;
-            tm_mon = int_of_string mon - 1;
-            tm_mday = int_of_string day;
-            tm_hour = int_of_string hour;
-            tm_min = int_of_string min;
-            tm_sec = int_of_string sec;
-            tm_wday = 0;
-            tm_yday = 0;
-            tm_isdst = false;
-          }
-      in
-      (* normalize *)
-      (* ugly, but this is suggested in Unix.mli to get the inverse
-       * of the gmtime function.
-       *)
-      let before = USys.getenv_opt "TZ" in
-      UUnix.putenv "TZ" "UTC";
-      let _s, tm = Unix.mktime tm in
-      (match before with
-      | None ->
-          (* argh, no unsetenv,
-           * see https://discuss.ocaml.org/t/unset-environment-variable/9025/4
-           *)
-          UUnix.putenv "TZ" ""
-      | Some old -> UUnix.putenv "TZ" old);
-      tm)
-    else failwith (spf "wrong datetime format: %s" s)
+  let wrap s =
+    (* Note that RFC 3339 is a subset of ISO 8601, so this does align with
+     * unwrap. *)
+    match Timedesc.Timestamp.of_iso8601 s with
+    | Ok dt -> dt
+    | Error s -> failwith (spf "wrong datetime format: %s" s)
 
   let () =
-    Alcotest_ext.test "Datetime" (fun () ->
-        let now = Unix.gmtime (UUnix.gettimeofday ()) in
+    Testo.test "ATD_string_wrap.Datetime" (fun () ->
+        let now = Timedesc.Timestamp.now () in
         let s : string = unwrap now in
         let now' = wrap s in
         if not (now =*= now') then

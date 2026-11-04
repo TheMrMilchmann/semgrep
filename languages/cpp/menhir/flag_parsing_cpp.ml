@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (*****************************************************************************)
 (* types *)
 (*****************************************************************************)
@@ -28,7 +40,6 @@ let cmdline_flags_macrofile () =
 (* verbose *)
 (*****************************************************************************)
 
-let verbose_pp_ast = ref false
 let filter_msg = ref false
 let filter_classic_passed = ref false
 let filter_define_error = ref true
@@ -37,10 +48,12 @@ let filter_define_error = ref true
 (* debugging *)
 (*****************************************************************************)
 
+(* TODO: switch to Log_parser_cpp, or design new Log srcs for each of those
+ * category
+ *)
 let debug_typedef = ref true
 let debug_pp = ref true
 let debug_cplusplus = ref true
-let debug_pp_ast = ref false
 
 let cmdline_flags_debugging () =
   [
@@ -55,11 +68,3 @@ let cmdline_flags_debugging () =
           debug_cplusplus := true),
       " " );
   ]
-
-(*****************************************************************************)
-(* Disable parsing features *)
-(*****************************************************************************)
-
-let strict_lexer = ref false
-let if0_passing = ref true
-let ifdef_to_if = ref false

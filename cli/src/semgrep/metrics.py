@@ -1,15 +1,25 @@
-import functools
+#
+# Copyright (c) 2021-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import hashlib
 import json
 import os
+import platform
 import uuid
 from collections import defaultdict
 from datetime import datetime
 from enum import auto
 from enum import Enum
-from pathlib import Path
 from typing import Any
-from typing import Callable
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -19,16 +29,21 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import click
+import opentelemetry
 import requests
 from attr import define
 from attr import Factory
+from opentelemetry.util.types import Attributes
 from typing_extensions import LiteralString
 
 import semgrep.semgrep_interfaces.semgrep_metrics as met
 import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 from semgrep import __VERSION__
+from semgrep.constants import USER_FRIENDLY_PRODUCT_NAMES
 from semgrep.error import error_type_string
 from semgrep.error import SemgrepError
+from semgrep.mcp.models import SemgrepScanResult
+from semgrep.mcp.models import WhoamiResult
 from semgrep.parsing_data import ParsingData
 from semgrep.profile_manager import ProfileManager
 from semgrep.rule import Rule
@@ -40,21 +55,27 @@ from semgrep.semgrep_interfaces.semgrep_metrics import Environment
 from semgrep.semgrep_interfaces.semgrep_metrics import Errors
 from semgrep.semgrep_interfaces.semgrep_metrics import Extension
 from semgrep.semgrep_interfaces.semgrep_metrics import FileStats
+from semgrep.semgrep_interfaces.semgrep_metrics import Finding
+from semgrep.semgrep_interfaces.semgrep_metrics import Guardian
+from semgrep.semgrep_interfaces.semgrep_metrics import InstallPro
 from semgrep.semgrep_interfaces.semgrep_metrics import Interfile
 from semgrep.semgrep_interfaces.semgrep_metrics import Interprocedural
 from semgrep.semgrep_interfaces.semgrep_metrics import Intraprocedural
-from semgrep.semgrep_interfaces.semgrep_metrics import Misc
+from semgrep.semgrep_interfaces.semgrep_metrics import Mcp
 from semgrep.semgrep_interfaces.semgrep_metrics import ParseStat
 from semgrep.semgrep_interfaces.semgrep_metrics import Payload
 from semgrep.semgrep_interfaces.semgrep_metrics import Performance
-from semgrep.semgrep_interfaces.semgrep_metrics import ProFeatures
 from semgrep.semgrep_interfaces.semgrep_metrics import RuleStats
 from semgrep.semgrep_interfaces.semgrep_metrics import SecretsConfig
 from semgrep.semgrep_interfaces.semgrep_metrics import SupplyChainConfig
+from semgrep.semgrep_interfaces.semgrep_metrics import Value
 from semgrep.semgrep_types import get_frozen_id
 from semgrep.types import FilteredMatches
+from semgrep.types import TargetInfo
+from semgrep.util import is_truthy
 from semgrep.verbose_logging import getLogger
 
+# Used below but can't be imported normally due to a circular dependency
 if TYPE_CHECKING:
     from semgrep.engine import EngineType
 
@@ -77,6 +98,35 @@ class MetricsState(Enum):
     AUTO = auto()
 
 
+class MetricsStateType(click.ParamType):
+    name = "metrics_state"
+
+    def get_metavar(self, param: click.Parameter, ctx: click.Context) -> str:
+        return "[auto|on|off]"
+
+    def convert(
+        self,
+        value: Any,
+        _param: Optional["click.Parameter"],
+        ctx: Optional["click.Context"],
+    ) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            lower = value.lower()
+            if lower == "auto":
+                return MetricsState.AUTO
+            # Support setting via old environment variable values 0/1/true/false
+            if is_truthy(value):
+                return MetricsState.ON
+            if lower == "off" or lower == "0" or lower == "false":
+                return MetricsState.OFF
+        self.fail("expected 'auto', 'on', or 'off'")
+
+
+METRICS_STATE_TYPE = MetricsStateType()
+
+
 class MetricsJsonEncoder(json.JSONEncoder):
     def default(self, obj: Any) -> Any:
         if isinstance(obj, datetime):
@@ -91,16 +141,23 @@ class MetricsJsonEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def suppress_errors(func: Callable[..., None]) -> Callable[..., None]:
-    @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            logger.debug(f"Error in {func.__name__}: {e}")
-            return None
+def get_install_method(package_path: Optional[str] = None) -> str:
+    """
+    Heuristically determine how the Semgrep CLI was installed:
+    "docker" | "homebrew" | "pip" | "unknown".
 
-    return wrapper
+    Docker is checked first since our docker image installs semgrep via pip
+    inside the container. Homebrew is checked before pip since the homebrew
+    formula vendors a site-packages directory under its Cellar.
+    """
+    if "SEMGREP_IN_DOCKER" in os.environ:
+        return "docker"
+    path = package_path if package_path is not None else __file__
+    if "Cellar" in path or "homebrew" in path or "linuxbrew" in path:
+        return "homebrew"
+    if "site-packages" in path or "dist-packages" in path:
+        return "pip"
+    return "unknown"
 
 
 # to be mocked to a constant function in test_metrics.py
@@ -134,11 +191,16 @@ class Metrics:
                 projectHash=None,
                 ci=None,
                 isDiffScan=False,
+                os=platform.system(),
+                isTranspiledJS=False,
             ),
             errors=Errors(),
             performance=Performance(maxMemoryBytes=None),
             extension=Extension(),
-            value=Misc(features=[]),
+            mcp=Mcp(),
+            guardian=Guardian(),
+            install_pro=InstallPro(),
+            value=Value(features=[]),
             started_at=Datetime(datetime.now().astimezone().isoformat()),
             event_id=met.Uuid(str(get_frozen_id())),
             anonymous_user_id="",
@@ -146,24 +208,43 @@ class Metrics:
             sent_at=Datetime(""),
         )
     )
+    # So we can easily add metrics we record to the trace too!
+    top_level_span: opentelemetry.trace.Span | None = None
 
     def __attrs_post_init__(self) -> None:
         self.payload.environment.ci = os.getenv("CI")
+        self.payload.environment.installMethod = get_install_method()
+
+    def log_exception(self, func_name: str, e: Exception) -> None:
+        """Log an exception at the debug level
+
+        The add_* methods should not raise exceptions.
+        We used to have a @suppress_errors wrapper for automatically catching
+        exceptions but it was preventing type checking by mypy
+        so we got rid of it."""
+        logger.debug(f"Error in Metrics.{func_name}: {e}")
 
     def configure(
         self,
         metrics_state: Optional[MetricsState],
+        top_level_span: opentelemetry.trace.Span | None = None,
     ) -> None:
         """
         Configures whether to always, never, or automatically send metrics (based on whether config
         is pulled from the server).
 
         :param metrics_state: The value of the --metrics option
+        :param top_level_span: The top-level OpenTelemetry span for the current scan
         :raises click.BadParameter: if both --metrics and --enable-metrics/--disable-metrics are passed
         and their values are different
         """
 
         self.metrics_state = metrics_state or MetricsState.AUTO
+        self.top_level_span = top_level_span
+
+    def add_to_top_level_span(self, attributes: Attributes) -> None:
+        if self.top_level_span is not None and attributes is not None:
+            self.top_level_span.set_attributes(attributes)
 
     # TODO(cooper): It would really be best if EngineType included all of the
     # information here, but I am a bit concerned about changing it, since it is
@@ -173,7 +254,6 @@ class Metrics:
     # care about the additional information being bundeled for metrics, we'll
     # just take some additional parameters here. Currently this is just for
     # secrets, but the same would apply for (supply chain)-related information.
-    @suppress_errors
     def add_engine_config(
         self,
         engineType: "EngineType",
@@ -181,40 +261,45 @@ class Metrics:
         secrets: Optional[SecretsConfig],
         supply_chain: Optional[SupplyChainConfig],
     ) -> None:
+        # Needs to be imported with narrow scope due to a circular dependency if
+        # it is imported at the top level.
+        from semgrep.engine import EngineType
+
         """
         Assumes configs is list of arguments passed to semgrep using --config
         """
-        self.payload.value.engineRequested = engineType.name
-        analysis_type = {
-            EngineType.OSS: AnalysisType(Intraprocedural()),
-            EngineType.PRO_LANG: AnalysisType(Intraprocedural()),
-            EngineType.PRO_INTRAFILE: AnalysisType(Interprocedural()),
-            EngineType.PRO_INTERFILE: AnalysisType(Interfile()),
-        }.get(engineType, AnalysisType(Intraprocedural()))
-        self.payload.value.engineConfig = EngineConfig(
-            analysis_type=analysis_type,
-            code_config=code,
-            secrets_config=secrets,
-            supply_chain_config=supply_chain,
-            pro_langs=True,
-        )
+        try:
+            self.payload.value.engineRequested = engineType.name
+            analysis_type = {
+                EngineType.OSS: AnalysisType(Intraprocedural()),
+                EngineType.PRO_LANG: AnalysisType(Intraprocedural()),
+                EngineType.PRO_INTRAFILE: AnalysisType(Interprocedural()),
+                EngineType.PRO_INTERFILE: AnalysisType(Interfile()),
+            }.get(engineType, AnalysisType(Intraprocedural()))
+            self.payload.value.engineConfig = EngineConfig(
+                analysis_type=analysis_type,
+                code_config=code,
+                secrets_config=secrets,
+                supply_chain_config=supply_chain,
+                pro_langs=True,
+            )
+        except Exception as e:
+            self.log_exception("add_engine_config", e)
 
-    @suppress_errors
-    def add_interfile_languages_used(self, used_langs: List[str]) -> None:
+    def add_interfile_languages_used(self, used_langs: Optional[List[str]]) -> None:
         """
         Assumes configs is list of arguments passed to semgrep using --config
         """
-        self.payload.value.interfileLanguagesUsed = used_langs
+        try:
+            self.payload.value.interfileLanguagesUsed = used_langs or []
+        except Exception as e:
+            self.log_exception("add_interfile_languages_used", e)
 
-    @suppress_errors
-    def add_diff_depth(self, diff_depth: int) -> None:
-        if not self.payload.value.proFeatures:
-            self.payload.value.proFeatures = ProFeatures()
-        self.payload.value.proFeatures.diffDepth = diff_depth
-
-    @suppress_errors
     def add_is_diff_scan(self, is_diff_scan: bool) -> None:
-        self.payload.environment.isDiffScan = is_diff_scan
+        try:
+            self.payload.environment.isDiffScan = is_diff_scan
+        except Exception as e:
+            self.log_exception("add_is_diff_scan", e)
 
     @property
     def is_using_registry(self) -> bool:
@@ -222,189 +307,289 @@ class Metrics:
 
     @is_using_registry.setter
     def is_using_registry(self, value: bool) -> None:
-        self._is_using_registry = value
+        try:
+            self._is_using_registry = value
+        except Exception as e:
+            self.log_exception("is_using_registry", e)
 
-    @suppress_errors
     def add_project_url(self, project_url: Optional[str]) -> None:
         """
         Standardizes url then hashes
         """
-        if project_url is None:
-            self.payload.environment.projectHash = None
-            return
-
         try:
-            parsed_url = urlparse(project_url)
-            if parsed_url.scheme == "https":
-                # Remove optional username/password from project_url
-                sanitized_url = f"{parsed_url.hostname}{parsed_url.path}"
-            else:
-                # For now don't do anything special with other git-url formats
+            if project_url is None:
+                self.payload.environment.projectHash = None
+                return
+
+            try:
+                parsed_url = urlparse(project_url)
+                if parsed_url.scheme == "https":
+                    # Remove optional username/password from project_url
+                    sanitized_url = f"{parsed_url.hostname}{parsed_url.path}"
+                else:
+                    # For now don't do anything special with other git-url formats
+                    sanitized_url = project_url
+            except ValueError:
+                logger.debug(f"Failed to parse url {project_url}")
                 sanitized_url = project_url
-        except ValueError:
-            logger.debug(f"Failed to parse url {project_url}")
-            sanitized_url = project_url
 
-        m = hashlib.sha256(sanitized_url.encode())
-        self.payload.environment.projectHash = met.Sha256(m.hexdigest())
+            m = hashlib.sha256(sanitized_url.encode())
+            self.payload.environment.projectHash = met.Sha256(m.hexdigest())
+        except Exception as e:
+            self.log_exception("add_project_url", e)
 
-    @suppress_errors
     def add_configs(self, configs: Sequence[str]) -> None:
         """
         Assumes configs is list of arguments passed to semgrep using --config
         """
-        m = hashlib.sha256()
-        for c in configs:
-            m.update(c.encode())
-        self.payload.environment.configNamesHash = met.Sha256(m.hexdigest())
+        try:
+            m = hashlib.sha256()
+            for c in configs:
+                m.update(c.encode())
+            self.payload.environment.configNamesHash = met.Sha256(m.hexdigest())
+        except Exception as e:
+            self.log_exception("add_configs", e)
 
-    @suppress_errors
     def add_rules(self, rules: Sequence[Rule], profile: Optional[out.Profile]) -> None:
-        rules = sorted(rules, key=lambda r: r.full_hash)
-        m = hashlib.sha256()
-        for rule in rules:
-            m.update(rule.full_hash.encode())
-        self.payload.environment.rulesHash = met.Sha256(m.hexdigest())
+        try:
+            rules = sorted(rules, key=lambda r: r.full_hash)
+            m = hashlib.sha256()
+            for rule in rules:
+                m.update(rule.full_hash.encode())
+            self.payload.environment.rulesHash = met.Sha256(m.hexdigest())
 
-        self.payload.performance.numRules = len(rules)
-        if profile:
-            # aggregate rule stats across files
-            _rule_match_times: Dict[out.RuleId, float] = defaultdict(float)
-            _rule_bytes_scanned: Dict[out.RuleId, int] = defaultdict(int)
-            for i, rule_id in enumerate(profile.rules):
-                for target_times in profile.targets:
-                    if target_times.match_times[i] > 0.0:
-                        _rule_match_times[rule_id] += target_times.match_times[i]
-                        _rule_bytes_scanned[rule_id] += target_times.num_bytes
+            self.payload.performance.numRules = len(rules)
 
-            self.payload.performance.ruleStats = [
-                RuleStats(
-                    ruleHash=rule.full_hash,
-                    matchTime=mock_float(_rule_match_times[rule.id2]),
-                    bytesScanned=mock_int(_rule_bytes_scanned[rule.id2]),
-                )
-                for rule in rules
-                # We consider only rules with match times and bytes scanned
-                # greater than 0 to avoid making the metrics too bloated.
-                if _rule_match_times[rule.id2] > 0.0
-                and _rule_bytes_scanned[rule.id2] > 0
-            ]
+            self.add_to_top_level_span(
+                {
+                    "scan.rules.count": self.payload.performance.numRules,
+                    "scan.rules.hash": self.payload.environment.rulesHash.to_json_string(),
+                }
+            )
+            if profile:
+                # aggregate rule stats across files
+                _rule_match_times: Dict[out.RuleId, float] = defaultdict(float)
+                _rule_bytes_scanned: Dict[out.RuleId, int] = defaultdict(int)
+                for i, rule_id in enumerate(profile.rules):
+                    for target_times in profile.targets:
+                        if target_times.match_times[i] > 0.0:
+                            _rule_match_times[rule_id] += target_times.match_times[i]
+                            _rule_bytes_scanned[rule_id] += target_times.num_bytes
 
-    @suppress_errors
+                self.payload.performance.ruleStats = [
+                    RuleStats(
+                        ruleHash=rule.full_hash,
+                        matchTime=mock_float(_rule_match_times[rule.id2]),
+                        bytesScanned=mock_int(_rule_bytes_scanned[rule.id2]),
+                    )
+                    for rule in rules
+                    # We consider only rules with match times and bytes scanned
+                    # greater than 0 to avoid making the metrics too bloated.
+                    if _rule_match_times[rule.id2] > 0.0
+                    and _rule_bytes_scanned[rule.id2] > 0
+                ]
+        except Exception as e:
+            self.log_exception("add_rules", e)
+
     def add_max_memory_bytes(self, profiling_data: Optional[out.Profile]) -> None:
-        if profiling_data:
-            self.payload.performance.maxMemoryBytes = profiling_data.max_memory_bytes
-
-    @suppress_errors
-    def add_findings(self, findings: FilteredMatches) -> None:
-        # Rules with 0 findings don't carry a lot of information
-        # compared to rules that actually have findings. Rules with 0
-        # findings also increase the size of the metrics quite
-        # significantly, e.g., when the number of rules grows up to
-        # magnitudes of 10k. So we filter them out in the metrics.
-        self.payload.value.ruleHashesWithFindings = [
-            (r.full_hash, len(f)) for r, f in findings.kept.items() if len(f) > 0
-        ]
-        self.payload.value.numFindings = sum(len(v) for v in findings.kept.values())
-        self.payload.value.numIgnored = sum(len(v) for v in findings.removed.values())
-
-    @suppress_errors
-    def add_targets(self, targets: Set[Path], profile: Optional[out.Profile]) -> None:
-        if profile:
-            self.payload.performance.fileStats = [
-                FileStats(
-                    size=target_times.num_bytes,
-                    numTimesScanned=mock_int(
-                        len([x for x in target_times.match_times if x > 0.0])
-                    ),
-                    # TODO: we just have a single parse_time in target_times.parse_times
-                    parseTime=mock_float(
-                        max(time for time in target_times.parse_times)
-                    ),
-                    matchTime=mock_float(
-                        sum(time for time in target_times.match_times)
-                    ),
-                    runTime=mock_float(target_times.run_time),
+        try:
+            if profiling_data:
+                self.payload.performance.maxMemoryBytes = (
+                    profiling_data.max_memory_bytes
                 )
-                for target_times in profile.targets
+        except Exception as e:
+            self.log_exception("add_max_memory_bytes", e)
+
+    def add_findings(self, findings: FilteredMatches) -> None:
+        try:
+            # Rules with 0 findings don't carry a lot of information
+            # compared to rules that actually have findings. Rules with 0
+            # findings also increase the size of the metrics quite
+            # significantly, e.g., when the number of rules grows up to
+            # magnitudes of 10k. So we filter them out in the metrics.
+            self.payload.value.ruleHashesWithFindings = [
+                (r.full_hash, len(f)) for r, f in findings.kept.items() if len(f) > 0
             ]
-        # TODO: fit the data in profile?
-        total_bytes_scanned = sum(t.stat().st_size for t in targets)
-        self.payload.performance.totalBytesScanned = total_bytes_scanned
-        self.payload.performance.numTargets = len(targets)
+            self.payload.value.numFindings = sum(len(v) for v in findings.kept.values())
+            self.payload.value.numIgnored = sum(
+                len(v) for v in findings.removed.values()
+            )
+            self.add_to_top_level_span(
+                {
+                    "scan.findings.count": self.payload.value.numFindings,
+                    "scan.findings.ignored.count": self.payload.value.numIgnored,
+                    "scan.rules.with_findings.count": len(
+                        self.payload.value.ruleHashesWithFindings
+                    ),
+                }
+            )
 
-    @suppress_errors
+            # Breakdown # of findings per-product.
+            _num_findings_by_product: Dict[out.Product, int] = defaultdict(int)
+            for r, f in findings.kept.items():
+                _num_findings_by_product[r.product] += len(f)
+            self.payload.value.numFindingsByProduct = [
+                (USER_FRIENDLY_PRODUCT_NAMES[p], n_findings)
+                for p, n_findings in _num_findings_by_product.items()
+            ]
+        except Exception as e:
+            self.log_exception("add_findings", e)
+
+    def add_targets(
+        self, targets: Set[TargetInfo], profile: Optional[out.Profile]
+    ) -> None:
+        try:
+            if profile:
+                self.payload.performance.fileStats = [
+                    FileStats(
+                        size=target_times.num_bytes,
+                        numTimesScanned=mock_int(
+                            len([x for x in target_times.match_times if x > 0.0])
+                        ),
+                        # TODO: we just have a single parse_time in target_times.parse_times
+                        parseTime=mock_float(
+                            max(time for time in target_times.parse_times)
+                        ),
+                        matchTime=mock_float(
+                            sum(time for time in target_times.match_times)
+                        ),
+                        runTime=mock_float(target_times.run_time),
+                    )
+                    for target_times in profile.targets
+                ]
+                # Sorted by key so that variation in target order can't be
+                # noticed by different ordering of file sizes.
+                self.payload.performance.fileStats = sorted(
+                    self.payload.performance.fileStats, key=lambda fs: fs.size
+                )
+            # TODO: fit the data in profile?
+            total_bytes_scanned = sum(t.fpath.stat().st_size for t in targets)
+            self.payload.performance.totalBytesScanned = total_bytes_scanned
+            self.payload.performance.numTargets = len(targets)
+            self.add_to_top_level_span(
+                {
+                    "scan.targets.count": self.payload.performance.numTargets,
+                    "scan.targets.bytes_scanned_sum": self.payload.performance.totalBytesScanned,
+                }
+            )
+        except Exception as e:
+            self.log_exception("add_targets", e)
+
     def add_errors(self, errors: List[SemgrepError]) -> None:
-        self.payload.errors.errors = [
-            met.Error(error_type_string(e.type_())) for e in errors
-        ]
+        try:
+            self.payload.errors.errors = [
+                met.Error(error_type_string(e.type_())) for e in errors
+            ]
+        except Exception as e:
+            self.log_exception("add_errors", e)
 
-    @suppress_errors
     def add_profiling(self, profiler: ProfileManager) -> None:
-        self.payload.performance.profilingTimes = [
-            (k, v) for k, v in profiler.dump_stats().items()
-        ]
+        try:
+            self.payload.performance.profilingTimes = [
+                (k, v) for k, v in profiler.dump_stats().items()
+            ]
+        except Exception as e:
+            self.log_exception("add_profiling", e)
 
-    @suppress_errors
     def add_token(self, token: Optional[str]) -> None:
-        self.payload.environment.isAuthenticated = bool(token)
+        try:
+            self.payload.environment.isAuthenticated = bool(token)
+        except Exception as e:
+            self.log_exception("add_token", e)
 
-    @suppress_errors
     def add_integration_name(self, name: Optional[str]) -> None:
-        self.payload.environment.integrationName = name
+        try:
+            self.payload.environment.integrationName = name
+        except Exception as e:
+            self.log_exception("add_integration_name", e)
 
-    @suppress_errors
     def add_exit_code(self, exit_code: int) -> None:
-        self.payload.errors.returnCode = exit_code
+        try:
+            self.payload.errors.returnCode = exit_code
+        except Exception as e:
+            self.log_exception("add_exit_code", e)
 
-    @suppress_errors
+    def add_deployment_id(self, deployment_id: Optional[int]) -> None:
+        try:
+            self.payload.environment.deployment_id = deployment_id
+        except Exception as e:
+            self.log_exception("add_deployment_id", e)
+
+    def add_install_pro_outcome(self, success: bool) -> None:
+        try:
+            self.payload.install_pro.success = success
+            if not success and self.payload.install_pro.error is None:
+                self.payload.install_pro.error = "unknown"
+        except Exception as e:
+            self.log_exception("add_install_pro_outcome", e)
+
+    def stage_install_pro_error(self, error: LiteralString) -> None:
+        try:
+            self.payload.install_pro.error = error
+        except Exception as e:
+            self.log_exception("stage_install_pro_error", e)
+
+    def clear_install_pro_error(self) -> None:
+        try:
+            self.payload.install_pro.error = None
+        except Exception as e:
+            self.log_exception("clear_install_pro_error", e)
+
     def add_version(self, version: str) -> None:
-        self.payload.environment.version = version
+        try:
+            self.payload.environment.version = version
+        except Exception as e:
+            self.log_exception("add_version", e)
 
-    @suppress_errors
     def add_feature(self, category: LiteralString, name: str) -> None:
-        self.payload.value.features.append(f"{category}/{name}")
-        self.payload.value.features.sort()
+        try:
+            self.payload.value.features.append(f"{category}/{name}")
+            self.payload.value.features.sort()
+        except Exception as e:
+            self.log_exception("add_feature", e)
 
-    @suppress_errors
     def add_registry_url(self, url_string: str) -> None:
-        path = urlparse(url_string).path
-        parts = path.lstrip("/").split("/")
-        if len(parts) != 2:
-            return  # not a simple registry shorthand
+        try:
+            path = urlparse(url_string).path
+            parts = path.lstrip("/").split("/")
+            if len(parts) != 2:
+                return  # not a simple registry shorthand
 
-        prefix, name = parts
+            prefix, name = parts
 
-        if prefix == "r":
-            # we want to avoid reporting specific rules, so we do this mapping:
-            # r/python -> "python"
-            # r/python.flask -> "python."
-            # r/python.correctness.lang => "python.."
-            query_parts = name.split(".")
-            dot_count = len(query_parts) - 1
-            self.add_feature("registry-query", query_parts[0] + dot_count * ".")
-        if prefix == "p":
-            self.add_feature("ruleset", name)
+            if prefix == "r":
+                # we want to avoid reporting specific rules, so we do this mapping:
+                # r/python -> "python"
+                # r/python.flask -> "python."
+                # r/python.correctness.lang => "python.."
+                query_parts = name.split(".")
+                dot_count = len(query_parts) - 1
+                self.add_feature("registry-query", query_parts[0] + dot_count * ".")
+            if prefix == "p":
+                self.add_feature("ruleset", name)
+        except Exception as e:
+            self.log_exception("add_registry_url", e)
 
-    @suppress_errors
     def add_parse_rates(self, parse_rates: ParsingData) -> None:
         """
         Adds parse rates, grouped by language
         """
-        self.payload.parse_rate = [
-            (
-                str(lang),
-                ParseStat(
-                    targets_parsed=data.num_targets - data.targets_with_errors,
-                    num_targets=data.num_targets,
-                    bytes_parsed=data.num_bytes - data.error_bytes,
-                    num_bytes=data.num_bytes,
-                ),
-            )
-            for (lang, data) in parse_rates.get_errors_by_lang().items()
-        ]
+        try:
+            self.payload.parse_rate = [
+                (
+                    str(lang),
+                    ParseStat(
+                        targets_parsed=data.num_targets - data.targets_with_errors,
+                        num_targets=data.num_targets,
+                        bytes_parsed=data.num_bytes - data.error_bytes,
+                        num_bytes=data.num_bytes,
+                    ),
+                )
+                for (lang, data) in parse_rates.get_errors_by_lang().items()
+            ]
+        except Exception as e:
+            self.log_exception("add_parse_rates", e)
 
-    @suppress_errors
     def add_extension(
         self,
         machine_id: Optional[str],
@@ -413,13 +598,122 @@ class Metrics:
         version: Optional[str],
         type: Optional[str],
     ) -> None:
-        self.payload.extension = Extension(
-            machineId=machine_id,
-            isNewAppInstall=new_install,
-            sessionId=session_id,
-            version=version,
-            ty=type,
-        )
+        try:
+            self.payload.extension = Extension(
+                machineId=machine_id,
+                isNewAppInstall=new_install,
+                sessionId=session_id,
+                version=version,
+                ty=type,
+            )
+        except Exception as e:
+            self.log_exception("add_extension", e)
+
+    def clear_mcp(self) -> None:
+        self.payload.mcp = Mcp()
+        self.payload.performance.totalBytesScanned = None
+        self.payload.performance.numRules = None
+        self.payload.environment.deployment_id = None
+
+    def add_mcp(
+        self,
+        deployment_id: Optional[int],
+        session_id: str,
+        deployment_name: Optional[str],
+        tool_name: Optional[str],
+    ) -> None:
+        try:
+            self.payload.environment.deployment_id = deployment_id
+            self.payload.mcp = Mcp(
+                deployment_name=deployment_name,
+                tool_name=tool_name,
+                session_id=session_id,
+                errors=[],
+            )
+        except Exception as e:
+            self.log_exception("add_mcp", e)
+
+    def cli_matches_to_findings(
+        self, matches: list[dict[str, Any]]
+    ) -> list[tuple[str, Finding]]:
+        return [
+            (
+                finding["check_id"],
+                Finding(
+                    path=finding["path"],
+                    line=finding["start"]["line"],
+                    col=finding["start"]["col"],
+                    offset=finding["start"]["offset"],
+                    severity=finding["extra"]["severity"],
+                ),
+            )
+            for finding in matches
+        ]
+
+    def add_mcp_scan_metrics(
+        self,
+        results: SemgrepScanResult,
+        num_lines_scanned: int,
+    ) -> None:
+        try:
+            total_bytes_scanned = int(
+                results.mcp_scan_results.get("total_bytes_scanned") or 0
+            )
+            rules = list(results.mcp_scan_results.get("rules") or [])
+            # Fill in the some of the performance fields from the MCP scan results that we actually use
+            self.payload.performance.totalBytesScanned = total_bytes_scanned
+            self.payload.performance.numRules = len(rules)
+            self.payload.mcp.num_skipped_rules = len(results.skipped_rules)
+            self.payload.mcp.num_scanned_files = len(results.paths["scanned"])
+            self.payload.mcp.num_findings = len(results.results)
+            self.payload.mcp.findings = self.cli_matches_to_findings(results.results)
+            self.payload.mcp.errors = [error["message"] for error in results.errors]
+            self.payload.mcp.num_lines = num_lines_scanned
+        except Exception as e:
+            self.log_exception("add_mcp_scan", e)
+
+    def add_mcp_findings_metrics(
+        self,
+        tps: list[tuple[str, Finding]],
+        fps: list[tuple[str, Finding]],
+        skips: list[tuple[str, Finding]],
+    ) -> None:
+        try:
+            self.payload.mcp.num_tps = len(tps)
+            self.payload.mcp.tps = tps
+            self.payload.mcp.num_fps = len(fps)
+            self.payload.mcp.fps = fps
+            self.payload.mcp.num_skips = len(skips)
+            self.payload.mcp.skips = skips
+        except Exception as e:
+            self.log_exception("add_mcp_findings_metrics", e)
+
+    def add_mcp_git_info(self, git_info: Optional[dict[str, str]]) -> None:
+        try:
+            if git_info:
+                self.payload.mcp.git_username = git_info["username"]
+                self.payload.mcp.git_repo = git_info["repo"]
+                self.payload.mcp.git_branch = git_info["branch"]
+        except Exception as e:
+            self.log_exception("add_mcp_git_info", e)
+
+    def add_mcp_oauth_info(self, oauth_info: Optional[WhoamiResult]) -> None:
+        try:
+            if oauth_info:
+                self.payload.mcp.oauth_id = str(oauth_info.id)
+                self.payload.mcp.oauth_name = oauth_info.name
+                self.payload.mcp.oauth_email = oauth_info.email
+        except Exception as e:
+            self.log_exception("add_mcp_oauth_info", e)
+
+    def add_mcp_error(self, error: str) -> None:
+        try:
+            if self.payload.mcp.errors is None:
+                self.payload.mcp.errors = [error]
+            else:
+                self.payload.mcp.errors.append(error)
+        except Exception as e:
+            self.log_exception("add_mcp_error", e)
 
     def as_json(self) -> str:
         value = self.payload.to_json()
@@ -431,7 +725,7 @@ class Metrics:
         Returns whether metrics should be sent.
 
         If metrics_state is:
-          - auto, sends if using_registry
+          - auto, sends if using_registry or if logged in
           - on, sends
           - off, doesn't send
         """
@@ -453,25 +747,28 @@ class Metrics:
             return self.is_using_registry or using_app
         return self.metrics_state == MetricsState.ON
 
-    @suppress_errors
     def gather_click_params(self) -> None:
-        ctx = click.get_current_context()
-        if ctx is None:
-            return
-        for param in ctx.params:
-            source = ctx.get_parameter_source(param)
-            if source == click.core.ParameterSource.COMMANDLINE:
-                self.add_feature("cli-flag", param)
-            if source == click.core.ParameterSource.ENVIRONMENT:
-                self.add_feature("cli-envvar", param)
-            if source == click.core.ParameterSource.PROMPT:
-                self.add_feature("cli-prompt", param)
+        try:
+            ctx = click.get_current_context()
+            if ctx is None:
+                return
+            for param in ctx.params:
+                source = ctx.get_parameter_source(param)
+                if source == click.core.ParameterSource.COMMANDLINE:
+                    self.add_feature("cli-flag", param)
+                if source == click.core.ParameterSource.ENVIRONMENT:
+                    self.add_feature("cli-envvar", param)
+                if source == click.core.ParameterSource.PROMPT:
+                    self.add_feature("cli-prompt", param)
+        except Exception as e:
+            self.log_exception("gather_click_params", e)
 
-    # Posting the metrics is separated out so that our tests can check
-    # for it
-    # TODO it's a bit unfortunate that our tests are going to post
-    # metrics...
+    # Posting the metrics is separated out so that our tests can check for it
+    # TODO it's a bit unfortunate that our tests are going to post metrics...
     def _post_metrics(self, *, user_agent: str, local_scan_id: str) -> None:
+        # old: was also logging {self.as_json()}
+        # alt: save it in ~/.semgrep/logs/metrics.json?
+        logger.debug(f"Sending to {METRICS_ENDPOINT}")
         r = requests.post(
             METRICS_ENDPOINT,
             data=self.as_json(),
@@ -482,32 +779,37 @@ class Metrics:
             },
             timeout=3,
         )
+        logger.debug(f"response from {METRICS_ENDPOINT} {r.json()}")
         r.raise_for_status()
 
-    @suppress_errors
     def send(self) -> None:
         """
         Send metrics to the metrics server.
 
         Will if is_enabled is True
         """
+        try:
+            from semgrep.state import get_state  # avoiding circular import
 
-        logger.verbose(
-            f"{'Sending' if self.is_enabled else 'Not sending'} pseudonymous metrics since metrics are configured to {self.metrics_state.name} and registry usage is {self.is_using_registry}"
-        )
+            state = get_state()
 
-        if not self.is_enabled:
-            return
+            logger.verbose(
+                f"{'Sending' if self.is_enabled else 'Not sending'} pseudonymous \
+metrics since metrics are configured to {self.metrics_state.name}, \
+registry usage is {self.is_using_registry}, and login status is {state.app_session.is_authenticated}"
+            )
 
-        self.gather_click_params()
-        self.payload.sent_at = Datetime(datetime.now().astimezone().isoformat())
+            if not self.is_enabled:
+                return
 
-        from semgrep.state import get_state  # avoiding circular import
+            self.gather_click_params()
+            self.payload.sent_at = Datetime(datetime.now().astimezone().isoformat())
 
-        state = get_state()
-        self.payload.anonymous_user_id = state.settings.get("anonymous_user_id")
+            self.payload.anonymous_user_id = state.settings.get("anonymous_user_id")
 
-        self._post_metrics(
-            user_agent=str(state.app_session.user_agent),
-            local_scan_id=str(state.local_scan_id),
-        )
+            self._post_metrics(
+                user_agent=str(state.app_session.user_agent),
+                local_scan_id=str(state.local_scan_id),
+            )
+        except Exception as e:
+            self.log_exception("send", e)

@@ -1,17 +1,32 @@
+#
+# Copyright (c) 2023-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 ##############################################################################
 # Prelude
 ##############################################################################
 # Helpers to run_scan.py to report scan status
+import sys
 from textwrap import wrap
 from typing import List
+from typing import Optional
 from typing import Sequence
+from typing import Union
 
-from attrs import evolve
 from rich.columns import Columns
 from rich.padding import Padding
 from rich.table import Table
 
 import semgrep.semgrep_interfaces.semgrep_output_v1 as out
+from semgrep import telemetry
 from semgrep.app import auth
 from semgrep.console import console
 from semgrep.console import Title
@@ -21,8 +36,12 @@ from semgrep.core_runner import Plan
 from semgrep.rule import Rule
 from semgrep.state import DesignTreatment
 from semgrep.state import get_state
+from semgrep.target_manager import SAST_PRODUCT
 from semgrep.target_manager import TargetManager
 from semgrep.target_mode import TargetModeConfig
+from semgrep.types import fpaths_of_targets
+from semgrep.types import TargetAccumulator
+from semgrep.util import is_secrets_ai_ruleset
 from semgrep.util import unit_str
 from semgrep.util import with_color
 from semgrep.util import with_feature_status
@@ -31,6 +50,9 @@ from semgrep.util import with_feature_status
 # Helpers
 ##############################################################################
 
+# Helper function to identify secret rules
+is_secret_rule = lambda r: isinstance(r.product.value, out.Secrets)
+
 
 # TODO: Use an array of semgrep_output_v1.Product instead of booleans flags for secrets, code, and supply chain
 def _print_product_status(sast_enabled: bool = True, sca_enabled: bool = False) -> None:
@@ -38,17 +60,15 @@ def _print_product_status(sast_enabled: bool = True, sca_enabled: bool = False) 
     (Simple) print the statuses of enabled products to stdout when the user
     is given the product-focused CLI UX treatment.
     """
-    learn_more_url = with_color(
-        Colors.cyan, "https://semgrep.dev/products/cloud-platform/", underline=True
-    )
+    learn_more_url = with_color(Colors.cyan, "https://sg.run/cloud", underline=True)
     login_command = with_color(Colors.gray, "`semgrep login`")
-    is_logged_in = auth.get_token() is not None
+    is_logged_in = auth.is_logged_in_weak()
     all_enabled = True  # assume all enabled until we find a disabled product
 
     sections = [
         (
             "Semgrep OSS",
-            True,
+            sast_enabled,
             [
                 "Basic security coverage for first-party code vulnerabilities.",
             ],
@@ -108,19 +128,11 @@ def _print_scan_plan_header(
     Prints the number of files intended to be scanned and (optionally)
     the number of rules to be run based on the current configuration.
     """
-    file_count = len(target_manager.get_all_files())
     legacy_cli_ux = cli_ux == DesignTreatment.LEGACY
     simple_ux = cli_ux == DesignTreatment.SIMPLE
 
-    if target_mode_config.is_pro_diff_scan:
-        total_file_count = len(
-            evolve(target_manager, baseline_handler=None).get_all_files()
-        )
-        diff_file_count = len(target_mode_config.get_diff_targets())
-        summary_line = f"Pro Differential Scanning {diff_file_count}/{unit_str(total_file_count, 'file')}"
-    else:
-        file_count = len(target_manager.get_all_files())
-        summary_line = f"Scanning {unit_str(file_count, 'file')}"
+    target_count = len(target_manager.get_all_files(product=SAST_PRODUCT))
+    summary_line = f"Scanning {unit_str(target_count, 'file')}"
 
     if target_manager.respect_git_ignore:
         summary_line += (
@@ -136,19 +148,25 @@ def _print_scan_plan_header(
     # historically take into account the effects of not scanning
     # files, which rule_count_by_product includes.
     sast_rule_count = len(sast_plan.rules)
-    is_secret_rule = lambda r: isinstance(r.product.value, out.Secrets)
     secrets_rule_count = len(list(filter(is_secret_rule, sast_plan.rules)))
 
     # TODO code_rule_count currently double counts pro_rules.
     code_rule_count = sast_rule_count - secrets_rule_count
-    summary_line += f" with {unit_str(code_rule_count, 'Code rule')}"
-
-    if secrets_rule_count:
-        summary_line += f", {unit_str(secrets_rule_count, 'Secrets rule')}"
-
     sca_rule_count = len(sca_plan.rules)
-    if sca_rule_count:
-        summary_line += f", {unit_str(sca_rule_count, 'Supply Chain rule')}"
+
+    # Only mention products that have rules to run, so e.g. a secrets-only
+    # scan doesn't advertise "0 Code rules".
+    rule_count_parts = [
+        unit_str(count, unit)
+        for count, unit in (
+            (code_rule_count, "Code rule"),
+            (secrets_rule_count, "Secrets rule"),
+            (sca_rule_count, "Supply Chain rule"),
+        )
+        if count
+    ]
+    if rule_count_parts:
+        summary_line += f" with {', '.join(rule_count_parts)}"
 
     console.print(summary_line + ":")
 
@@ -167,8 +185,12 @@ def _print_degenerate_table(plan: Plan, *, rule_count: int) -> None:
     """
     if not rule_count or not plan.target_mappings:
         console.print("Nothing to scan.")
-    else:  # e.g. 1 rule, 4 files
-        console.print(f"Scanning {unit_str(len(plan.target_mappings), 'file')}.")
+    else:
+        # e.g. 1 rule, 4 files
+        file_count = len(
+            [task for task in plan.target_mappings if plan.product in task.products]
+        )
+        console.print(f"Scanning {unit_str(file_count, 'file')}.")
 
 
 def _print_sast_table(
@@ -190,28 +212,108 @@ def _print_sast_table(
         )
         return
 
+    use_color = sys.stderr.isatty()
+    # NOTE: osemgrep lacks support for bold table headers
+    # Given that this is only printed in legacy and compatability
+    # runs, the output doesn't really matter
     _print_tables(
         [
-            sast_plan.table_by_language(with_tables_for=product),
-            sast_plan.table_by_origin(with_tables_for=product),
+            sast_plan.table_by_language(with_tables_for=product, use_color=use_color),
+            sast_plan.table_by_origin(with_tables_for=product, use_color=use_color),
         ]
     )
+
+
+def _print_sca_parse_error(error: out.DependencyParserError) -> None:
+    # These are zero indexed but most editors are one indexed
+    line_prefix = f"{error.line} | "
+    path = error.path.value
+    if error.line and error.col and error.text:
+        location = f"[bold]{path}[/bold] at [bold]{error.line}:{error.col}[/bold]"
+
+        console.print(
+            f"Failed to parse {location} - {error.reason}\n"
+            f"{line_prefix}{error.text}\n"
+            f"{' ' * (error.col - 1 + len(line_prefix))}^"
+        )
+    elif error.line and error.text:
+        location = f"[bold]{path}[/bold] at [bold]{error.line}[/bold]"
+
+        console.print(
+            f"Failed to parse {location} - {error.reason}\n{line_prefix}{error.text}\n"
+        )
+    elif error.line:
+        location = f"[bold]{path}[/bold] at [bold]{error.line}[/bold]"
+        console.print(f"Failed to parse {location} - {error.reason}")
+    else:
+        location = f"[bold]{path}[/bold]"
+        console.print(f"Failed to parse {location} - {error.reason}")
+
+
+def _print_sca_resolution_error(error: out.ScaResolutionError) -> None:
+    def format_resolution_error_message(message: str) -> str:
+        # the Ocaml code returns error messages with \n instead of newlines,
+        # which makes the error output look messy. We switch back to using real
+        # newlines, and then prepend each line of the output with > to show
+        # that it is a replication of third-party output.
+        with_newlines = message.replace("\\n", "\n")
+        processed_message = "\n".join(
+            [f"  > {line}" for line in with_newlines.split("\n")]
+        )
+        return processed_message
+
+    # duplicated mostly in error.py in DependencyResolutionSemgrepError.__str__
+    def print_resolution_error(err: out.ResolutionErrorKind) -> str:
+        if isinstance(err.value, out.UnsupportedManifest):
+            return "Unsupported Manifest"
+        elif isinstance(err.value, out.MissingRequirement):
+            return f"Missing Requirement ({err.value.value})"
+        elif isinstance(err.value, out.ResolutionCmdFailed_):
+            processed_message = format_resolution_error_message(err.value.value.message)
+            return f"Resolution Command Failed.\nCommand: {err.value.value.command}\nOutput from third-party command:\n{processed_message})"
+        elif isinstance(err.value, out.IncompleteDependencyResolution_):
+            processed_message = format_resolution_error_message(err.value.value.message)
+            return f"Incomplete Dependency Resolution.\nCommand: {err.value.value.command}\nDetails:\n{processed_message}"
+        elif isinstance(err.value, out.ResourceInaccessible_):
+            processed_message = format_resolution_error_message(err.value.value.message)
+            return f"Resource Inaccessible (command: {err.value.value.command}) (registry_url: {err.value.value.registry_url}) (output from third-party command:\n{processed_message})"
+        else:
+            return f"Parsing dependency output failed ({err.value.value})"
+
+    console.print(
+        f"Failed to resolve dependencies for {error.dependency_source_file.value}. {print_resolution_error(error.type_)}"
+    )
+
+
+def _sca_error_sort_key(error: out.ScaError) -> tuple:
+    e = error.value.value
+    if isinstance(e, out.DependencyParserError):
+        return (e.path.value, e.line or 0)
+    elif isinstance(e, out.ScaResolutionError):
+        return (e.dependency_source_file.value, 0)
+    return ("", 0)
+
+
+def _print_sca_resolution_errors(errors: List[out.ScaError]) -> None:
+    """
+    Print the given SCA resolution errors.
+    """
+    for error in sorted(errors, key=_sca_error_sort_key):
+        e = error.value.value
+        if isinstance(e, out.DependencyParserError):
+            _print_sca_parse_error(e)
+        else:
+            _print_sca_resolution_error(e)
 
 
 def _print_sca_table(sca_plan: Plan, rule_count: int) -> None:
     """
     Pretty print the sca plan to stdout with the legacy CLI UX.
     """
-    if rule_count <= 1 or not sca_plan.target_mappings:
-        _print_degenerate_table(sca_plan, rule_count=rule_count)
-        return
 
-    _print_tables(
-        [
-            sca_plan.table_by_ecosystem(),
-            sca_plan.table_by_sca_analysis(),
-        ]
-    )
+    _print_tables([sca_plan.table_by_subproject()])
+    console.print("\n")  # space intentional to force second table to be on its own line
+    _print_tables([sca_plan.table_by_sca_analysis()])
 
 
 def _print_detailed_sca_table(
@@ -220,7 +322,9 @@ def _print_detailed_sca_table(
     """
     Pretty print the plan to stdout with the detailed CLI UX.
     """
-    if rule_count:
+    # even if no rules, we still want to print the subproject table to
+    # show any resolution failures (rules get filtered out when resolution fails)
+    if rule_count or sca_plan.all_subprojects:
         _print_sca_table(sca_plan, rule_count)
         return
 
@@ -273,16 +377,24 @@ def _print_detailed_sca_table(
 ##############################################################################
 
 
+@telemetry.trace()
 def print_scan_status(
     rules: Sequence[Rule],
     target_manager: TargetManager,
     target_mode_config: TargetModeConfig,
+    all_subprojects: List[Union[out.ResolvedSubproject, out.UnresolvedSubproject]],
+    dependency_resolution_errors: List[out.ScaError],
     *,
     cli_ux: DesignTreatment = DesignTreatment.LEGACY,
     # TODO: Use an array of semgrep_output_v1.Product instead of booleans flags for secrets, code, and supply chain
     with_code_rules: bool = True,
     with_supply_chain: bool = False,
-) -> List[Plan]:
+    # Whether the Code product is enabled for this scan. True/False when known
+    # (e.g. from the platform in `semgrep ci`), None when it can't be determined.
+    code_enabled: Optional[bool] = None,
+    # Used for recording phase data
+    target_accumulator: Optional[TargetAccumulator] = None,
+) -> int:
     """
     Prints the scan status and returns the plans
     """
@@ -290,6 +402,9 @@ def print_scan_status(
     simple_ux = cli_ux == DesignTreatment.SIMPLE
     detailed_ux = cli_ux == DesignTreatment.DETAILED
     minimal_ux = cli_ux == DesignTreatment.MINIMAL
+    if target_accumulator is None:
+        target_accumulator = TargetAccumulator()
+    initial_accumulator_paths = fpaths_of_targets(target_accumulator.targets)
 
     sast_plan = CoreRunner.plan_core_run(
         [
@@ -303,44 +418,56 @@ def print_scan_status(
                 and (not rule.from_transient_scan)
             )
         ],
-        target_manager
-        if not target_mode_config.is_pro_diff_scan
-        else evolve(
-            target_manager, target_strings=target_mode_config.get_diff_targets()
-        ),
+        target_manager,
+        all_subprojects,
         product=out.Product(
             out.SAST()
         ),  # code-smell since secrets and sast are within the same plan
+        all_targets=target_accumulator,
     )
 
-    lockfiles = target_manager.get_all_lockfiles()
+    used_ecosystems = {
+        subproject.info.ecosystem
+        for subproject in all_subprojects
+        if isinstance(subproject, out.ResolvedSubproject)
+    }
     sca_plan = CoreRunner.plan_core_run(
         [
             rule
             for rule in rules
             if isinstance(rule.product.value, out.SCA)
-            and any(lockfiles[ecosystem] for ecosystem in rule.ecosystems)
+            and any(ecosystem in used_ecosystems for ecosystem in rule.ecosystems)
         ],
         target_manager,
+        all_subprojects,
         product=out.Product(out.SCA()),
+        # we don't use target info for printing the sca plan, and with dependency-only
+        # rules it gets very expensive to compute. We skip it.
+        make_target_info_and_unused_rules=False,
+        all_targets=target_accumulator,
+    )
+
+    telemetry.record_phase_data(
+        telemetry.get_current_span(),
+        [
+            path
+            for path in fpaths_of_targets(target_accumulator.targets)
+            if path not in initial_accumulator_paths
+        ],
+        rules,
     )
 
     plans = [sast_plan, sca_plan]
 
+    executed_rule_count = sum(
+        max(0, len(plan.rules) - len(plan.unused_rules)) for plan in plans
+    )
     # We skip printing the remaining output for pattern invocations
     if minimal_ux:
-        return plans
+        return executed_rule_count
 
-    if simple_ux:
-        logo = with_color(Colors.green, "○○○")
-        console.print(
-            f"""
-┌──── {logo} ────┐
-│ Semgrep CLI │
-└─────────────┘
-"""
-        )
-    else:
+    # For CI / test runs or when legacy format is requested we print the scan title
+    if legacy_ux:
         console.print(Title("Scan Status"))
 
     _print_scan_plan_header(
@@ -353,7 +480,7 @@ def print_scan_status(
     # NOTE: There's some funky behavior with handling the rule counts
     # in which some functions require rule counts calculated in different ways.
     alt_sast_rule_count = sast_plan.rule_count_for_product(out.Product(out.SAST()))
-    alt_sca_rule_count = sca_plan.rule_count_for_product(out.Product(out.SCA()))
+    has_code_rules = alt_sast_rule_count > 0
 
     secrets_rule_count = sast_plan.rule_count_for_product(out.Product(out.Secrets()))
     has_secret_rules = secrets_rule_count > 0
@@ -366,31 +493,57 @@ def print_scan_status(
             sast_enabled=with_code_rules,
             sca_enabled=with_supply_chain,
         )
-        return plans
+        return executed_rule_count
 
-    if not has_sca_rules and not has_secret_rules and legacy_ux:
+    if (
+        not has_sca_rules
+        and not has_secret_rules
+        and legacy_ux
+        and not dependency_resolution_errors
+    ):
         # Print these SAST table without section headers
         _print_sast_table(
             sast_plan=sast_plan,
             product=out.Product(out.SAST()),
             rule_count=alt_sast_rule_count,
         )
-        return plans
+        return executed_rule_count
 
     if legacy_ux:
         console.print(Padding(Title("Code Rules", order=2), (1, 0, 0, 0)))
     else:
         console.print(Title("Code Rules", order=2))
 
-    _print_sast_table(
-        sast_plan=sast_plan,
-        product=out.Product(out.SAST()),
-        rule_count=alt_sast_rule_count,
-    )
+    # When there are no code rules to run, say so explicitly (and why, when we
+    # know) rather than printing a confusing empty table, so it's clear code
+    # analysis isn't silently broken (ENGINE-2878).
+    if has_code_rules:
+        _print_sast_table(
+            sast_plan=sast_plan,
+            product=out.Product(out.SAST()),
+            rule_count=alt_sast_rule_count,
+        )
+    elif code_enabled is False:
+        console.print("Code scanning is not enabled.")
+    else:
+        console.print("No code rules to run.")
 
     # TODO: after launch this should no longer be conditional.
     if has_secret_rules:
         console.print(Title("Secrets Rules", order=2))
+
+        # Check if any secret rule has the generic secrets AI ruleset
+        has_generic_secrets = any(
+            is_secrets_ai_ruleset(rule.metadata)
+            for rule in filter(is_secret_rule, sast_plan.rules)
+        )
+
+        if has_generic_secrets:
+            console.print("AI augmented rules are active for secrets detection.")
+
+        # NOTE: this modification of the plan's product is needed for
+        # accurately reporting the number of files in degenerate table
+        sast_plan.product = out.Product(out.Secrets())
         _print_sast_table(
             sast_plan=sast_plan,
             product=out.Product(out.Secrets()),
@@ -402,20 +555,23 @@ def print_scan_status(
     elif legacy_ux:
         # Show the basic table for supply chain
         console.print(Title("Supply Chain Rules", order=2))
-        _print_sca_table(sca_plan=sca_plan, rule_count=alt_sca_rule_count)
+        _print_sca_table(sca_plan=sca_plan, rule_count=sca_rule_count)
     else:
         # Show the table with a supply chain nudge or supply chain
         console.print(Title("Supply Chain Rules", order=2))
         _print_detailed_sca_table(
             sca_plan=sca_plan,
-            rule_count=alt_sca_rule_count,
+            rule_count=sca_rule_count,
             # NOTE: `with_supply_chain` is only used for nudging `scan` command invocations
             # without supply-chain to upgrade their usage to the `ci` command
             with_supply_chain=with_supply_chain,
         )
+    # always show SCA resolution errors regardless of if there are rules,
+    # since if resolution fails the rules will be filtered out
+    _print_sca_resolution_errors(dependency_resolution_errors)
 
     if detailed_ux:
         console.print(Title("Progress", order=2))
         console.print(" ")  # space intentional for progress bar padding
 
-    return plans
+    return executed_rule_count

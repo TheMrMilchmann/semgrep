@@ -36,10 +36,10 @@ module H = Eval_jsonnet_common
 (* Standard library *)
 (*****************************************************************************)
 
-(*Creates std so that we can add it to the environment when we switch back to
-  * environment model for handling standard library functions
-*)
-let pre_std = lazy (Std_jsonnet.get_std_jsonnet ())
+(* Creates std so that we can add it to the environment when we switch back to
+ * environment model for handling standard library functions
+ *)
+let pre_std = lazy_safe (Std_jsonnet.get_std_jsonnet ())
 
 (* This is an arbitrary path, used as a placeholder, since we aren't
  * desugaring from a file *)
@@ -48,7 +48,8 @@ let path =
   | Ok p -> p
   | Error _ -> failwith ""
 
-let std = lazy (Desugar_jsonnet.desugar_program path Lazy.(force pre_std))
+let std =
+  lazy_safe (Desugar_jsonnet.desugar_program path Lazy_safe.(force pre_std))
 
 (*****************************************************************************)
 (* Helpers *)
@@ -63,6 +64,8 @@ let _is_imp_std s =
   || s = "filter" || s = "objectHasEx"
 
 let freshvar =
+  (* TODO: false positive *)
+  (* nosemgrep: no-ref-declarations-at-top-scope *)
   let store = ref 0 in
   fun () ->
     incr store;
@@ -80,16 +83,16 @@ let vobj_to_obj l asserts fields r =
   let new_fields =
     fields
     |> List.map (fun { V.fld_name; fld_hidden; fld_value } ->
-           match fld_value.lv with
-           | Val _
-           | Closure _ ->
-               error (Tok.unsafe_fake_tok "") "shouldn't be a value"
-           | Unevaluated e ->
-               {
-                 fld_name = vfld_name_to_fld_name fld_name;
-                 fld_hidden;
-                 fld_value = e;
-               })
+        match fld_value.lv with
+        | Val _
+        | Closure _ ->
+            error (Tok.unsafe_fake_tok "") "shouldn't be a value"
+        | Unevaluated e ->
+            {
+              fld_name = vfld_name_to_fld_name fld_name;
+              fld_hidden;
+              fld_value = e;
+            })
   in
   O (l, Object (asserts, new_fields), r)
 
@@ -115,13 +118,13 @@ let to_lazy_value _env e : V.lazy_value = { lv = Unevaluated e }
 let rec substitute id sub expr =
   match expr with
   | L v -> L v
-  | Array (l, xs, r) -> Array (l, List_.map (substitute id sub) xs, r)
+  | Array (l, xs, r) -> Array (l, List.map (substitute id sub) xs, r)
   | Lambda { f_tok; f_params = lparams, params, rparams; f_body } ->
       if parameter_list_contains params id then
         Lambda { f_tok; f_params = (lparams, params, rparams); f_body }
       else
         let new_params =
-          List_.map
+          List.map
             (fun (P (name, tk, e)) -> P (name, tk, substitute id sub e))
             params
         in
@@ -136,10 +139,10 @@ let rec substitute id sub expr =
       match v with
       | Object (asserts, fields) ->
           let new_asserts =
-            List_.map (fun (tk, expr) -> (tk, substitute id sub expr)) asserts
+            List.map (fun (tk, expr) -> (tk, substitute id sub expr)) asserts
           in
           let new_fields =
-            List_.map
+            List.map
               (fun { fld_name; fld_hidden; fld_value } ->
                 match fld_name with
                 | FExpr (l, name, r) ->
@@ -166,7 +169,7 @@ let rec substitute id sub expr =
       let new_args =
         if id = "std" then args
         else
-          List_.map
+          List.map
             (fun arg ->
               match arg with
               | Arg e -> Arg (substitute id sub e)
@@ -185,7 +188,7 @@ let rec substitute id sub expr =
       if bind_list_contains binds id then Local (_tlocal, binds, _tsemi, e)
       else
         let new_binds =
-          List_.map
+          List.map
             (fun (B (name, tk, expr)) -> B (name, tk, substitute id sub expr))
             binds
         in
@@ -195,7 +198,7 @@ let rec substitute id sub expr =
   | Call (e0, (l, args, r)) ->
       let new_func = substitute id sub e0 in
       let new_args =
-        List_.map
+        List.map
           (fun arg ->
             match arg with
             | Arg e -> Arg (substitute id sub e)
@@ -216,10 +219,10 @@ let rec substitute id sub expr =
 let rec substitute_kw kw sub expr =
   match expr with
   | L v -> L v
-  | Array (l, xs, r) -> Array (l, List_.map (substitute_kw kw sub) xs, r)
+  | Array (l, xs, r) -> Array (l, List.map (substitute_kw kw sub) xs, r)
   | Lambda { f_tok; f_params = lparams, params, rparams; f_body } ->
       let new_params =
-        List_.map
+        List.map
           (fun (P (id, tok, e)) -> P (id, tok, substitute_kw kw sub e))
           params
       in
@@ -234,7 +237,7 @@ let rec substitute_kw kw sub expr =
       match v with
       | Object (asserts, fields) ->
           let new_fields =
-            List_.map
+            List.map
               (fun { fld_name = FExpr (l, e, r); fld_hidden; fld_value } ->
                 {
                   fld_name = FExpr (l, substitute_kw kw sub e, r);
@@ -264,7 +267,7 @@ let rec substitute_kw kw sub expr =
               r1 ) ),
         (l, args, r) ) ->
       let new_args =
-        List_.map
+        List.map
           (fun arg ->
             match arg with
             | Arg e -> Arg (substitute_kw kw sub e)
@@ -281,7 +284,7 @@ let rec substitute_kw kw sub expr =
           (l, new_args, r) )
   | Local (_tlocal, binds, _tsemi, e) ->
       let new_binds =
-        List_.map
+        List.map
           (fun (B (name, tk, expr)) -> B (name, tk, substitute_kw kw sub expr))
           binds
       in
@@ -291,7 +294,7 @@ let rec substitute_kw kw sub expr =
   | Call (e0, (l, args, r)) ->
       let new_func = substitute_kw kw sub e0 in
       let new_args =
-        List_.map
+        List.map
           (fun arg ->
             match arg with
             | Arg e -> Arg (substitute_kw kw sub e)
@@ -335,11 +338,11 @@ and eval_expr env expr =
   (* lazy evaluation of Array elements and Lambdas *)
   | Array (l, xs, r) ->
       let elts =
-        xs |> List_.map (fun x -> to_lazy_value env x) |> Array.of_list
+        xs |> List.map (fun x -> to_lazy_value env x) |> Array.of_list
       in
       V.Array (l, elts, r)
   (* in subst model we don't rely on closure so locals here is empty *)
-  | Lambda f -> V.Lambda (f, Map_.empty)
+  | Lambda f -> V.Lambda (f, V.Local_id_map.empty)
   | O v -> eval_obj_inside env v
   | Id (name, tk) -> error tk ("trying to evaluate just a variable: " ^ name)
   | IdSpecial (_, tk) -> error tk "evaluating just a keyword"
@@ -383,7 +386,7 @@ and eval_expr_for_call env e0 =
       (Id ("std", _), (_, L (Str (None, DoubleQuote, (_, [ _ ], _))), _)) ->
       (* set locals so that "std" shows up in the environment when evaluating *)
       let e0_and_std =
-        Local (fk, [ B (("std", fk), fk, Lazy.force std) ], fk, e0)
+        Local (fk, [ B (("std", fk), fk, Lazy_safe.force std) ], fk, e0)
       in
       (* !!! Switch to Eval_jsonnet !!! but just to access the code of the
        * function; the function itself is still executed below
@@ -422,7 +425,7 @@ and eval_array_access env v1 v2 =
       match
         fields
         |> List.find_opt (fun (field : V.value_field) ->
-               fst field.fld_name = fld)
+            fst field.fld_name = fld)
       with
       | None -> error tk (spf "field '%s' not present in %s" fld (sv e))
       | Some fld -> (
@@ -481,17 +484,17 @@ and eval_std_filter_element env (tk : tok) (f : function_definition)
 and eval_obj_inside env (l, x, r) : V.t =
   match x with
   | Object (assertsTODO, fields) ->
-      let hdupes = Hashtbl.create 16 in
+      let hdupes = Base.Hashtbl.Poly.create ~size:16 () in
       let fields =
         fields
-        |> List_.map_filter
+        |> List.filter_map
              (fun { fld_name = FExpr (tk, ei, _); fld_hidden; fld_value } ->
                match eval_expr env ei with
                | Primitive (Null _) -> None
                | Primitive (Str ((str, _) as fld_name)) ->
-                   if Hashtbl.mem hdupes str then
+                   if Base.Hashtbl.mem hdupes str then
                      error tk (spf "duplicate field name: \"%s\"" str)
-                   else Hashtbl.add hdupes str true;
+                   else Base.Hashtbl.set hdupes ~key:str ~data:true;
                    Some
                      {
                        V.fld_name;
@@ -517,20 +520,20 @@ and eval_plus_object env _tk objl objr =
   let asserts = lassert @ rassert in
   let hash_of_right_field_names =
     rflds
-    |> List_.map (fun { V.fld_name = s, _; _ } -> s)
-    |> Hashtbl_.hashset_of_list
+    |> List.map (fun { V.fld_name = s, _; _ } -> s)
+    |> Hashtbl_.Base.hashset_of_list
   in
 
   let lflds_no_overlap =
     lflds
     |> List.filter (fun { V.fld_name = s, _; _ } ->
-           not (Hashtbl.mem hash_of_right_field_names s))
+        not (Base.Hashtbl.mem hash_of_right_field_names s))
   in
 
   let lflds_overlap_hidden =
     lflds
     |> List.map (fun { V.fld_name = s, _; fld_hidden; _ } -> (s, fld_hidden))
-    |> List.to_seq |> Hashtbl.of_seq
+    |> Hashtbl_.Base.hash_of_list
   in
 
   let super = freshvar () in
@@ -538,32 +541,28 @@ and eval_plus_object env _tk objl objr =
 
   let new_rh_asserts =
     lassert
-    |> List_.map (fun ((tk, e), _) ->
-           ( tk,
-             e
-             |> substitute_kw fake_super (Id super)
-             |> substitute_kw fake_self (Id self) ))
+    |> List.map (fun ((tk, e), _) ->
+        ( tk,
+          e
+          |> substitute_kw fake_super (Id super)
+          |> substitute_kw fake_self (Id self) ))
   in
   let new_rh_fields =
     lflds
-    |> List_.map (fun { V.fld_name; fld_hidden; fld_value } ->
-           match fld_value.lv with
-           | Val _
-           | Closure _ ->
-               error (Tok.unsafe_fake_tok "") "shouldn't have been evaluated"
-           | Unevaluated e ->
-               let new_field_name = vfld_name_to_fld_name fld_name in
+    |> List.map (fun { V.fld_name; fld_hidden; fld_value } ->
+        match fld_value.lv with
+        | Val _
+        | Closure _ ->
+            error (Tok.unsafe_fake_tok "") "shouldn't have been evaluated"
+        | Unevaluated e ->
+            let new_field_name = vfld_name_to_fld_name fld_name in
 
-               let new_fld_value =
-                 e
-                 |> substitute_kw fake_super (Id super)
-                 |> substitute_kw fake_self (Id self)
-               in
-               {
-                 fld_name = new_field_name;
-                 fld_hidden;
-                 fld_value = new_fld_value;
-               })
+            let new_fld_value =
+              e
+              |> substitute_kw fake_super (Id super)
+              |> substitute_kw fake_self (Id self)
+            in
+            { fld_name = new_field_name; fld_hidden; fld_value = new_fld_value })
   in
 
   let rh_obj =
@@ -583,34 +582,34 @@ and eval_plus_object env _tk objl objr =
   let new_ers =
     rflds
     |> List.map (fun { V.fld_name; fld_hidden; fld_value } ->
-           match fld_value.lv with
-           | Val _
-           | Closure _ ->
-               error (Tok.unsafe_fake_tok "") "shouldn't have been evaluated"
-           | Unevaluated e ->
-               let new_fld_value =
-                 Local
-                   ( Tok.unsafe_fake_tok "local",
-                     new_binds,
-                     Tok.unsafe_sc,
-                     substitute_kw fake_super e_s e )
-               in
-               let name, _ = fld_name in
-               (* implements hidden inheritance as defined in spec *)
-               let hidden, _ = fld_hidden in
-               let new_hidden =
-                 if Hashtbl.mem lflds_overlap_hidden name then
-                   match hidden with
-                   | Visible -> Hashtbl.find lflds_overlap_hidden name
-                   | _ -> fld_hidden
-                 else fld_hidden
-               in
+        match fld_value.lv with
+        | Val _
+        | Closure _ ->
+            error (Tok.unsafe_fake_tok "") "shouldn't have been evaluated"
+        | Unevaluated e ->
+            let new_fld_value =
+              Local
+                ( Tok.unsafe_fake_tok "local",
+                  new_binds,
+                  Tok.unsafe_sc,
+                  substitute_kw fake_super e_s e )
+            in
+            let name, _ = fld_name in
+            (* implements hidden inheritance as defined in spec *)
+            let hidden, _ = fld_hidden in
+            let new_hidden =
+              if Base.Hashtbl.mem lflds_overlap_hidden name then
+                match hidden with
+                | Visible -> Hashtbl_.Base.find lflds_overlap_hidden name
+                | _ -> fld_hidden
+              else fld_hidden
+            in
 
-               {
-                 V.fld_name;
-                 fld_hidden = new_hidden;
-                 fld_value = to_lazy_value env new_fld_value;
-               })
+            {
+              V.fld_name;
+              fld_hidden = new_hidden;
+              fld_value = to_lazy_value env new_fld_value;
+            })
   in
 
   let all_fields = new_ers @ lflds_no_overlap in
@@ -635,42 +634,41 @@ and manifest_value (v : V.t) : JSON.t =
   | Array (_, arr, _) ->
       J.Array
         (arr |> Array.to_list
-        |> List_.map (fun (entry : V.lazy_value) ->
-               manifest_value (to_value env entry)))
+        |> List.map (fun (entry : V.lazy_value) ->
+            manifest_value (to_value env entry)))
   | V.Object (_l, (_assertsTODO, fields), _r) ->
       (* TODO: evaluate asserts *)
       let xs =
         fields
-        |> List_.map_filter (fun { V.fld_name; fld_hidden; fld_value } ->
-               match fst fld_hidden with
-               | A.Hidden -> None
-               | A.Visible
-               | A.ForcedVisible ->
-                   (* similar to what we do in eval_expr on field access *)
-                   let _new_assertsTODO =
-                     _assertsTODO
-                     |> List.map (fun ((tk, prog), _) -> (tk, prog))
-                   in
-                   let _new_self = vobj_to_obj _l _new_assertsTODO fields _r in
-                   let v =
-                     match fld_value.lv with
-                     | Closure _ -> raise Impossible
-                     | Val v -> v
-                     | Unevaluated e ->
-                         let new_e =
-                           e
-                           |> substitute_kw fake_self _new_self
-                           |> substitute_kw fake_super
-                                (O
-                                   ( Tok.unsafe_fake_tok "{",
-                                     Object ([], []),
-                                     Tok.unsafe_fake_tok "}" ))
-                         in
-                         eval_expr env new_e
-                   in
+        |> List.filter_map (fun { V.fld_name; fld_hidden; fld_value } ->
+            match fst fld_hidden with
+            | A.Hidden -> None
+            | A.Visible
+            | A.ForcedVisible ->
+                (* similar to what we do in eval_expr on field access *)
+                let _new_assertsTODO =
+                  _assertsTODO |> List.map (fun ((tk, prog), _) -> (tk, prog))
+                in
+                let _new_self = vobj_to_obj _l _new_assertsTODO fields _r in
+                let v =
+                  match fld_value.lv with
+                  | Closure _ -> raise Impossible
+                  | Val v -> v
+                  | Unevaluated e ->
+                      let new_e =
+                        e
+                        |> substitute_kw fake_self _new_self
+                        |> substitute_kw fake_super
+                             (O
+                                ( Tok.unsafe_fake_tok "{",
+                                  Object ([], []),
+                                  Tok.unsafe_fake_tok "}" ))
+                      in
+                      eval_expr env new_e
+                in
 
-                   let j = manifest_value v in
-                   Some (fst fld_name, j))
+                let j = manifest_value v in
+                Some (fst fld_name, j))
       in
       J.Object xs
 

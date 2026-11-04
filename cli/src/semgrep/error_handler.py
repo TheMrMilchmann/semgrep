@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2022-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import sys
 from typing import Any
 from typing import Dict
@@ -10,6 +22,7 @@ from attr import field
 
 from semgrep.error import FINDINGS_EXIT_CODE
 from semgrep.error import OK_EXIT_CODE
+from semgrep.util import redact_credentials
 from semgrep.verbose_logging import getLogger
 
 logger = getLogger(__name__)
@@ -45,12 +58,15 @@ class ErrorHandler:
     def capture_error(self, e: Optional[BaseException] = None) -> None:
         import traceback
 
+        # The traceback is POSTed to the fail-open endpoint; scrub before store.
         if sys.exc_info()[0] is not None:
-            self.payload["error"] = "".join(traceback.format_exc())
+            self.payload["error"] = redact_credentials("".join(traceback.format_exc()))
         elif e is not None:
             exc_type = e.__class__
             tb = e.__traceback__
-            self.payload["error"] = "".join(traceback.format_exception(exc_type, e, tb))
+            self.payload["error"] = redact_credentials(
+                "".join(traceback.format_exception(exc_type, e, tb))
+            )
 
     @property
     def is_enabled(self) -> bool:
@@ -96,6 +112,7 @@ class ErrorHandler:
             self.capture_error()
 
         self.payload["request_id"] = str(state.local_scan_id)
+        self.payload["exit_code"] = exit_code
 
         try:
             requests.post(url, headers=headers, json=self.payload, timeout=3)

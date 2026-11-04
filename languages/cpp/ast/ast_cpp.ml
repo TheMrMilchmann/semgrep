@@ -171,7 +171,7 @@ and typeC =
    * Indeed, 'long long' is not the same than just 'long'.
    * The type_ below is either a TPrimitive or TypeName of IdIdent.
    *)
-  | TSized of sized_type wrap list * type_ option (*  *)
+  | TSized of sized_type wrap list * type_ option (* *)
   | TPointer of tok (*'*'*) * type_ * pointer_modifier list
   (* c++ext: *)
   | TReference of tok (*'&'*) * type_
@@ -476,6 +476,7 @@ and stmt =
   | Jump of jump * sc
   (* labeled *)
   | Label of a_label * tok (* : *) * stmt
+  | LabelDecl of a_label * tok (* : *) * decl
   (* TODO: only inside Switch in theory *)
   | Case of tok * expr * tok (* : *) * case_body
   (* gccext: *)
@@ -486,9 +487,18 @@ and stmt =
   (* co_return and co_yield *)
   | CoStmt of co_operator wrap * expr option
   | AsmStmt of tok * assembler bracket * sc
+  (* Microsoft-specific:
+     https://learn.microsoft.com/en-us/cpp/cpp/try-finally-statement?view=msvc-170
+  *)
+  | MsTry of tok (* "__try__" *) * compound * ms_try_handler
+  | MsLeave of tok (* "__leave" *)
   (* old: c++ext: gccext: there was a DeclStmt and NestedFunc before, but they
    * are now handled by stmt_or_decl *)
   | StmtTodo of todo_category * stmt list
+
+and ms_try_handler =
+  | MsExcept of tok (* "__except" *) * expr paren * compound
+  | MsFinally of tok (* "__finally" *) * compound
 
 (* c++ext: *)
 and co_operator = Co_return | Co_yield
@@ -509,15 +519,18 @@ and condition_clause = condition_initializer option * condition_subject
 
 and for_header =
   | ForClassic of a_expr_or_vars * expr option * expr option
-  (* c++0x? TODO: var_decl can be DStructrured_binding with vinit = None  *)
   | ForRange of
-      (* since c++20 *)
-      condition_initializer option
-      * (type_ * entity)
+      condition_initializer option (* since C++20 *)
+      * declaration_binding
       * tok (*':'*)
       * initialiser
   (* sgrep-ext: *)
   | ForEllipsis of tok (* ... *)
+
+(** A variable declaration's single name or full structured binding. *)
+and declaration_binding =
+  | BindingName of type_ * entity
+  | BindingStructured of type_ * (ident * ident list) bracket
 
 and a_expr_or_vars = (expr_stmt, vars_decl) Either_.t
 and a_label = string wrap
@@ -554,9 +567,9 @@ and exception_declaration = ExnDecl of parameter
 and assembler = {
   (* Should only be a literal string or ConcatString *)
   a_template : expr;
-  a_outputs : ident asm_operand list;
+  a_outputs : expr asm_operand list;
   a_inputs : expr asm_operand list;
-  a_clobbers : ident list;
+  a_clobbers : expr list;
   a_gotos : ident list;
 }
 
@@ -625,6 +638,7 @@ and decl =
       tok (*'namespace'*) * ident * tok (*=*) * a_namespace_name * sc
   (* the namespace can be unnamed *)
   | Namespace of tok * name option * declarations
+  | NamespaceAttributed of tok * attribute * name option * declarations
   (* the list can be empty *)
   | ExternDecl of tok * string wrap (* usually "C" *) * decl
   | ExternList of tok * string wrap * declarations
@@ -635,6 +649,7 @@ and decl =
   (* since c++20 *)
   | Concept of tok (*'concept'*) * ident * tok (*'='*) * expr * sc
   | Friend of tok (* 'friend' *) * decl (* Func or DeclList *)
+  | ConstexprFriend of tok (* 'constexpr' *) * tok (* 'friend' *) * decl
   (* gccext: allow redundant ';' *)
   | EmptyDef of sc
   | NotParsedCorrectly of tok list
@@ -705,7 +720,14 @@ and initialiser =
 
 (* ex: [2].y = x,  or .y[2]  or .y.x. They can be nested *)
 and designator =
-  | DesignatorField of tok (* . *) * ident
+  (* This token is an option, because an alternate (but equivalent) form
+     (deprecated since GCC 2.5) looks like
+     { y: yvalue }
+      instead of
+     { .y = yvalue }
+     https://gcc.gnu.org/onlinedocs/gcc/Designated-Inits.html
+  *)
+  | DesignatorField of tok (* . *) option * ident
   | DesignatorIndex of expr bracket
   | DesignatorRange of (expr * tok (*...*) * expr) bracket
 
@@ -809,7 +831,7 @@ and enum_definition = {
   enum_kind : tok; (* 'enum'  TODO also enum class/struct *)
   enum_name : name option;
   (* TODO: enum_base: *)
-  enum_body : enum_elem list brace;
+  enum_body : enum_elem sequencable list brace;
 }
 
 and enum_elem = { e_name : ident; e_val : (tok (*=*) * a_const_expr) option }
@@ -918,6 +940,10 @@ and type_qualifier =
   | Constinit
   | Consteval
   | NoReturn
+  | Nonnull
+  | StaticArray
+  | MsCallQualifier of string wrap
+  | AlignAsQualifier of argument bracket
   (* https://stackoverflow.com/questions/5323478/how-to-use-extension-and-typeof-in-a-minified-example-in-c *)
   | Extension
 
@@ -1011,6 +1037,7 @@ and a_cppExpr = expr
 
 (* ------------------------------------------------------------------------- *)
 (* cppext: #ifdefs *)
+(* coupling: this is the same as in Ast_c! *)
 (* ------------------------------------------------------------------------- *)
 and 'a sequencable =
   | X of 'a
@@ -1136,14 +1163,11 @@ let get_original_token_location = function
  * used by parsing hacks
  *)
 let make_expanded ii =
-  let no_virt_loc =
-    (* TODO? use Pos.fake_pos? *)
-    let pos = Pos.make 0 in
-    ({ Tok.str = ""; pos }, -1)
-  in
-  Tok.ExpandedTok (get_original_token_location ii, no_virt_loc)
+  let loc = get_original_token_location ii in
+  let virt_loc = (loc, -1) in
+  Tok.ExpandedTok (loc, virt_loc)
 
-let make_param ?(p_name = None) ?(p_specs = []) ?(p_val = None) t =
+let make_param ?p_name ?(p_specs = []) ?p_val t =
   { p_name; p_type = t; p_specs; p_val }
 
 (* used by parsing hacks *)

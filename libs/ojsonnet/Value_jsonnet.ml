@@ -26,6 +26,15 @@ module Core = Core_jsonnet
 (*****************************************************************************)
 (* Values *)
 (*****************************************************************************)
+type local_id = LSelf | LSuper | LId of string
+[@@deriving show { with_path = false }, ord]
+
+module Local_id_map = Map.Make (struct
+  type t = local_id
+
+  let compare = compare_local_id
+end)
+
 type t =
   | Primitive of primitive
   | Array of lazy_value array Core.bracket
@@ -64,14 +73,16 @@ and asserts = Core.obj_assert * env
  * A lazy value was represented originally simply as "t Lazy.t". However, this
  * does not work with the object merge '+' operator, because we need to
  * access the environment in which fields of the object are evaluated in. We
- * can't just build a closure (a Lazy.t), that implicitely has an environment;
+ * can't just build a closure (a Lazy.t), that implicitly has an environment;
  * we need to make explicit the environment (see Closure below).
  * In fact, this is also needed to implement the "late-bound" 'self'.
- * The environment is also neccesary to keep around and for values, since
+ * The environment is also necessary to keep around and for values, since
  * there could be nested objects/arrays which also have lazy semantics
- * themselves, and thus again need to be able to modify a specifc environment
+ * themselves, and thus again need to be able to modify a specific environment.
+ * TODO: putting opaque below here because get stack overflow otherwise
+ * when printing values.
  *)
-and lazy_value = { mutable lv : lazy_value_kind }
+and lazy_value = { mutable lv : lazy_value_kind [@opaque] }
 
 and lazy_value_kind =
   (* when we know the value, which is useful to bind Self/Super *)
@@ -116,10 +127,8 @@ and env = {
   tostring : t -> string;
 }
 
-(* TODO? split? move self/super in separate field outside locals? *)
-and local_id = LSelf | LSuper | LId of string
-
-and locals = (local_id, lazy_value) Map_.t
+(* TODO add a printer here if needed. *)
+and locals = (lazy_value Local_id_map.t[@show.opaque])
 [@@deriving show { with_path = false }]
 
 (*****************************************************************************)
@@ -131,7 +140,7 @@ let empty_obj : t =
 
 let empty_env =
   {
-    locals = Map_.empty;
+    locals = Local_id_map.empty;
     depth = 0;
     in_debug_call = false;
     (* fake implem; Each Eval_jsonnet_xxx.ml need to define those methods *)

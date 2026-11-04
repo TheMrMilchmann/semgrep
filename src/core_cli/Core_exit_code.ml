@@ -1,10 +1,20 @@
 (*
+   Copyright (c) 2021-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Exit semgrep-core cleanly with appropriate logging and error messages.
 *)
 
 open Common
-
-let logger = Logging.get_logger [ __MODULE__ ]
 
 (* Add new cases as needed *)
 type reason =
@@ -30,8 +40,8 @@ let code_of_reason = function
   | Bad_command_line -> 1
   | Unknown_exception _ -> (* same code as an uncaught exception *) 2
 
-let exit_semgrep (caps : Cap.Process.exit) reason =
+let exit_semgrep reason =
   let code = code_of_reason reason in
   let msg = string_of_reason reason in
-  logger#info "exit %i: %s" code msg;
-  CapStdlib.exit caps code
+  Logs.info (fun m -> m "exit %i: %s" code msg);
+  raise (UnixExit (code, msg))

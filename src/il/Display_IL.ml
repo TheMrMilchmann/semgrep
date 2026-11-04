@@ -1,20 +1,46 @@
-open IL
+(*
+   Copyright (c) 2021-2025 Semgrep Inc.
 
-let string_of_type (ty : IL.type_) =
-  match ty.type_.t with
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+open IL
+module G = AST_generic
+
+let string_of_type (ty : G.type_) =
+  match ty.t with
   | TyN (Id (id, _)) -> fst id
   | __else__ -> "<TYPE>"
 
 let string_of_base base =
   match base with
   | Var x -> str_of_name x
+  | VarSpecial (This, _) -> "<this>"
+  | VarSpecial (Self, _) -> "<self>"
   | VarSpecial _ -> "<VarSpecial>"
   | Mem _ -> "<Mem>"
 
 let string_of_offset offset =
   match offset.o with
   | Dot a -> ident_str_of_name a
+  | Index { e = Literal (G.Int parsed_int); _ } -> (
+      match Parsed_int.to_int_opt parsed_int with
+      | Some i -> Common.spf "[%d]" i
+      | None -> "[...]")
+  | Index { e = Literal (G.String (_, (str, _), _)); _ } ->
+      Common.spf "[\"%s\"]" str
   | Index _ -> "[...]"
+
+let string_of_offset_list offset =
+  if offset <> [] then
+    "." ^ String.concat "." (List.map string_of_offset offset)
+  else ""
 
 let string_of_lval { base; rev_offset } =
   string_of_base base
@@ -51,22 +77,20 @@ let rec string_of_exp_kind e =
         (string_of_exp e2)
   | Operator ((op, _), _) -> Common.spf "<OP %s ...>" (G.show_operator op)
   | FixmeExp _ -> "<FIXME-EXP>"
-  | Composite (_, _)
-  | Record _
-  | Cast (_, _) ->
-      "<EXP>"
+  | Composite (_, _) -> "<COMPOSITE>"
+  | RecordOrDict _ -> "<RECORD-OR-DICT>"
+  | Cast (_, _) -> "<CAST>"
 
 and string_of_exp e = string_of_exp_kind e.e
 
 let string_of_argument arg =
   match arg with
-  | Unnamed { e = Fetch lval; _ } -> string_of_lval lval
-  | Unnamed _
-  | Named _ ->
-      "_"
+  | Unnamed e
+  | Named (_, e) ->
+      string_of_exp e
 
 let string_of_arguments args =
-  List_.map string_of_argument args |> String.concat ","
+  List.map string_of_argument args |> String.concat ","
 
 let short_string_of_node_kind nkind =
   match nkind with
@@ -79,16 +103,19 @@ let short_string_of_node_kind nkind =
   | NGoto (_, l) -> "goto " ^ str_of_label l
   | NReturn (_, e) -> Common.spf "return %s" (string_of_exp e)
   | NThrow _ -> "throw ...;"
-  | NLambda params ->
-      let params_strs = List_.map str_of_name params in
-      "LAMBDA " ^ String.concat ", " params_strs
   | NOther (Noop str) -> Common.spf "<noop: %s>" str
   | NOther _ -> "<other>"
+  | NNestedDef entity ->
+      let name_str =
+        match entity.name with
+        | EN name -> str_of_name name
+        | FixmeEntity _ -> "<fixme entity>"
+      in
+      "<def> " ^ name_str
   | NInstr x -> (
       match x.i with
       | Assign (lval, exp) -> string_of_lval lval ^ " = " ^ string_of_exp exp
-      | AssignAnon _ -> " ... = <lambda|class>"
-      | Call (lval_opt, exp, args) ->
+      | AssignCall (lval_opt, { c = Call (exp, args); _ }) ->
           let lval_str =
             match lval_opt with
             | None -> ""
@@ -96,10 +123,8 @@ let short_string_of_node_kind nkind =
           in
           "CALL " ^ lval_str ^ string_of_exp exp ^ "("
           ^ string_of_arguments args ^ ")"
-      | New (lval, ty, _cons, args) ->
-          Common.spf "%s = new %s(%s)" (string_of_lval lval) (string_of_type ty)
-            (string_of_arguments args)
-      | CallSpecial (lval_opt, (call_special, _tok), args) ->
+      | AssignCall
+          (lval_opt, { c = CallSpecial ((call_special, _tok), args); _ }) ->
           let lval_str =
             match lval_opt with
             | None -> ""
@@ -108,15 +133,41 @@ let short_string_of_node_kind nkind =
           Common.spf "<special>%s%s(%s)" lval_str
             (IL.show_call_special call_special)
             (string_of_arguments args)
+      | New (lval, ty, _cons, args) ->
+          Common.spf "%s = new %s(%s)" (string_of_lval lval) (string_of_type ty)
+            (string_of_arguments args)
       | FixmeInstr _ -> "<fix-me instr>")
+  | NMatch scrutinee -> Common.spf "match %s" (str_of_name scrutinee)
+  | NCase (_scrutinee, case) ->
+      Common.spf "with %s"
+        (match case with
+        | PatLiteral lit -> string_of_literal lit
+        | PatWildcard -> "_"
+        | PatVariable var -> str_of_name var
+        | PatConstructor (ctor, params) ->
+            fst ctor.ident ^ "("
+            ^ String.concat ", " (List.map str_of_name params)
+            ^ ")")
   | NTodo _ -> "<to-do stmt>"
 
-let at_exit_mark node str = if node.at_exit then str ^ " @exit" else str
+let short_string_of_node node =
+  let str = short_string_of_node_kind node.n in
+  if node.at_exit then str ^ " @exit" else str
+
+let pp_cfg f ?title (flow : cfg) : unit =
+  flow.graph
+  |> Ograph_call_dot_gv.pp_ograph_mutable_generic ?title
+       ~s_of_node:(fun (_nodei, node) ->
+         (short_string_of_node node, None, None))
+       f
 
 (* using internally graphviz dot and ghostview on X11 *)
-let (display_cfg : cfg -> unit) =
- fun flow ->
+let display_cfg ?title (flow : cfg) : unit =
   flow.graph
-  |> Ograph_call_dot_gv.print_ograph_mutable_generic
+  |> Ograph_call_dot_gv.print_ograph_mutable_generic ?title
+       ?output_file:
+         (Option.map
+            (fun s -> Fpath.(UTmp.get_temp_dir_name () / (s ^ ".dot")))
+            title)
        ~s_of_node:(fun (_nodei, node) ->
-         (short_string_of_node_kind node.n |> at_exit_mark node, None, None))
+         (short_string_of_node node, None, None))

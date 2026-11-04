@@ -1,6 +1,6 @@
 (* Emma Jin, Yoann Padioleau
  *
- * Copyright (C) 2020, 2023 r2c
+ * Copyright (C) 2020, 2023 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -16,6 +16,7 @@ open Common
 open AST_generic
 module G = AST_generic
 module F = Format
+module Log = Log_printing.Log
 
 (*****************************************************************************)
 (* Prelude *)
@@ -64,7 +65,8 @@ type env = { lang : Lang.t; (* indentation level *) level : int }
 (* Helpers *)
 (*****************************************************************************)
 let todo any =
-  UCommon.pr2 (show_any any);
+  Logs_.msg_with_detail ~src:Log_printing.src Logs.Warning
+    "Pretty_print_AST: unhandled AST node" (fun () -> show_any any);
   "*TODO*"
 
 let rec indent = function
@@ -93,10 +95,13 @@ type lang_kind = CLikeSemiColon | Other
 let _lang_kind = function
   | Lang.C
   | Lang.Cpp
+  | Lang.Objc
   | Lang.Java
   | Lang.Apex
   | Lang.Csharp
-  | Lang.Rust ->
+  | Lang.Rust
+  | Lang.Move_on_sui
+  | Lang.Move_on_aptos ->
       CLikeSemiColon
   | _other_ -> Other
 
@@ -165,7 +170,8 @@ let rec stmt env st =
   | DirectiveStmt _
   | DisjStmt (_, _)
   | OtherStmtWithStmt (_, _, _)
-  | OtherStmt (_, _) ->
+  | OtherStmt (_, _)
+  | RawStmt _ ->
       todo (S st)
 
 and label_ident env lbl =
@@ -203,9 +209,13 @@ and if_stmt env (tok, e, s, sopt) =
   (* if cond *)
   let colon_body = F.sprintf "%s:\n%s\n" in
   (* (if cond) body *)
-  let bracket_body = F.sprintf "%s %s" (* (if cond) body *) in
+  let bracket_body =
+    F.sprintf "%s %s"
+    (* (if cond) body *)
+  in
   let format_cond, elseif_str, format_block =
     match env.lang with
+    | Lang.Circom
     | Lang.Cairo
     | Lang.Xml
     | Lang.Dart
@@ -226,6 +236,9 @@ and if_stmt env (tok, e, s, sopt) =
     | Lang.Hack
     | Lang.Yaml
     | Lang.Html
+    | Lang.Gosu
+    | Lang.Powershell
+    | Lang.Fga
     | Lang.Terraform ->
         raise Todo
     | Lang.Python
@@ -237,10 +250,13 @@ and if_stmt env (tok, e, s, sopt) =
     | Lang.Go
     | Lang.C
     | Lang.Cpp
+    | Lang.Objc
     | Lang.Csharp
     | Lang.Json
     | Lang.Jsonnet
     | Lang.Js
+    | Lang.Move_on_sui
+    | Lang.Move_on_aptos
     | Lang.Ts
     | Lang.Vue
     | Lang.Kotlin
@@ -282,6 +298,7 @@ and while_stmt env (tok, e, s) =
   let ruby_while = F.sprintf "%s %s\n %s\nend" in
   let while_format =
     match env.lang with
+    | Lang.Circom
     | Lang.Cairo
     | Lang.Xml
     | Lang.Dart
@@ -302,7 +319,10 @@ and while_stmt env (tok, e, s) =
     | Lang.Solidity
     | Lang.Swift
     | Lang.Html
-    | Lang.Terraform ->
+    | Lang.Terraform
+    | Lang.Gosu
+    | Lang.Powershell
+    | Lang.Fga ->
         raise Todo
     | Lang.Python
     | Lang.Python2
@@ -312,11 +332,14 @@ and while_stmt env (tok, e, s) =
     | Lang.Java
     | Lang.C
     | Lang.Cpp
+    | Lang.Objc
     | Lang.Csharp
     | Lang.Kotlin
     | Lang.Json
     | Lang.Jsonnet
     | Lang.Js
+    | Lang.Move_on_sui
+    | Lang.Move_on_aptos
     | Lang.Ts
     | Lang.Vue
     | Lang.Rust
@@ -333,6 +356,7 @@ and do_while stmt env (s, e) =
   let c_do_while = F.sprintf "do %s\nwhile(%s)" in
   let do_while_format =
     match env.lang with
+    | Lang.Circom
     | Lang.Cairo
     | Lang.Xml
     | Lang.Dart
@@ -353,12 +377,16 @@ and do_while stmt env (s, e) =
     | Lang.Solidity
     | Lang.Swift
     | Lang.Html
+    | Lang.Gosu
+    | Lang.Powershell
+    | Lang.Fga
     | Lang.Terraform ->
         raise Todo
     | Lang.Apex
     | Lang.Java
     | Lang.C
     | Lang.Cpp
+    | Lang.Objc
     | Lang.Csharp
     | Lang.Kotlin
     | Lang.Js
@@ -371,6 +399,8 @@ and do_while stmt env (s, e) =
     | Lang.Go
     | Lang.Json
     | Lang.Jsonnet
+    | Lang.Move_on_sui
+    | Lang.Move_on_aptos
     | Lang.Ocaml
     | Lang.Rust
     | Lang.R ->
@@ -382,6 +412,7 @@ and do_while stmt env (s, e) =
 and for_stmt env (for_tok, hdr, s) =
   let for_format =
     match env.lang with
+    | Lang.Circom
     | Lang.Cairo
     | Lang.Xml
     | Lang.Dart
@@ -401,15 +432,22 @@ and for_stmt env (for_tok, hdr, s) =
     | Lang.Yaml
     | Lang.Scala
     | Lang.Solidity
+    | Lang.Gosu
+    | Lang.Powershell
+    | Lang.Fga
     | Lang.Terraform ->
         raise Todo
     | Lang.Apex
     | Lang.Java
     | Lang.C
     | Lang.Cpp
+    | Lang.Objc
     | Lang.Csharp
     | Lang.Kotlin
     | Lang.Js
+    | Lang.Move_on_sui ->
+        failwith "Move on SUI has for loops????"
+    | Lang.Move_on_aptos
     | Lang.Ts
     | Lang.Vue
     | Lang.Rust
@@ -455,7 +493,7 @@ and for_stmt env (for_tok, hdr, s) =
         F.sprintf "%s; %s; %s" (show_init_list init) (opt_expr cond)
           (opt_expr next)
     | ForEach (pat, tok, e) -> for_each (pat, tok, e)
-    | MultiForEach fors -> String.concat ";" (List_.map multi_for_each fors)
+    | MultiForEach fors -> String.concat ";" (List.map multi_for_each fors)
     | ForEllipsis tok -> token ~d:"..." tok
   in
   let body_str = stmt { env with level = env.level + 1 } s in
@@ -466,9 +504,130 @@ and for_stmt env (for_tok, hdr, s) =
 (*****************************************************************************)
 
 and type_ t =
-  match t.t with
-  | TyN (Id (id, _)) -> ident id
-  | _ -> todo (T t)
+  let attrs_str =
+    match t.t_attrs with
+    | [] -> ""
+    | attrs ->
+        let attr_strs = attrs |> List.map (fun _attr -> "@attr") in
+        " " ^ String.concat " " attr_strs
+  in
+  let base_str =
+    match t.t with
+    | TyN name -> name_to_string name
+    | TyApply (base, (_, args, _)) ->
+        let base_str = type_ base in
+        let args_str =
+          args |> List.map type_argument_to_string |> String.concat ", "
+        in
+        F.sprintf "%s<%s>" base_str args_str
+    | TyFun (params, ret) ->
+        let params_str =
+          params
+          |> List.map (function
+            | Param p -> (
+                match (p.pname, p.ptype) with
+                | Some id, Some ty -> F.sprintf "%s: %s" (ident id) (type_ ty)
+                | Some id, None -> ident id
+                | None, Some ty -> type_ ty
+                | None, None -> "_")
+            | ParamPattern _ -> "<pattern>"
+            | ParamRest (_, p) -> (
+                match (p.pname, p.ptype) with
+                | Some id, Some ty ->
+                    F.sprintf "...%s: %s" (ident id) (type_ ty)
+                | Some id, None -> F.sprintf "...%s" (ident id)
+                | None, Some ty -> F.sprintf "...%s" (type_ ty)
+                | None, None -> "...")
+            | ParamHashSplat (_, p) -> (
+                match (p.pname, p.ptype) with
+                | Some id, Some ty -> F.sprintf "**%s: %s" (ident id) (type_ ty)
+                | Some id, None -> F.sprintf "**%s" (ident id)
+                | None, Some ty -> F.sprintf "**%s" (type_ ty)
+                | None, None -> "**_")
+            | _ -> "_")
+          |> String.concat ", "
+        in
+        F.sprintf "(%s) -> %s" params_str (type_ ret)
+    | TyArray ((_, None, _), ty) -> F.sprintf "%s[]" (type_ ty)
+    | TyArray ((_, Some _size, _), ty) ->
+        (* For expressions, just show simplified form *)
+        F.sprintf "%s[...]" (type_ ty)
+    | TyTuple (_, tys, _) ->
+        let tys_str = tys |> List.map type_ |> String.concat ", " in
+        F.sprintf "(%s)" tys_str
+    | TyVar id -> F.sprintf "'%s" (ident id)
+    | TyAny _ -> "_"
+    | TyPointer (_, ty) -> F.sprintf "*%s" (type_ ty)
+    | TyRef (_, ty) -> F.sprintf "&%s" (type_ ty)
+    | TyQuestion (ty, _) -> F.sprintf "%s?" (type_ ty)
+    | TyRest (_, ty) -> F.sprintf "...%s" (type_ ty)
+    | TyAnd (t1, _, t2) -> F.sprintf "%s & %s" (type_ t1) (type_ t2)
+    | TyOr (t1, _, t2) -> F.sprintf "%s | %s" (type_ t1) (type_ t2)
+    | TyRecordAnon ((kind, _), (_, fields, _)) ->
+        let kind_str =
+          match kind with
+          | Class -> "class"
+          | Interface -> "interface"
+          | Trait -> "trait"
+          | Object -> "object"
+        in
+        let fields_str =
+          if List.length fields > 3 then
+            F.sprintf "{ %d fields }" (List.length fields)
+          else
+            let field_strs =
+              fields
+              |> List.map (function
+                | F { s = DefStmt (ent, FieldDefColon fld); _ } -> (
+                    match (ent.name, fld.vtype) with
+                    | EN (Id (id, _)), Some ty ->
+                        F.sprintf "%s: %s" (ident id) (type_ ty)
+                    | EN (Id (id, _)), None -> ident id
+                    | _ -> "_")
+                | _ -> "_")
+              |> String.concat "; "
+            in
+            F.sprintf "{ %s }" field_strs
+        in
+        F.sprintf "%s %s" kind_str fields_str
+    | TyEllipsis _ -> "..."
+    | TyExpr e -> (
+        (* For simple expressions, show them, otherwise simplify *)
+        match e.e with
+        | L (String _) -> "<string>"
+        | L (Int (Some i, _)) -> Int64.to_string i
+        | L (Bool (b, _)) -> string_of_bool b
+        | N name -> name_to_string name
+        | _ -> "<expr>")
+    | OtherType (kind, _) -> F.sprintf "<other:%s>" (fst kind)
+  in
+  base_str ^ attrs_str
+
+and name_to_string = function
+  | Id (id, _) -> ident id
+  | IdQualified { name_last = id, _; name_middle = None; _ } -> ident id
+  | IdQualified { name_last = id, _; name_middle = Some (QDots parts); _ } ->
+      let parts_str =
+        parts |> List.map (fun ((s, _), _) -> s) |> String.concat "."
+      in
+      F.sprintf "%s.%s" parts_str (ident id)
+  | IdQualified { name_last = id, _; name_middle = Some (QExpr (_e, _)); _ } ->
+      F.sprintf "<expr>.%s" (ident id)
+  | IdSpecial ((special, _), _) -> (
+      match special with
+      | This -> "this"
+      | Super -> "super"
+      | Self -> "self"
+      | Cls -> "cls"
+      | Parent -> "parent")
+
+and type_argument_to_string = function
+  | TA ty -> type_ ty
+  | TAWildcard (_, None) -> "?"
+  | TAWildcard (_, Some ((true, _), ty)) -> F.sprintf "? extends %s" (type_ ty)
+  | TAWildcard (_, Some ((false, _), ty)) -> F.sprintf "? super %s" (type_ ty)
+  | TAExpr _ -> "<expr>"
+  | OtherTypeArg _ -> "?"
 
 (*****************************************************************************)
 (* Definitions *)
@@ -478,6 +637,7 @@ and def_stmt env (entity, def_kind) =
   let var_def (ent, def) =
     let no_val, with_val =
       match env.lang with
+      | Lang.Circom
       | Lang.Cairo
       | Lang.Xml
       | Lang.Dart
@@ -498,12 +658,15 @@ and def_stmt env (entity, def_kind) =
       | Lang.Solidity
       | Lang.Swift
       | Lang.Html
+      | Lang.Gosu
+      | Lang.Powershell
       | Lang.Terraform ->
           raise Todo
       | Lang.Apex
       | Lang.Java
       | Lang.C
       | Lang.Cpp
+      | Lang.Objc
       | Lang.Csharp
       | Lang.Kotlin ->
           ( (fun typ id _e -> F.sprintf "%s %s;" typ id),
@@ -523,6 +686,8 @@ and def_stmt env (entity, def_kind) =
       | Lang.Ruby ->
           ( (fun _typ id _e -> F.sprintf "%s" id),
             fun _typ id e -> F.sprintf "%s = %s" id e )
+      | Lang.Move_on_sui
+      | Lang.Move_on_aptos
       | Lang.Rust ->
           ( (fun typ id _e -> F.sprintf "let %s: %s" id typ),
             fun typ id e -> F.sprintf "let %s: %s = %s" id typ e )
@@ -530,6 +695,9 @@ and def_stmt env (entity, def_kind) =
       | Lang.R ->
           ( (fun _typ id _e -> F.sprintf "%s" id),
             fun _typ id e -> F.sprintf "%s <- %s" id e )
+      | Lang.Fga ->
+          ( (fun _typ id _e -> F.sprintf "define %s:" id),
+            fun _typ id e -> F.sprintf "define %s: %s" id e )
       | Lang.Json
       | Lang.Jsonnet
       | Lang.Ocaml ->
@@ -549,7 +717,7 @@ and def_stmt env (entity, def_kind) =
   | VarDef def -> var_def (entity, def)
   | _ -> todo (S (DefStmt (entity, def_kind) |> G.s))
 
-(* TODO? maybe we should check IdFlags.is_hidden !(id_info.id_flags) *)
+(* TODO? maybe we should check IdFlags.is_fake !(id_info.id_flags) *)
 and ident_or_dynamic = function
   | EN (Id (x, _idinfo)) -> ident x
   | EN _
@@ -566,7 +734,8 @@ and expr env e =
   match e.e with
   | N (Id ((s, _), idinfo)) -> id env (s, idinfo)
   | N (IdQualified qualified_info) -> id_qualified env qualified_info
-  | IdSpecial (sp, tok) -> special env (sp, tok)
+  | N (IdSpecial (special, _)) -> id_special special
+  | Special (sp, tok) -> special env (sp, tok)
   | Call (e1, e2) -> call env (e1, e2)
   | New (_, t, _, es) -> new_call env (t, es)
   | L x -> literal env x
@@ -602,22 +771,27 @@ and canonical_name env = function
 (* TODO: look at name_top too *)
 and id_qualified env { name_last = id, _toptTODO; name_middle; name_top; _ } =
   (match name_top with
-  | None -> ""
-  | Some _t -> "::")
+    | None -> ""
+    | Some _t -> "::")
   ^
   match name_middle with
   | Some (QDots dot_ids) ->
       (* TODO: do not do fst, look also at type qualification *)
-      F.sprintf "%s.%s" (dotted_access env (List_.map fst dot_ids)) (ident id)
+      F.sprintf "%s.%s" (dotted_access env (List.map fst dot_ids)) (ident id)
   | Some (QExpr (e, _t)) -> expr env e ^ "::"
   | None -> ident id
 
-and special env = function
+and id_special = function
   | This, tok -> token ~d:"this" tok
   | Self, tok -> token ~d:"self" tok
+  | Super, tok -> token ~d:"super" tok
+  | Parent, tok -> token ~d:"parent" tok
+  | Cls, tok -> token ~d:"cls" tok
+
+and special env = function
   | Op op, tok -> arithop env (op, tok)
   | IncrDecr _, _ -> "" (* should be captured in the call *)
-  | sp, tok -> todo (E (IdSpecial (sp, tok) |> G.e))
+  | sp, tok -> todo (E (Special (sp, tok) |> G.e))
 
 and new_call env (t, (_, es, _)) =
   let s1 = type_ t in
@@ -626,13 +800,13 @@ and new_call env (t, (_, es, _)) =
 and call env (e, (_, es, _)) =
   let s1 = expr env e in
   match (e.e, es) with
-  | IdSpecial (Op In, _), [ e1; e2 ] ->
+  | Special (Op In, _), [ e1; e2 ] ->
       F.sprintf "%s in %s" (argument env e1) (argument env e2)
-  | IdSpecial (Op NotIn, _), [ e1; e2 ] ->
+  | Special (Op NotIn, _), [ e1; e2 ] ->
       F.sprintf "%s not in %s" (argument env e1) (argument env e2)
-  | IdSpecial (Op _, _), [ x; y ] ->
+  | Special (Op _, _), [ x; y ] ->
       F.sprintf "%s %s %s" (argument env x) s1 (argument env y)
-  | IdSpecial (IncrDecr (i_d, pre_post), _), [ x ] -> (
+  | Special (IncrDecr (i_d, pre_post), _), [ x ] -> (
       let op_str =
         match i_d with
         | Incr -> "++"
@@ -701,6 +875,7 @@ and field_ident env fi =
   match fi with
   | FN (Id (id, _idinfo)) -> ident id
   | FN (IdQualified qualified_info) -> id_qualified env qualified_info
+  | FN (IdSpecial (special, _idinfo)) -> id_special special
   | FDynamic e -> expr env e
 
 and tyvar env (id, typ) =
@@ -747,6 +922,7 @@ let svalue env = function
   | G.Sym e -> Printf.sprintf "sym(%s)" (expr env e)
   | G.Cst t -> Printf.sprintf "cst(%s)" (ctype t)
   | G.Lit l -> Printf.sprintf "lit(%s)" (literal env l)
+  | G.Unknown -> "BOTTOM"
 
 (*****************************************************************************)
 (* Entry points *)

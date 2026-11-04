@@ -1,15 +1,39 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 open Common
 module MV = Metavariable
 module OutJ = Semgrep_output_v1_j
 module OutUtils = Semgrep_output_utils
 module G = AST_generic
 
+(*****************************************************************************)
+(* Prelude *)
+(*****************************************************************************)
+
+(*****************************************************************************)
+(* Types *)
+(*****************************************************************************)
+
 type replacement = {
-  mval_content : string Lazy.t;
+  mval_content : string Lazy_safe.t;
   propagated_content : string option;
 }
 
 type replacement_ctx = (string * replacement) list
+
+(*****************************************************************************)
+(* Helpers *)
+(*****************************************************************************)
 
 let metavar_string_of_any any =
   (* TODO: metavar_string_of_any is used in get_propagated_value
@@ -21,7 +45,7 @@ let metavar_string_of_any any =
   any |> AST_generic_helpers.ii_of_any
   |> List.filter Tok.is_origintok
   |> List.sort Tok.compare_pos
-  |> List_.map Tok.content_of_tok
+  |> List.map Tok.content_of_tok
   |> Core_text_output.join_with_space_if_needed
 
 let propagated_value_string_of_mval mval =
@@ -29,46 +53,50 @@ let propagated_value_string_of_mval mval =
   match any with
   | G.E { e = N (Id (_, id_info)); _ } -> (
       match !(id_info.id_svalue) with
-      | Some (Lit x) ->
+      | Lit x ->
           let any = G.E (G.L x |> G.e) in
           Some (metavar_string_of_any any)
-      | Some (Sym x) ->
+      | Sym x ->
           let any = G.E x in
           Some (metavar_string_of_any any)
-      | Some (Cst _) -> None
-      | Some NotCst -> None
-      | None -> None)
+      | _ -> None)
   | __else__ -> None
+
+(*****************************************************************************)
+(* Entry points *)
+(*****************************************************************************)
 
 let of_bindings bindings =
   bindings
-  |> List_.map_filter (fun (mvar, mval) ->
-         match MV.range_of_mvalue mval with
-         | None -> None
-         | Some (file, mval_range) ->
-             let mval_content = lazy (Range.content_at_range file mval_range) in
-             let propagated_content = propagated_value_string_of_mval mval in
-             Some (mvar, { mval_content; propagated_content }))
+  |> List.filter_map (fun (mvar, mval) ->
+      match MV.range_of_mvalue mval with
+      | None -> None
+      | Some (file, mval_range) ->
+          let mval_content =
+            lazy_safe (Range.content_at_range file mval_range)
+          in
+          let propagated_content = propagated_value_string_of_mval mval in
+          Some (mvar, { mval_content; propagated_content }))
 
 let of_out (metavars : OutJ.metavars) =
   metavars
-  |> List_.map (fun (mvar, metavar_value) ->
-         let mval_content = lazy metavar_value.OutJ.abstract_content in
-         let propagated_content =
-           Option.map
-             (fun svalue -> svalue.OutJ.svalue_abstract_content)
-             metavar_value.propagated_value
-         in
-         (mvar, { mval_content; propagated_content }))
+  |> List.map (fun (mvar, metavar_value) ->
+      let mval_content = lazy_safe metavar_value.OutJ.abstract_content in
+      let propagated_content =
+        Option.map
+          (fun svalue -> svalue.OutJ.svalue_abstract_content)
+          metavar_value.propagated_value
+      in
+      (mvar, { mval_content; propagated_content }))
 
-let interpolate_metavars (text : string) (ctx : replacement_ctx) : string =
+let interpolate_metavars ?fmt (text : string) (ctx : replacement_ctx) : string =
   (* sort by metavariable length to avoid name collisions
    * (eg. $X2 must be handled before $X)
    *)
   let ctx =
     ctx
     |> List.sort (fun (a, _) (b, _) ->
-           compare (String.length b) (String.length a))
+        compare (String.length b) (String.length a))
   in
   ctx
   |> List.fold_left
@@ -84,7 +112,10 @@ let interpolate_metavars (text : string) (ctx : replacement_ctx) : string =
               (fun _whole_str ->
                 match propagated_content with
                 | Some s -> s (* default to the matched value *)
-                | None -> Lazy.force mval_content)
+                | None -> Lazy_safe.force mval_content)
          |> Str.global_substitute (Str.regexp_string mvar) (fun _whole_str ->
-                Lazy.force mval_content))
+             let mval_content = Lazy_safe.force mval_content in
+             Option.fold ~none:mval_content
+               ~some:(fun fmt -> fmt mval_content)
+               fmt))
        text

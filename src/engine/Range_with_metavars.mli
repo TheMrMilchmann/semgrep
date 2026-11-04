@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2021-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* Used in Match_rules to represent a range and all necessary information *)
 (* to return a match *)
 
@@ -10,7 +22,7 @@ type t = {
   r : Range.t;
   mvars : Metavariable.bindings;
   kind : range_kind;
-  origin : Pattern_match.t;
+  origin : Core_match.t;
 }
 [@@deriving show]
 
@@ -18,8 +30,8 @@ type ranges = t list [@@deriving show]
 
 (* Functions *)
 
-val match_result_to_range : Pattern_match.t -> t
-val range_to_pattern_match_adjusted : Rule.rule -> t -> Pattern_match.t
+val match_result_to_range : Core_match.t -> t
+val range_to_pattern_match_adjusted : Rule.rule -> t -> Core_match.t
 
 (* Set functions *)
 

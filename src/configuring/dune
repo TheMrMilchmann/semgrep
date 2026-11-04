@@ -9,14 +9,22 @@
  (libraries
    atdgen-runtime
    commons
+   ppx_deriving_yojson
+   process_limits
  )
- (preprocess (pps ppx_deriving.show ppx_profiling))
+ (preprocess
+   (pps
+     ppx_deriving.show
+     ppx_deriving_yojson
+     ppx_profiling
+   )
+ )
 )
 
 (rule
  (targets Rule_options_j.ml Rule_options_j.mli)
  (deps    Rule_options.atd)
- (action  (run atdgen -j -j-strict-fields -j-std %{deps})))
+ (action  (run atdgen -j -j-strict-fields %{deps})))
 
 (rule
  (targets Rule_options_t.ml Rule_options_t.mli)

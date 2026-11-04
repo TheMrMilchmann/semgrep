@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Main data structures to support gitignore file filtering.
 
    Specification: https://git-scm.com/docs/gitignore
@@ -61,49 +73,36 @@ type level = {
   patterns : path_selectors;
 }
 
-(*
-   A project usually contains a single toplevel .gitignore, but each subdir
-   of this project can also contain a "refining" .gitignore that
-   takes precedence. Here we cache all those .gitignore. The cache
-   also support non-standard ignore files (e.g., .semgrepignore).
+(* The legacy semgrepignore format adds ':include' directives. *)
+type format = Gitignore | Legacy_semgrepignore
 
-   See also Gitignores_cache.create() and Gitignores_cache.load()
+(* 'gitignore_filename' exists because we want to support reading gitignore
+   patterns from files other than '.gitignore' such as '.semgrepignore'.
+
+   The order of the file names defines
+   the order in which multiples file in the same folder are loaded,
+   as if they were concatenated. Multiple files found in the same folder
+   are treated as part of the same level, i.e. the fate of a file is unknown
+   until the patterns of all the gitignore files in the folder were scanned.
 *)
-type gitignores_cache = {
-  project_root : Fpath.t;
-  (* gitignore_filenames is the list of pairs (file kind, file name)
-     for gitignore files. The file kind is the conventional file kind
-     chosen be the user (e.g. "semgrepignore" for ".semgrepignore" files).
-     The default is ["gitignore", ".gitignore"]. In Semgrep, we use
-     [".gitignore"; ".semgrepignore"]. The order of the file names defines
-     the order in which multiples file in the same folder are loaded,
-     as if they were concatenated. Multiple files found in the same folder
-     are treated as part of the same level, i.e. the fate of a file is unknown
-     until the patterns of all the gitignore files in the folder were scanned.
+type gitignore_filename = {
+  (* The file kind is the name for the conventional file kind
+     chosen by the user (e.g. "semgrepignore" for ".semgrepignore" files).
+     This is used in error messages and such.
   *)
-  gitignore_filenames : (string (* kind *) * string (* file name *)) list;
-  (* TODO? why we use a cache? Why not loading all those .gitiginore at once?*)
-  cache : (string, level option) Hashtbl.t;
+  source_kind : string;
+  (* The filename is e.g. '.gitignore' or '.semgrepignore'.
+  *)
+  filename : string;
+  (* Specify if the format is strict Gitignore or some extension. *)
+  format : format;
 }
 
-(*
-   This represents the full gitignore filtering inputs, assuming
-   the sources of gitignore patterns were already parsed and are provided
-   as levels. The actual sources of gitignore patterns and levels
-   are not specified here, allowing nonstandard sources (e.g.,
-   .semgrepignore files).
-
-   See also Gitignore_filter.create() and Gitignore_filter.select().
-*)
-type filter = {
-  project_root : Fpath.t;
-  higher_priority_levels : level list;
-  gitignore_file_cache : gitignores_cache;
-  lower_priority_levels : level list;
-}
+let default_gitignore_filename =
+  { source_kind = "gitignore"; filename = ".gitignore"; format = Gitignore }
 
 (* Final result of a gitignore filter (clearer than a bool) *)
-type status = Not_ignored | Ignored
+type status = Not_ignored | Ignored [@@deriving show]
 
 (*****************************************************************************)
 (* Helpers *)
@@ -133,5 +132,5 @@ let show_selection_event (x : selection_event) : string =
 *)
 let show_selection_events (xs : selection_event list) : string =
   List.rev xs
-  |> List_.map (fun x -> show_selection_event x ^ "\n")
+  |> List.map (fun x -> show_selection_event x ^ "\n")
   |> String.concat ""

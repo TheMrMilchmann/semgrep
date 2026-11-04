@@ -2,7 +2,7 @@
 (* Yoann Padioleau
  *
  * Copyright (C) 2010, 2013, 2014 Facebook
- * Copyright (C) 2019 r2c
+ * Copyright (C) 2019 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -18,6 +18,7 @@ open Common
 
 open Parser_js
 module Flag = Flag_parsing
+module Log = Log_parser_javascript.Log
 
 (*****************************************************************************)
 (* Prelude *)
@@ -53,7 +54,7 @@ let hexa_to_int = function
 (* ---------------------------------------------------------------------- *)
 (* Keywords *)
 (* ---------------------------------------------------------------------- *)
-let keyword_table = Hashtbl_.hash_of_list [
+let keyword_table = Hashtbl_.Base.hash_of_list [
 
   "if",         (fun ii -> T_IF ii);
   "else",       (fun ii -> T_ELSE ii);
@@ -173,31 +174,36 @@ type state_mode =
 
 let default_state = ST_IN_CODE
 
+(* Because we're using DLS here, a JS parser must never invoke an effect,
+ * lest our fiber get migrated to another domain! *)
+
 let _mode_stack =
-  ref [default_state]
+  Domain.DLS.new_key (const [default_state])
 
 (* The logic to modify _last_non_whitespace_like_token is in the
  * caller of the lexer, that is in Parse_js.tokens.
  * Used for ambiguity between / as a divisor and start of regexp.
  *)
 let _last_non_whitespace_like_token =
-  ref (None: Parser_js.token option)
+  Domain.DLS.new_key (const (None: Parser_js.token option))
 
 let reset () =
-  _mode_stack := [default_state];
-   _last_non_whitespace_like_token := None;
+  Domain.DLS.set _mode_stack [default_state];
+  Domain.DLS.set _last_non_whitespace_like_token None;
   ()
 
 let rec current_mode () =
-  match !_mode_stack with
+  match Domain.DLS.get _mode_stack with
   | top :: _ -> top
   | [] ->
-      UCommon.pr2("mode_stack is empty, defaulting to INITIAL");
+      Log.warn (fun m -> m "mode_stack is empty, defaulting to INITIAL");
       reset();
       current_mode ()
 
-let push_mode mode = Stack_.push mode _mode_stack
-let pop_mode () = ignore(Stack_.pop _mode_stack)
+let push_mode mode = Domain.DLS.set _mode_stack (mode :: (Domain.DLS.get _mode_stack))
+let pop_mode () =
+    let ms = Domain.DLS.get _mode_stack in
+    Domain.DLS.set _mode_stack (List_.tl_exn "unexpected empty list" ms)
 let set_mode mode = begin pop_mode(); push_mode mode; end
 
 (* Here is an example of state transition. Given a js file like:
@@ -362,8 +368,8 @@ rule initial = parse
   | ['a'-'z''A'-'Z' '$' '_']['a'-'z''A'-'Z''$''_''0'-'9']* {
       let s = tok lexbuf in
       let info = tokinfo lexbuf in
-      match Common2.optionise (fun () ->
-        Hashtbl.find keyword_table s (* need case insensitive ? *))
+      match
+        Base.Hashtbl.find keyword_table s (* need case insensitive ? *)
       with
       | Some f -> f info
       | None -> T_ID (s, info)
@@ -459,7 +465,7 @@ rule initial = parse
       let s = tok lexbuf in
       let info = tokinfo lexbuf in
 
-      match !_last_non_whitespace_like_token with
+      match Domain.DLS.get _last_non_whitespace_like_token with
       | Some (
             T_INT _ | T_FLOAT _ | T_STRING _ | T_REGEX _
           | T_FALSE _ | T_TRUE _ | T_NULL _
@@ -518,7 +524,7 @@ rule initial = parse
    * in which the quote does not need to be ended.
    *)
   | "<" (XHPTAG as tag) {
-    match !_last_non_whitespace_like_token with
+    match Domain.DLS.get _last_non_whitespace_like_token with
     | Some (
         T_LPAREN _
       | T_SEMICOLON _ (* TODO: somes ambiguities with generics then! *)
@@ -530,11 +536,11 @@ rule initial = parse
       | T_PLING _ | T_COLON _
       | T_LBRACKET _
       | T_AND _ | T_OR _ | T_PLUS _
-    ) when !Flag_parsing_js.jsx ->
+    ) ->
       push_mode (ST_IN_XHP_TAG tag);
       T_XHP_OPEN_TAG(tag, tokinfo lexbuf)
     (* sgrep-ext: *)
-    | None when !Flag.sgrep_mode ->
+    | None when Hook.get Flag.sgrep_mode ->
       push_mode (ST_IN_XHP_TAG tag);
       T_XHP_OPEN_TAG(tag, tokinfo lexbuf)
     | _ ->
@@ -547,7 +553,7 @@ rule initial = parse
     * mostly copy paste from above
     *)
    | "<>" {
-    match !_last_non_whitespace_like_token with
+    match Domain.DLS.get _last_non_whitespace_like_token with
     | Some (
         T_LPAREN _
       | T_SEMICOLON _ (* TODO: somes ambiguities with generics then! *)
@@ -559,7 +565,7 @@ rule initial = parse
       | T_PLING _ | T_COLON _
       | T_LBRACKET _
       | T_AND _ | T_OR _ | T_PLUS _
-    ) when !Flag_parsing_js.jsx
+    )
       ->
       let tag = "" in
       (* we go directly in ST_IN_XHP_TEXT *)
@@ -567,7 +573,7 @@ rule initial = parse
       T_XHP_SHORT_FRAGMENT(tokinfo lexbuf)
 
     (* sgrep-ext: *)
-    | None when !Flag.sgrep_mode ->
+    | None when Hook.get Flag.sgrep_mode ->
       let tag = "" in
       (* we go directly in ST_IN_XHP_TEXT *)
       push_mode (ST_IN_XHP_TEXT tag);

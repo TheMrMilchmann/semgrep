@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2023-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 """
 Target mode configuration for Semgrep Scan
 
@@ -6,18 +18,12 @@ modes: pro (interfile) differential scanning, open-source (per-file)
 differential scanning, and whole scan. Here's a breakdown of their respective
 targeting requirements:
 
-Pro Diff Scan: In this mode, all input files are designated as "targets", and
-specifically, the files that have changed between the head and baseline commits
-are considered "diff targets".
-
 OSS Diff Scan: For OSS differential scanning, the files that have changed
 between the head and baseline commits serve as the primary "targets".
 
 Whole Scan: In the case of the whole scan, all input files are categorized as
 "targets" without any distinction based on commit changes.
 """
-from pathlib import Path
-from typing import FrozenSet
 from typing import Union
 
 from attr import field
@@ -26,62 +32,39 @@ from attr import frozen
 
 @frozen
 class WholeScan:
-    ()
+    pass
+
+
+@frozen
+class HistoricalScan:
+    pass
 
 
 @frozen
 class DiffScan:
-    ()
-
-
-@frozen
-class ProDiffScan:
-    diff_targets: FrozenSet[Path] = field()
-    diff_depth: int = field()
+    pass
 
 
 @frozen
 class TargetModeConfig:
-    scan_type: Union[WholeScan, DiffScan, ProDiffScan] = field()
-
-    @classmethod
-    def pro_diff_scan(
-        cls, diff_targets: FrozenSet[Path], diff_depth: int
-    ) -> "TargetModeConfig":
-        return cls(ProDiffScan(diff_targets, diff_depth))
+    scan_type: Union[WholeScan, HistoricalScan, DiffScan] = field()
 
     @classmethod
     def whole_scan(cls) -> "TargetModeConfig":
         return cls(WholeScan())
 
     @classmethod
+    def historical_scan(cls) -> "TargetModeConfig":
+        return cls(HistoricalScan())
+
+    @classmethod
     def diff_scan(cls) -> "TargetModeConfig":
         return cls(DiffScan())
 
     @property
-    def is_pro_diff_scan(self) -> bool:
-        return isinstance(self.scan_type, ProDiffScan)
+    def is_historical_scan(self) -> bool:
+        return isinstance(self.scan_type, HistoricalScan)
 
     @property
     def is_diff_scan(self) -> bool:
         return isinstance(self.scan_type, DiffScan)
-
-    def get_diff_targets(self) -> FrozenSet[Path]:
-        if isinstance(self.scan_type, WholeScan) or isinstance(
-            self.scan_type, DiffScan
-        ):
-            raise ValueError("not a pro diff scan")
-        elif isinstance(self.scan_type, ProDiffScan):
-            return self.scan_type.diff_targets
-        else:
-            raise ValueError("unknown scan type: " + str(self.scan_type))
-
-    def get_diff_depth(self) -> int:
-        if isinstance(self.scan_type, WholeScan) or isinstance(
-            self.scan_type, DiffScan
-        ):
-            raise ValueError("not a pro diff scan")
-        elif isinstance(self.scan_type, ProDiffScan):
-            return self.scan_type.diff_depth
-        else:
-            raise ValueError("unknown scan type: " + str(self.scan_type))

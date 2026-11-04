@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2021 r2c
+ * Copyright (C) 2019-2021 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -18,7 +18,7 @@
 
 type nodei = Ograph_extended.nodei
 
-module NodeiSet = Set.Make (Int)
+module NodeiSet = Sets.Int_set
 
 (* A graph with its entry point and (for convenience) the pre-computed set of
  * reachable nodes. Since the node type is abstract, we do need the id of the
@@ -38,20 +38,26 @@ let make (graph : _ Ograph_extended.ograph_mutable) entry exit : _ t =
     else
       let seen = NodeiSet.add nodei seen in
       let succs =
-        (graph#successors nodei)#fold
-          (fun s (ni, _) -> NodeiSet.add ni s)
-          NodeiSet.empty
+        Set_.fold
+          (fun (ni, _) s -> NodeiSet.add ni s)
+          (graph#successors nodei) NodeiSet.empty
       in
       NodeiSet.fold aux succs seen
   in
   { graph; entry; exit; reachable = aux entry NodeiSet.empty }
 
+let reachable_nodes cfg =
+  let nodes = cfg.graph#nodes in
+  cfg.reachable |> NodeiSet.to_seq
+  |> Seq.map (fun i -> Maps.Int_map.find i nodes)
+
 (* Predecessors of a node (that can be reached from the entry node). *)
 let predecessors cfg nodei : (nodei * 'node) list =
-  (cfg.graph#predecessors nodei)#tolist
+  Set_.elements (cfg.graph#predecessors nodei)
   |> List.filter (fun (pi, _) -> NodeiSet.mem pi cfg.reachable)
 
 (* Successors of a node (returns an empty list for unreachable nodes). *)
 let successors cfg nodei : (nodei * 'node) list =
-  if NodeiSet.mem nodei cfg.reachable then (cfg.graph#successors nodei)#tolist
+  if NodeiSet.mem nodei cfg.reachable then
+    Set_.elements (cfg.graph#successors nodei)
   else []

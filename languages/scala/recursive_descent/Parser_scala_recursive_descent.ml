@@ -1,6 +1,6 @@
 (* Yoann Padioleau, Matthew McQuaid
  *
- * Copyright (C) 2021-2022 R2C
+ * Copyright (C) 2021-2022 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -20,8 +20,7 @@ module Flag = Flag_parsing
 open Token_scala
 open AST_scala
 module AST = AST_scala
-
-let logger = Logging.get_logger [ __MODULE__ ]
+module Log = Log_parser_scala.Log
 
 (*****************************************************************************)
 (* Prelude *)
@@ -29,7 +28,7 @@ let logger = Logging.get_logger [ __MODULE__ ]
 (* A recursive-descent Scala parser.
  *
  * This is mostly an OCaml port of the Scala2 parser found in
- * https://github.com/scala/scala/src/compiler/scala/tools/nsc/ast/parser/Parsers.scala
+ * https://github.com/scala/scala/blob/2.13.x/src/compiler/scala/tools/nsc/ast/parser/Parsers.scala
  *
  * alt:
  *  - use Parsers.scala of dotty? but the source is longer, and most of
@@ -79,7 +78,7 @@ let logger = Logging.get_logger [ __MODULE__ ]
  *)
 
 (* See also Flag_parsing.debug_parser and Flag_parsing.debug_lexer *)
-let debug_newline = ref false
+let debug_newline = false
 
 (*****************************************************************************)
 (* Types  *)
@@ -162,14 +161,14 @@ type indent_status =
 let n_dash n = Common2.repeat "--" n |> String.concat ""
 
 let with_logging funcname f in_ =
-  if !Flag.debug_parser then (
+  if Hook.get Flag.debug_parser then (
     let save = in_.depth in
     in_.depth <- in_.depth + 1;
     let depth = n_dash in_.depth in
-    logger#info "%s>%s: %s" depth funcname (T.show in_.token);
+    Log.debug (fun m -> m "%s>%s: %s" depth funcname (T.show in_.token));
     let res = f () in
     (* less: pass in_ ? *)
-    logger#info "%s<%s: %s" depth funcname (T.show in_.token);
+    Log.debug (fun m -> m "%s<%s: %s" depth funcname (T.show in_.token));
     in_.depth <- save;
     res)
   else f ()
@@ -180,12 +179,11 @@ let with_logging funcname f in_ =
 let error x in_ =
   let tok = in_.token in
   let info = TH.info_of_tok tok in
-  if !Flag.debug_parser then (
-    UCommon.pr2 (T.show tok);
-    UCommon.pr2 x);
+  if Hook.get Flag.debug_parser then
+    Log.err (fun m -> m "tok =%s, x = %s" (T.show tok) x);
   raise (Parsing_error.Syntax_error info)
 
-let warning s = if !Flag.debug_parser then UCommon.pr2 ("WARNING: " ^ s)
+let warning s = if Hook.get Flag.debug_parser then Log.warn (fun m -> m "%s" s)
 
 (*****************************************************************************)
 (* Helpers  *)
@@ -329,7 +327,8 @@ let getIndentStatus ?(is_opportunistic = false) in_ =
     > prev_indent_width (* we are indented w.r.t. the old indentation region *)
     && (is_opportunistic || prev_is_indent_token)
        (* and the previous token can start an indent *)
-    && (* and this token starts a new line *)
+    &&
+    (* and this token starts a new line *)
     startsNewLine in_
   in
   let is_dedented =
@@ -389,8 +388,19 @@ let adjustSepRegions lastToken in_ =
     | ((RPAREN _ | RBRACKET _ | RBRACE _) as x), y :: ys ->
         if x =~= y then ys
         else
-          (* stricter: original code just does nothing *)
-          error "unmatched closing token" in_
+          (* A closing grouper may need to pop through implicit indent
+             regions (DEDENTs) to find its matching opener. This happens
+             when `)` closes both an indented block and its enclosing
+             parens, e.g.:
+               foo(x =>
+                 expr)
+          *)
+          let rec pop_dedents = function
+            | DEDENT _ :: rest -> pop_dedents rest
+            | top :: rest when x =~= top -> rest
+            | _ -> error "unmatched closing token" in_
+          in
+          pop_dedents (y :: ys)
     | _, xs -> xs
   in
   in_.sepRegions <- newRegions;
@@ -406,9 +416,10 @@ let inSepRegion tok f in_ =
 (* newline: pad: I've added the ~newlines param to differentiante adding
  * a NEWLINE or NEWLINES *)
 let insertNL ?(newlines = false) in_ =
-  if !debug_newline then (
-    logger#info "%s: %s" "insertNL" (T.show in_.token);
-    logger#info "inserting back a newline:%s" (Dumper.dump in_.last_nl));
+  if debug_newline then (
+    Log.debug (fun m -> m "%s: %s" "insertNL" (T.show in_.token));
+    Log.debug (fun m ->
+        m "inserting back a newline:%s" (Dumper.dump in_.last_nl)));
   match in_.last_nl with
   | None -> error "IMPOSSIBLE? no last newline to insert back" in_
   | Some x ->
@@ -431,14 +442,16 @@ let afterLineEnd in_ =
         | DEDENT _ ->
             loop xs
         | _ ->
-            if !debug_newline then
-              logger#info "%s: false because %s" "afterLineEnd" (T.show x);
+            if debug_newline then
+              Log.debug (fun m ->
+                  m "%s: false because %s" "afterLineEnd" (T.show x));
             false)
     | [] -> false
   in
   loop in_.passed |> fun b ->
-  if !debug_newline then
-    logger#info "%s: %s, result = %b" "afterLineEnd" (T.show in_.token) b;
+  if debug_newline then
+    Log.debug (fun m ->
+        m "%s: %s, result = %b" "afterLineEnd" (T.show in_.token) b);
   b
 
 (* ------------------------------------------------------------------------- *)
@@ -458,7 +471,8 @@ let fetchToken in_ =
     match in_.rest with
     | [] -> error "IMPOSSIBLE? fetchToken: no more tokens" in_
     | x :: xs -> (
-        if !Flag.debug_lexer then logger#info "fetchToken: %s" (T.show x);
+        if Hook.get Flag.debug_lexer then
+          Log.debug (fun m -> m "fetchToken: %s" (T.show x));
 
         in_.rest <- xs;
 
@@ -481,6 +495,21 @@ let fetchToken in_ =
   in
   loop [ in_.token ]
 
+(** Peek at the next significant token without consuming anything.
+    Skips Space, Comment, and Nl tokens, matching fetchToken's behavior. *)
+let peekToken in_ : T.token option =
+  let rec loop = function
+    | [] -> None
+    | x :: xs -> (
+        match x with
+        | T.Space _
+        | T.Comment _
+        | T.Nl _ ->
+            loop xs
+        | _ -> Some x)
+  in
+  loop in_.rest
+
 (* ------------------------------------------------------------------------- *)
 (* nextToken *)
 (* ------------------------------------------------------------------------- *)
@@ -502,14 +531,15 @@ let nextToken in_ =
   (if
      afterLineEnd in_ && TH.inLastOfStat lastToken && TH.inFirstOfStat in_.token
      && (match in_.sepRegions with
-        | []
-        | RBRACE _ :: _
-        (* See "note: sepFor" below. *)
-        | Kfor _ :: _
-        | DEDENT _ :: _ ->
-            true
-        | _ -> false)
-     && (* STILL?: not applyBracePatch *)
+       | []
+       | RBRACE _ :: _
+       (* See "note: sepFor" below. *)
+       | Kfor _ :: _
+       | DEDENT _ :: _ ->
+           true
+       | _ -> false)
+     &&
+     (* STILL?: not applyBracePatch *)
      true
    then
      match () with
@@ -616,6 +646,51 @@ let isIndentAfterColon in_ =
   | COLON _ -> lookingAhead (fun in_ -> Option.is_some (passedIndent in_)) in_
   | _ -> false
 
+(* NOTE: "Scala3 optional braces".
+
+  See https://docs.scala-lang.org/scala3/reference/other-new-features/indentation.html#optional-braces-for-method-arguments
+  ColonArgument ::= colon [LambdaStart] indent (CaseClauses | Block) outdent
+  LambdaStart   ::= FunParams ('=>' | '?=>')
+                    | HkTypeParamClause '=>'
+
+  This checks whether a colon ':' is followed by:
+  1. an indented token directly; or,
+  2. a LambdaStart (e.g. `u =>` or `(x, y) =>`) on the same line,
+      then an indented token.
+ *)
+let isColonArgument in_ : bool =
+  match in_.token with
+  | COLON _ ->
+      lookingAhead
+        (fun in_ ->
+          (* Case 1: indent directly after colon *)
+          if Option.is_some (passedIndent in_) then true
+          else
+            (* Case 2: LambdaStart on same line, then indent *)
+            let is_arrow_then_indent () =
+              match in_.token with
+              | ARROW _
+              | OP ("?=>", _) ->
+                  nextToken in_;
+                  Option.is_some (passedIndent in_)
+              | __else__ -> false
+            in
+            match in_.token with
+            | _ when TH.isIdentBool in_.token ->
+                nextToken in_;
+                is_arrow_then_indent ()
+            | USCORE _ ->
+                nextToken in_;
+                is_arrow_then_indent ()
+            | LPAREN _
+            | LBRACKET _ ->
+                (* FunParams or HkTypeParamClause *)
+                skipMatching in_;
+                is_arrow_then_indent ()
+            | __else__ -> false)
+        in_
+  | __else__ -> false
+
 (* Adjust sepRegions to enter a new indent region, if we've
    passed by one.
 *)
@@ -632,40 +707,59 @@ let enterIndentRegion in_ =
       in_.is_indented <- None;
       in_.sepRegions <- DEDENT (line, width) :: in_.sepRegions
 
-(* Adjust sepREgions to end the current indent region, if we're
-   at the end.
+(* Is the current token one that would end an implicit indent region
+   because it belongs to an enclosing context?
+
+   This covers two cases:
+   1. A closing grouper (`)`, `]`, `}`) when the top of sepRegions
+      is DEDENT, meaning the grouper closes an outer scope:
+        bar(x =>
+          (3))
+   2. A comma when we're in an implicit indent region inside parens
+      or brackets, meaning the comma separates arguments in the outer
+      grouper:
+        new Foo(
+          url =
+            "hi",
+          user = "bob")
+*)
+let isClosingIndentRegion in_ =
+  let rec has_grouper_underneath = function
+    | DEDENT _ :: rest -> has_grouper_underneath rest
+    | (RPAREN _ | RBRACKET _) :: _ -> true
+    | _ -> false
+  in
+  match (in_.token, in_.sepRegions) with
+  | (RBRACE _ | RBRACKET _ | RPAREN _), DEDENT _ :: _ -> true
+  | COMMA _, (DEDENT _ :: _ as regions) -> has_grouper_underneath regions
+  | _ -> false
+
+(* Pop the DEDENT off sepRegions to end the current indent region.
+
+   The cases here should be a superset of isClosingIndentRegion,
+   plus the normal DEDENT-token and EOF cases.
 *)
 let closeIndentRegion in_ =
   match (in_.token, in_.sepRegions) with
   | EOF _, _ -> ()
-  (* This check that the DEDENTs match each other was already
-     done, or we wouldn't have stopped on this token in the
-     first place.
-  *)
   | DEDENT _, DEDENT _ :: rest ->
       in_.sepRegions <- rest;
       skipToken in_
+  | _, DEDENT _ :: rest when isClosingIndentRegion in_ -> in_.sepRegions <- rest
   | _ -> failwith "expected closing dedent (probably not emitted correctly)"
 
-(* If this next token is indented, it's quite likely we're inside of an implicit
-   indented blockExpr, which can start off an `expr`.
+(* If this next token is indented, we're inside of an implicit indented
+   blockExpr, which can start off an `expr`.
 
    For instance, something like
    def foo() =
      val x = 3
 
-   It's not guaranteed, however, such as if we saw something like
-
-   def foo() =
-     3
-
-   where `{ 3 }` is not a valid BlockExpr.
-
-   So we will only assume it's an implicit blockExpr if it's both indented,
-   and not the start to an expression.
+   We are permissive here and don't check whether the token is an
+   expression start, because blockExprAsExpr will unwrap single-expression
+   blocks back into plain expressions when appropriate.
 *)
-let isIndentedBlockExprStart in_ =
-  Option.is_some (passedIndent in_) && not (TH.isExprIntro in_.token)
+let isIndentedBlockExprStart in_ = Option.is_some (passedIndent in_)
 
 (*****************************************************************************)
 (* Special parsing  *)
@@ -694,11 +788,11 @@ let nextTokNotClassOrObject =
 let acceptStatSep in_ =
   in_
   |> with_logging "acceptStatSep" (fun () ->
-         match in_.token with
-         | NEWLINE _
-         | NEWLINES _ ->
-             nextToken in_
-         | _ -> accept (SEMI ab) in_)
+      match in_.token with
+      | NEWLINE _
+      | NEWLINES _ ->
+          nextToken in_
+      | _ -> accept (SEMI ab) in_)
 
 let acceptStatSepOpt in_ =
   if not (TH.isStatSeqEnd in_.token) then acceptStatSep in_
@@ -799,25 +893,25 @@ let inGroupers left right body in_ =
 let inBraces f in_ =
   in_
   |> with_logging "inBraces" (fun () ->
-         inGroupers (LBRACE ab) (RBRACE ab) f in_)
+      inGroupers (LBRACE ab) (RBRACE ab) f in_)
 
 let inParens f in_ =
   in_
   |> with_logging "inParens" (fun () ->
-         inGroupers (LPAREN ab) (RPAREN ab) f in_)
+      inGroupers (LPAREN ab) (RPAREN ab) f in_)
 
 let inBrackets f in_ =
   in_
   |> with_logging "inBrackets" (fun () ->
-         inGroupers (LBRACKET ab) (RBRACKET ab) f in_)
+      inGroupers (LBRACKET ab) (RBRACKET ab) f in_)
 
 let inIndented f in_ =
   in_
   |> with_logging "inIndented" (fun () ->
-         enterIndentRegion in_;
-         let res = fb (Tok.unsafe_fake_tok "") (f in_) in
-         closeIndentRegion in_;
-         res)
+      enterIndentRegion in_;
+      let res = fb (Tok.unsafe_fake_tok "") (f in_) in
+      closeIndentRegion in_;
+      res)
 
 (* less: do actual error recovery? *)
 let inBracesOrNil = inBraces
@@ -954,7 +1048,15 @@ let rec selectors ~typeOK in_ : dotted_ident =
       [ ("type", ii) ]
   | _ ->
       let t1 = selector in_ in
-      if in_.token =~= DOT ab then (
+      (* Scala 3: don't consume DOT when followed by `match`. The expression
+       * parser handles `expr.match { ... }` via parseOther / simpleExprRest. *)
+      if
+        in_.token =~= DOT ab
+        && not
+             (match peekToken in_ with
+             | Some (Kmatch _) -> true
+             | _ -> false)
+      then (
         skipToken in_;
         t1 :: selectors ~typeOK in_)
       else [ t1 ]
@@ -1001,54 +1103,58 @@ let mixinQualifierOpt in_ : ident bracket option =
 let path ~thisOK ~typeOK in_ : path =
   in_
   |> with_logging (spf "path(thisOK:%b, typeOK:%b)" thisOK typeOK) (fun () ->
-         match in_.token with
-         | Kthis ii ->
-             nextToken in_;
-             (* ast: t := This(tpnme.Empty) *)
-             let t = This (None, ii) in
-             if (not thisOK) || in_.token =~= DOT ab then (
-               accept (DOT ab) in_;
-               (t, selectors ~typeOK in_))
-             else (t, [])
-         | Ksuper ii ->
-             nextToken in_;
-             let mixins = mixinQualifierOpt in_ in
-             (* ast: t := Super(This(tpnme.EMPTY), x *)
-             accept (DOT ab) in_;
-             let x = selector in_ in
-             let t = Super (None, ii, mixins, x) in
-             if in_.token =~= DOT ab then (
-               skipToken in_;
-               (t, selectors ~typeOK in_))
-             else (t, [])
-         | _ ->
-             let name = ident in_ in
-             (* ast: t := Ident(name) and special stuff in BACKQUOTED_IDENT *)
-             if in_.token =~= DOT ab then (
-               skipToken in_;
-               match in_.token with
-               | Kthis ii ->
-                   nextToken in_;
-                   (* ast: t = This(name.toTypeName) *)
-                   let t = This (Some name, ii) in
-                   if (not thisOK) || in_.token =~= DOT ab then (
-                     accept (DOT ab) in_;
-                     (t, selectors ~typeOK in_))
-                   else (t, [])
-               | Ksuper ii ->
-                   (* pad: factorize with above Ksuper case *)
-                   nextToken in_;
-                   let mixins = mixinQualifierOpt in_ in
-                   (* ast: Super(This(name.toTypeName), x) *)
-                   accept (DOT ab) in_;
-                   let x = selector in_ in
-                   let t = Super (Some name, ii, mixins, x) in
-                   if in_.token =~= DOT ab then (
-                     skipToken in_;
-                     (t, selectors ~typeOK in_))
-                   else (t, [])
-               | _ -> (Id name, selectors ~typeOK in_))
-             else (Id name, []))
+      match in_.token with
+      | Kthis ii ->
+          nextToken in_;
+          (* ast: t := This(tpnme.Empty) *)
+          let t = This (None, ii) in
+          if (not thisOK) || in_.token =~= DOT ab then (
+            accept (DOT ab) in_;
+            (t, selectors ~typeOK in_))
+          else (t, [])
+      | Ksuper ii ->
+          nextToken in_;
+          let mixins = mixinQualifierOpt in_ in
+          (* ast: t := Super(This(tpnme.EMPTY), x *)
+          accept (DOT ab) in_;
+          let x = selector in_ in
+          let t = Super (None, ii, mixins, x) in
+          if in_.token =~= DOT ab then (
+            skipToken in_;
+            (t, selectors ~typeOK in_))
+          else (t, [])
+      | _ ->
+          let name = ident in_ in
+          (* ast: t := Ident(name) and special stuff in BACKQUOTED_IDENT *)
+          if in_.token =~= DOT ab then (
+            skipToken in_;
+            match in_.token with
+            | Kthis ii ->
+                nextToken in_;
+                (* ast: t = This(name.toTypeName) *)
+                let t = This (Some name, ii) in
+                if (not thisOK) || in_.token =~= DOT ab then (
+                  accept (DOT ab) in_;
+                  (t, selectors ~typeOK in_))
+                else (t, [])
+            | Ksuper ii ->
+                (* pad: factorize with above Ksuper case *)
+                nextToken in_;
+                let mixins = mixinQualifierOpt in_ in
+                (* ast: Super(This(name.toTypeName), x) *)
+                accept (DOT ab) in_;
+                let x = selector in_ in
+                let t = Super (Some name, ii, mixins, x) in
+                if in_.token =~= DOT ab then (
+                  skipToken in_;
+                  (t, selectors ~typeOK in_))
+                else (t, [])
+            (* Scala 3: `expr.match { ... }` — match is a valid postfix
+             * keyword after DOT, not an identifier. Return the path ending
+             * here; parseOther will see Kmatch and handle it. *)
+            | Kmatch _ -> (Id name, [])
+            | _ -> (Id name, selectors ~typeOK in_))
+          else (Id name, []))
 
 (** {{{
  *  StableId ::= Id
@@ -1067,27 +1173,46 @@ let stableId in_ : stable_id = path ~thisOK:false ~typeOK:false in_
  * mutual dependencies by using forward references.
  * alt: have all functions mutually recursive
  *)
+
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let interpolatedString_ =
   ref (fun ~inPattern _ ->
       ignore inPattern;
       failwith "forward ref not set")
 
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let exprTypeArgs_ = ref (fun _ -> failwith "forward ref not set")
+
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let annotTypeRest_ = ref (fun _ -> failwith "forward ref not set")
+
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let template_ = ref (fun _ -> failwith "forward ref not set")
+
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let defOrDcl_ = ref (fun _ _ -> failwith "forward ref not set")
+
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let tmplDef_ = ref (fun _ -> failwith "forward ref not set")
+
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let blockStatSeq_ = ref (fun _ -> failwith "forward ref not set")
 
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let indentedExprOrBlockStatSeqUntil_ =
   ref (fun _ ~until:_ -> failwith "forward ref not set")
 
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let packageOrPackageObject_ = ref (fun _ _ -> failwith "forward ref not set")
+
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let typeCaseClauses_ = ref (fun _ -> failwith "forward ref not set")
 
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let paramClauseInner_ =
   ref (fun ~caseParam:_ ~endTok:_ _ _ -> failwith "forward ref not set")
 
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let paramType_ =
   ref (fun ?repeatedParameterOK _ ->
       ignore repeatedParameterOK;
@@ -1103,7 +1228,7 @@ let paramType_ =
  *                  | null
  *  }}}
 *)
-let literal ?(isNegated = None) ?(inPattern = false) in_ : literal =
+let literal ?isNegated ?(inPattern = false) in_ : literal =
   in_
   |> with_logging
        (spf "literal(isNegated:%s, inPattern:%b)" (Dumper.dump isNegated)
@@ -1211,28 +1336,28 @@ let is_typed_fun_param_after_lparen in_ =
 let rec typ in_ : type_ =
   in_
   |> with_logging "typ" (fun () ->
-         (* CHECK: placeholderTypeBoundary *)
-         let t =
-           match in_.token with
-           | LBRACKET _ -> funType in_
-           | LPAREN _ when is_typed_fun_param_after_lparen in_ -> funType in_
-           | LPAREN _ -> tupleInfixType in_
-           | _ -> infixType FirstOp in_
-         in
-         match in_.token with
-         | ARROW ii ->
-             skipToken in_;
-             let t2 = typ in_ in
-             (* ast: makeFunctionTypeTree t t2 *)
-             TyFunction1 (t, ii, t2)
-         | KforSome ii ->
-             skipToken in_;
-             makeExistentialTypeTree t ii in_
-         | Kmatch ii ->
-             skipToken in_;
-             let _, type_case_clauses, _ = inBraces !typeCaseClauses_ in_ in
-             TyMatch (t, ii, type_case_clauses)
-         | _ -> t)
+      (* CHECK: placeholderTypeBoundary *)
+      let t =
+        match in_.token with
+        | LBRACKET _ -> funType in_
+        | LPAREN _ when is_typed_fun_param_after_lparen in_ -> funType in_
+        | LPAREN _ -> tupleInfixType in_
+        | _ -> infixType FirstOp in_
+      in
+      match in_.token with
+      | ARROW ii ->
+          skipToken in_;
+          let t2 = typ in_ in
+          (* ast: makeFunctionTypeTree t t2 *)
+          TyFunction1 (t, ii, t2)
+      | KforSome ii ->
+          skipToken in_;
+          makeExistentialTypeTree t ii in_
+      | Kmatch ii ->
+          skipToken in_;
+          let _, type_case_clauses, _ = inBraces !typeCaseClauses_ in_ in
+          TyMatch (t, ii, type_case_clauses)
+      | _ -> t)
 
 (** {{{
  *  FunType ::= FunTypeArgs (`=>` | `?=>') Type
@@ -1309,77 +1434,77 @@ and infixType mode in_ : type_ =
 and infixTypeRest t _modeTODO in_ : type_ =
   in_
   |> with_logging "infixTypeRest" (fun () ->
-         (* Detect postfix star for repeated args.
-          * Only RPAREN can follow, but accept COMMA and EQUALS for error's sake.
-          * Take RBRACE as a paren typo.
-          *)
-         let checkRepeatedParam in_ =
-           if TH.isRawStar in_.token then
-             lookingAhead
-               (fun in_ ->
-                 match in_.token with
-                 | RPAREN ii (* the good one *)
-                 | COMMA ii
-                 | EQUALS ii (* error recovery *)
-                 | RBRACE ii (* probably typo *) ->
-                     Some ii
-                 | _ -> None)
-               in_
-           else None
-         in
-         let asInfix in_ : type_ =
-           (* AST: let leftAssoc = nme.isLeftAssoc(in.name) *)
-           let leftAssoc = false in
-           warning "InfixTypeRest: leftAssoc??";
-           (* AST: if (mode != InfixMode.FirstOp) checkAssoc ... *)
-           let tycon = identForType in_ in
-           newLineOptWhenFollowing TH.isTypeIntroToken in_;
-           (* AST: let mkOp t1 = AppliedTypeTree(tycon, List(t, t1)) *)
-           if leftAssoc then
-             let t2 = compoundType in_ in
-             let x = TyInfix (t, tycon, t2) in
-             (* ast: mkOp(x) *)
-             infixTypeRest x LeftOp in_
-           else
-             let t2 = infixType RightOp in_ in
-             (* ast: mkOp(x) *)
-             TyInfix (t, tycon, t2)
-         in
-         if TH.isIdentBool in_.token then
-           match checkRepeatedParam in_ with
-           | None -> asInfix in_
-           | Some ii -> TyRepeated (t, ii)
-         else t)
+      (* Detect postfix star for repeated args.
+       * Only RPAREN can follow, but accept COMMA and EQUALS for error's sake.
+       * Take RBRACE as a paren typo.
+       *)
+      let checkRepeatedParam in_ =
+        if TH.isRawStar in_.token then
+          lookingAhead
+            (fun in_ ->
+              match in_.token with
+              | RPAREN ii (* the good one *)
+              | COMMA ii
+              | EQUALS ii (* error recovery *)
+              | RBRACE ii (* probably typo *) ->
+                  Some ii
+              | _ -> None)
+            in_
+        else None
+      in
+      let asInfix in_ : type_ =
+        (* AST: let leftAssoc = nme.isLeftAssoc(in.name) *)
+        let leftAssoc = false in
+        warning "InfixTypeRest: leftAssoc??";
+        (* AST: if (mode != InfixMode.FirstOp) checkAssoc ... *)
+        let tycon = identForType in_ in
+        newLineOptWhenFollowing TH.isTypeIntroToken in_;
+        (* AST: let mkOp t1 = AppliedTypeTree(tycon, List(t, t1)) *)
+        if leftAssoc then
+          let t2 = compoundType in_ in
+          let x = TyInfix (t, tycon, t2) in
+          (* ast: mkOp(x) *)
+          infixTypeRest x LeftOp in_
+        else
+          let t2 = infixType RightOp in_ in
+          (* ast: mkOp(x) *)
+          TyInfix (t, tycon, t2)
+      in
+      if TH.isIdentBool in_.token then
+        match checkRepeatedParam in_ with
+        | None -> asInfix in_
+        | Some ii -> TyRepeated (t, ii)
+      else t)
 
 (* () must be () => R; (types) could be tuple or (types) => R *)
 and tupleInfixType in_ : type_ =
   in_
   |> with_logging "tupleInfixType" (fun () ->
-         if not (in_.token =~= LPAREN ab) then
-           error "first token must be a left parenthesis" in_;
-         let ts =
-           inParens
-             (fun in_ ->
-               match in_.token with
-               | RPAREN _ -> []
-               | _ -> functionTypes in_)
-             in_
-         in
-         match in_.token with
-         | ARROW ii ->
-             skipToken in_;
-             let t = typ in_ in
-             (* ast: makeSafeFunctionType(ts, t) *)
-             TyFunction2 (ts, ii, t)
-         (* CHECK: if is.isEmpty "Illegal literal type (), use Unit instead" *)
-         | _ ->
-             (* CHECK: ts foreach checkNotByNameOrVarargs *)
-             (* ast: makeSafeTupleType(ts) *)
-             let tuple = TyTuple ts in
-             let str = simpleTypeRest tuple in_ in
-             let atr = !annotTypeRest_ str in_ in
-             let ctr = compoundTypeRest (Some atr) in_ in
-             infixTypeRest ctr FirstOp in_)
+      if not (in_.token =~= LPAREN ab) then
+        error "first token must be a left parenthesis" in_;
+      let ts =
+        inParens
+          (fun in_ ->
+            match in_.token with
+            | RPAREN _ -> []
+            | _ -> functionTypes in_)
+          in_
+      in
+      match in_.token with
+      | ARROW ii ->
+          skipToken in_;
+          let t = typ in_ in
+          (* ast: makeSafeFunctionType(ts, t) *)
+          TyFunction2 (ts, ii, t)
+      (* CHECK: if is.isEmpty "Illegal literal type (), use Unit instead" *)
+      | _ ->
+          (* CHECK: ts foreach checkNotByNameOrVarargs *)
+          (* ast: makeSafeTupleType(ts) *)
+          let tuple = TyTuple ts in
+          let str = simpleTypeRest tuple in_ in
+          let atr = !annotTypeRest_ str in_ in
+          let ctr = compoundTypeRest (Some atr) in_ in
+          infixTypeRest ctr FirstOp in_)
 
 (** {{{
  *  SimpleType       ::=  SimpleType TypeArgs
@@ -1395,43 +1520,42 @@ and tupleInfixType in_ : type_ =
 and simpleType in_ : type_ =
   in_
   |> with_logging "simpleType" (fun () ->
-         match in_.token with
-         | t when TH.isLiteral t && not (t =~= Knull ab) ->
-             let x = literal in_ in
-             (* ast: SingletonTypeTree(x) *)
-             (* scala3: restrict to simple_literal *)
-             TyLiteral x
-         | MINUS ii when lookingAhead (fun in_ -> TH.isNumericLit in_.token) in_
-           ->
-             nextToken in_;
-             let x = literal ~isNegated:(Some ii) in_ in
-             (* ast: SingletonTypeTree(x) *)
-             TyLiteral x
-         (* See https://docs.scala-lang.org/scala3/reference/changed-features/wildcards.html *)
-         | OP ("?", _) ->
-             let ii = TH.info_of_tok in_.token in
-             skipToken in_;
-             let bounds = typeBounds in_ in
-             TyAnon (ii, bounds)
-         | _ ->
-             let start =
-               match in_.token with
-               | LPAREN _ ->
-                   (* CHECK: "Illegal literal type (), use Unit instead" *)
-                   let xs = inParens types in_ in
-                   (* ast: makeSafeTupleType *)
-                   TyTuple xs
-               | t when TH.isWildcardType t ->
-                   let ii = TH.info_of_tok in_.token in
-                   skipToken in_;
-                   let bounds = wildcardType in_ in
-                   TyWildcard (ii, bounds)
-               | _ ->
-                   let x = path ~thisOK:false ~typeOK:true in_ in
-                   (* ast: convertToTypeId if not SingletonTypeTree *)
-                   TyName x
-             in
-             simpleTypeRest start in_)
+      match in_.token with
+      | t when TH.isLiteral t && not (t =~= Knull ab) ->
+          let x = literal in_ in
+          (* ast: SingletonTypeTree(x) *)
+          (* scala3: restrict to simple_literal *)
+          TyLiteral x
+      | MINUS ii when lookingAhead (fun in_ -> TH.isNumericLit in_.token) in_ ->
+          nextToken in_;
+          let x = literal ~isNegated:ii in_ in
+          (* ast: SingletonTypeTree(x) *)
+          TyLiteral x
+      (* See https://docs.scala-lang.org/scala3/reference/changed-features/wildcards.html *)
+      | OP ("?", _) ->
+          let ii = TH.info_of_tok in_.token in
+          skipToken in_;
+          let bounds = typeBounds in_ in
+          TyAnon (ii, bounds)
+      | _ ->
+          let start =
+            match in_.token with
+            | LPAREN _ ->
+                (* CHECK: "Illegal literal type (), use Unit instead" *)
+                let xs = inParens types in_ in
+                (* ast: makeSafeTupleType *)
+                TyTuple xs
+            | t when TH.isWildcardType t ->
+                let ii = TH.info_of_tok in_.token in
+                skipToken in_;
+                let bounds = wildcardType in_ in
+                TyWildcard (ii, bounds)
+            | _ ->
+                let x = path ~thisOK:false ~typeOK:true in_ in
+                (* ast: convertToTypeId if not SingletonTypeTree *)
+                TyName x
+          in
+          simpleTypeRest start in_)
 
 and simpleTypeRest t in_ : type_ =
   match in_.token with
@@ -1635,7 +1759,7 @@ let exprSimpleType x : type_ = outPattern simpleType x
 let typeOrInfixType location in_ : type_ =
   in_
   |> with_logging "typeOrInfixType" (fun () ->
-         if location =*= Local then typ in_ else startInfixType in_)
+      if location =*= Local then typ in_ else startInfixType in_)
 
 (** {{{
  *  TypedOpt ::= [`:` Type]
@@ -1667,18 +1791,18 @@ let typedOpt in_ =
 let rec pattern in_ : pattern =
   in_
   |> with_logging "pattern" (fun () ->
-         let rec loop () =
-           let p1 = pattern1 in_ in
-           if TH.isRawBar in_.token then (
-             let ii = TH.info_of_tok in_.token in
-             nextToken in_;
-             let p2 = loop () in
-             PatDisj (p1, ii, p2))
-           else p1
-         in
-         let res = loop () in
-         (* ast: makeAlternative if many elements *)
-         res)
+      let rec loop () =
+        let p1 = pattern1 in_ in
+        if TH.isRawBar in_.token then (
+          let ii = TH.info_of_tok in_.token in
+          nextToken in_;
+          let p2 = loop () in
+          PatDisj (p1, ii, p2))
+        else p1
+      in
+      let res = loop () in
+      (* ast: makeAlternative if many elements *)
+      res)
 
 (** {{{
  *  Pattern1    ::= boundvarid `:` TypePat
@@ -1734,45 +1858,43 @@ and pattern2 in_ : pattern =
 and pattern3 in_ : pattern =
   in_
   |> with_logging "pattern3" (fun () ->
-         (* CHECK: badPattern3 *)
-         let top = simplePattern in_ in
-         (* AST: let base = opstack *)
-         let checkWildStar in_ =
-           warning "checkWildStar, incomplete";
-           (* crazy: if top = USCORE && sequenceOK && peekingAhead ... *)
-           match in_.token with
-           | STAR ii ->
-               nextToken in_;
-               Some ii
-           | _ -> None
-         in
-         let rec loop top in_ =
-           in_
-           |> with_logging "pattern3: loop" (fun () ->
-                  (* AST: let next = reducePatternStack(base, top) *)
-                  let next = () in
-                  if TH.isIdentBool in_.token && not (TH.isRawBar in_.token)
-                  then
-                    let id, _targsTODO = pushOpInfo next in_ in
-                    (* no postfixPattern, so always go for right part of infix op *)
-                    let t2 = simplePattern in_ in
-                    let x = PatInfix (top, id, t2) in
-                    loop x in_
-                  else
-                    in_
-                    |> with_logging "pattern3: loop noIsIdent stop" (fun () ->
-                           top))
-         in
-         match checkWildStar in_ with
-         | None ->
-             let x = loop top in_ in
-             stripParens x
-         | Some istar -> (
-             (* ast: x *)
-             match top with
-             | PatVarid ("_", iuscore) -> PatUnderscoreStar (iuscore, istar)
-             (* stricter: *)
-             | _ -> error "star patterns works only with wildcard" in_))
+      (* CHECK: badPattern3 *)
+      let top = simplePattern in_ in
+      (* AST: let base = opstack *)
+      let checkWildStar in_ =
+        warning "checkWildStar, incomplete";
+        (* crazy: if top = USCORE && sequenceOK && peekingAhead ... *)
+        match in_.token with
+        | STAR ii ->
+            nextToken in_;
+            Some ii
+        | _ -> None
+      in
+      let rec loop top in_ =
+        in_
+        |> with_logging "pattern3: loop" (fun () ->
+            (* AST: let next = reducePatternStack(base, top) *)
+            let next = () in
+            if TH.isIdentBool in_.token && not (TH.isRawBar in_.token) then
+              let id, _targsTODO = pushOpInfo next in_ in
+              (* no postfixPattern, so always go for right part of infix op *)
+              let t2 = simplePattern in_ in
+              let x = PatInfix (top, id, t2) in
+              loop x in_
+            else
+              in_
+              |> with_logging "pattern3: loop noIsIdent stop" (fun () -> top))
+      in
+      match checkWildStar in_ with
+      | None ->
+          let x = loop top in_ in
+          stripParens x
+      | Some istar -> (
+          (* ast: x *)
+          match top with
+          | PatVarid ("_", iuscore) -> PatUnderscoreStar (iuscore, istar)
+          (* stricter: *)
+          | _ -> error "star patterns works only with wildcard" in_))
 
 (** {{{
  *  Patterns ::= Pattern { `,` Pattern }
@@ -1802,74 +1924,75 @@ and patterns in_ = commaSeparated pattern in_
 and simplePattern in_ : pattern =
   in_
   |> with_logging "simplePattern" (fun () ->
-         match in_.token with
-         (* pad: the code was written in a very different way by doing that
-          * below, given isIdentBool will say yes for MINUS
+      match in_.token with
+      (* pad: the code was written in a very different way by doing that
+            below, given isIdentBool will say yes for MINUS
           *)
-         (* matthew: [val - = expr] and [case - => expr] and [- <- expr] are valid Scala, so we check that - is not the end of the pattern *)
-         | MINUS ii
-           when lookingAhead
-                  (fun in_ ->
-                    match in_.token with
-                    | EQUALS _
-                    | ARROW _
-                    | LARROW _ ->
-                        false
-                    | _ -> true)
-                  in_ ->
-             nextToken in_;
-             let x = literal ~isNegated:(Some ii) ~inPattern:true in_ in
-             PatLiteral x
-         | x when TH.isIdentBool x || x =~= Kthis ab -> (
-             let t = stableId in_ in
-             (* less: if t = Ident("-") literal isNegated:true inPattern:true *)
-             let typeAppliedTree =
-               match in_.token with
-               | LBRACKET _ ->
-                   let xs = typeArgs in_ in
-                   (* ast: AppliedTypeTree(convertToTypeId(t), xs) *)
-                   Some xs
-               | _ -> None (* ast: t *)
-             in
-             let args =
-               match in_.token with
-               | LPAREN _ ->
-                   (* ast: Apply(typeAppliedTree, t) *)
-                   Some (argumentPatterns in_)
-               | _ ->
-                   (* ast: typeAppliedTree *)
-                   None
-             in
-             match (t, typeAppliedTree, args) with
-             | (Id (s, ii), []), None, None when AST.is_variable_name s ->
-                 PatVarid (s, ii)
-             | t, None, None -> PatName t
-             | t, x1, x2 -> PatApply (t, x1, x2))
-         | USCORE ii ->
-             nextToken in_;
-             (* ast: Ident(nme.WILDCARD) *)
-             PatVarid (AST.wildcard, ii)
-         | LPAREN _ ->
-             let xs = makeParens (noSeq patterns) in_ in
-             PatTuple xs
-         | x when TH.isLiteral x ->
-             let x = literal ~inPattern:true in_ in
-             PatLiteral x
-         | QUOTE quote ->
-             let x = quoted quote in_ in
-             PatQuoted x
-         | Ellipsis t ->
-             nextToken in_;
-             PatEllipsis t
-         (* scala3: deprecated XMLSTART *)
-         | _ -> error "illegal start of simple pattern" in_)
+      (* matthew: [val - = expr] and [case - => expr] and [- <- expr] are valid Scala, so we check that - is not the end of the pattern *)
+      | MINUS ii
+        when lookingAhead
+               (fun in_ ->
+                 match in_.token with
+                 | EQUALS _
+                 | ARROW _
+                 | LARROW _ ->
+                     false
+                 | _ -> true)
+               in_ ->
+          nextToken in_;
+          let x = literal ~isNegated:ii ~inPattern:true in_ in
+          PatLiteral x
+      | x when TH.isIdentBool x || x =~= Kthis ab -> (
+          let t = stableId in_ in
+          (* less: if t = Ident("-") literal isNegated:true inPattern:true *)
+          let typeAppliedTree =
+            match in_.token with
+            | LBRACKET _ ->
+                let xs = typeArgs in_ in
+                (* ast: AppliedTypeTree(convertToTypeId(t), xs) *)
+                Some xs
+            | _ -> None (* ast: t *)
+          in
+          let args =
+            match in_.token with
+            | LPAREN _ ->
+                (* ast: Apply(typeAppliedTree, t) *)
+                Some (argumentPatterns in_)
+            | _ ->
+                (* ast: typeAppliedTree *)
+                None
+          in
+          match (t, typeAppliedTree, args) with
+          | (Id (s, ii), []), None, None
+            when AST.is_variable_name s || AST_generic.is_metavar_name s ->
+              PatVarid (s, ii)
+          | t, None, None -> PatName t
+          | t, x1, x2 -> PatApply (t, x1, x2))
+      | USCORE ii ->
+          nextToken in_;
+          (* ast: Ident(nme.WILDCARD) *)
+          PatVarid (AST.wildcard, ii)
+      | LPAREN _ ->
+          let xs = makeParens (noSeq patterns) in_ in
+          PatTuple xs
+      | x when TH.isLiteral x ->
+          let x = literal ~inPattern:true in_ in
+          PatLiteral x
+      | QUOTE quote ->
+          let x = quoted quote in_ in
+          PatQuoted x
+      | Ellipsis t ->
+          nextToken in_;
+          PatEllipsis t
+      (* scala3: deprecated XMLSTART *)
+      | _ -> error "illegal start of simple pattern" in_)
 
 and argumentPatterns in_ : pattern list bracket =
   in_
   |> with_logging "argumentPatterns" (fun () ->
-         inParens
-           (fun in_ -> if in_.token =~= RPAREN ab then [] else seqPatterns in_)
-           in_)
+      inParens
+        (fun in_ -> if in_.token =~= RPAREN ab then [] else seqPatterns in_)
+        in_)
 
 (** {{{
  *  Quoted     ::=  ‘'’ ‘{’ Block ‘}’
@@ -1879,15 +2002,15 @@ and argumentPatterns in_ : pattern list bracket =
 and quoted quote_tok in_ =
   in_
   |> with_logging (spf "quoted") (fun () ->
-         nextToken in_;
-         match in_.token with
-         | LBRACE _ ->
-             let x = inBraces !blockStatSeq_ in_ in
-             QuotedBlock (quote_tok, x)
-         | LBRACKET _ ->
-             let x = inBrackets typ in_ in
-             QuotedType (quote_tok, x)
-         | _ -> error "error in quoted expr: brace or bracket expected" in_)
+      nextToken in_;
+      match in_.token with
+      | LBRACE _ ->
+          let x = inBraces !blockStatSeq_ in_ in
+          QuotedBlock (quote_tok, x)
+      | LBRACKET _ ->
+          let x = inBrackets typ in_ in
+          QuotedType (quote_tok, x)
+      | _ -> error "error in quoted expr: brace or bracket expected" in_)
 
 (* ------------------------------------------------------------------------- *)
 (* Context sensitive choices *)
@@ -2024,6 +2147,7 @@ and parseOther ?(is_block_expr = false) location (in_ : env) : expr =
              let def =
                {
                  fkind = (LambdaArrow, ii);
+                 ftparams = None;
                  fparams = [ params ];
                  frettype = None;
                  fbody = Some fbody;
@@ -2042,11 +2166,11 @@ and parseOther ?(is_block_expr = false) location (in_ : env) : expr =
 and postfixExpr ?(is_block_expr = false) in_ : expr =
   in_
   |> with_logging "postfixExpr" (fun () ->
-         (* TODO: AST: opstack, reduce *)
-         let rec loop top in_ =
-           in_
-           |> with_logging "postfixExpr:loop" (fun () ->
-                  (* In Scala 3, we can have if statements that look like
+      (* TODO: AST: opstack, reduce *)
+      let rec loop top in_ =
+        in_
+        |> with_logging "postfixExpr:loop" (fun () ->
+            (* In Scala 3, we can have if statements that look like
                      if <expr> then <expr> else <expr>
 
                      Except, in Scala 3, `then` is also a soft keyword.
@@ -2055,38 +2179,37 @@ and postfixExpr ?(is_block_expr = false) in_ : expr =
                        <expr> then
                      as a postfix application of `then` to <expr>.
                   *)
-                  if
-                    (not (TH.isIdentBool in_.token))
-                    || in_.token =~= ID_LOWER ("then", ab)
-                  then
-                    in_
-                    |> with_logging "postfixExpr:loop: noIdentBool, stop"
-                         (fun () -> top)
-                  else
-                    (* isIdentBool is true; remember that operators are identifiers and
-                     * that Scala allows any identifier in infix position
+            if
+              (not (TH.isIdentBool in_.token))
+              || in_.token =~= ID_LOWER ("then", ab)
+            then
+              in_
+              |> with_logging "postfixExpr:loop: noIdentBool, stop" (fun () ->
+                  top)
+            else
+              (* isIdentBool is true; remember that operators are identifiers and
+                       that Scala allows any identifier in infix position
                      *)
-                    (* AST: pushOpInfo(reduceExprStack(base, top)) *)
-                    let id, _targsTODO = pushOpInfo top in_ in
-                    newLineOptWhenFollowing TH.isExprIntro in_;
-                    if TH.isExprIntro in_.token then
-                      let res = prefixExpr in_ in
-                      match res with
-                      (*| None -> (* AST: reduceExprStack(base, top) *) None
+              (* AST: pushOpInfo(reduceExprStack(base, top)) *)
+              let id, _targsTODO = pushOpInfo top in_ in
+              newLineOptWhenFollowing TH.isExprIntro in_;
+              if TH.isExprIntro in_.token then
+                let res = prefixExpr in_ in
+                match res with
+                (*| None -> (* AST: reduceExprStack(base, top) *) None
                         | Some *)
-                      | next ->
-                          let next = Infix (top, id, next) in
-                          loop next in_
-                    else
-                      in_
-                      |> with_logging "postfixExpr:loop: noExprIntro, stop"
-                           (fun () ->
-                             (* AST: finishPostfixOp(base, popOpInfo()) *)
-                             Postfix (top, id)))
-         in
-         let res = prefixExpr ~is_block_expr in_ in
-         (* AST: reduceExprStack (res) *)
-         loop res in_)
+                | next ->
+                    let next = Infix (top, id, next) in
+                    loop next in_
+              else
+                in_
+                |> with_logging "postfixExpr:loop: noExprIntro, stop" (fun () ->
+                    (* AST: finishPostfixOp(base, popOpInfo()) *)
+                    Postfix (top, id)))
+      in
+      let res = prefixExpr ~is_block_expr in_ in
+      (* AST: reduceExprStack (res) *)
+      loop res in_)
 
 (** {{{
  *  PrefixExpr   ::= [`-` | `+` | `~` | `!`] SimpleExpr
@@ -2104,7 +2227,7 @@ and prefixExpr ?(is_block_expr = false) in_ : expr =
         match (t, in_.token) with
         | MINUS ii, x when TH.isNumericLit x (* uname == nme.UNARY_- ... *) ->
             (* start at the -, not the number *)
-            let x = literal ~isNegated:(Some ii) in_ in
+            let x = literal ~isNegated:ii in_ in
             let x' = L x in
             simpleExprRest ~canApply:true x' in_
         | _ ->
@@ -2131,130 +2254,134 @@ and prefixExpr ?(is_block_expr = false) in_ : expr =
 and simpleExpr ?(is_block_expr = false) in_ : expr =
   in_
   |> with_logging "simpleExpr" (fun () ->
-         let canApply = ref true in
-         let t =
-           match in_.token with
-           | _ when is_block_expr ->
-               canApply := false;
-               BlockExpr (blockExpr in_)
-           | x when TH.isLiteral x ->
-               let x = literal in_ in
-               L x
-           | x
-             when TH.isIdentBool x
-                  && lookingAhead2
-                       (fun in_ ->
-                         match in_.token with
-                         | DOT _ -> true
-                         | _ -> false)
-                       (fun in_ ->
-                         match in_.token with
-                         | Ellipsis _ -> true
-                         | _ -> false)
-                       in_ ->
-               let name = ident in_ in
-               Name (Id name, [])
-           (* scala3: deprecated XMLSTART *)
-           | x when TH.isIdentBool x ->
-               let x = path ~thisOK:true ~typeOK:false in_ in
-               Name x
-           | Kthis _
-           | Ksuper _ ->
-               let x = path ~thisOK:true ~typeOK:false in_ in
-               Name x
-           | USCORE ii ->
-               nextToken in_;
-               (* ast: freshPlaceholder *)
-               ExprUnderscore ii
-           (* pad: this may actually be a binding, not a tuple of
-            * expressions when part of a short lambda (arrow).
-            *)
-           | LPAREN _ -> (
-               let ((_, xs, _) as tuple) =
-                 makeParens (commaSeparated expr) in_
-               in
-               match xs with
-               | [ x ] -> x
-               | _ -> Tuple tuple)
-           | LBRACE _ ->
-               canApply := false;
-               let x = blockExpr in_ in
-               BlockExpr x
-           | QUOTE quote ->
-               let x = quoted quote in_ in
-               Quoted x
-           | Knew ii ->
-               canApply := false;
-               skipToken in_;
-               let cparents, cbody = !template_ in_ in
-               (* ast: gen.mkNew(parents, self, stats) *)
-               let def =
-                 { ckind = (Singleton, ii); cparams = []; cparents; cbody }
-               in
-               New (ii, def)
-           (* semgrep-ext: *)
-           | T.Ellipsis ii ->
-               skipToken in_;
-               AST.Ellipsis ii
-           | LDots ld ->
-               skipToken in_;
-               let e = expr in_ in
-               let rd = TH.info_of_tok in_.token in
-               accept (RDots ab) in_;
-               DeepEllipsis (ld, e, rd)
-           | _ -> error "illegal start of simple expression" in_
-         in
-         simpleExprRest ~canApply:!canApply t in_)
+      let canApply = ref true in
+      let t =
+        match in_.token with
+        | _ when is_block_expr ->
+            canApply := false;
+            blockExprAsExpr in_
+        | x when TH.isLiteral x ->
+            let x = literal in_ in
+            L x
+        | x
+          when TH.isIdentBool x
+               && lookingAhead2
+                    (fun in_ ->
+                      match in_.token with
+                      | DOT _ -> true
+                      | _ -> false)
+                    (fun in_ ->
+                      match in_.token with
+                      | Ellipsis _ -> true
+                      | _ -> false)
+                    in_ ->
+            let name = ident in_ in
+            Name (Id name, [])
+        (* scala3: deprecated XMLSTART *)
+        | x when TH.isIdentBool x ->
+            let x = path ~thisOK:true ~typeOK:false in_ in
+            Name x
+        | Kthis _
+        | Ksuper _ ->
+            let x = path ~thisOK:true ~typeOK:false in_ in
+            Name x
+        | USCORE ii ->
+            nextToken in_;
+            (* ast: freshPlaceholder *)
+            ExprUnderscore ii
+        (* pad: this may actually be a binding, not a tuple of
+         * expressions when part of a short lambda (arrow).
+         *)
+        | LPAREN _ -> (
+            let ((_, xs, _) as tuple) = makeParens (commaSeparated expr) in_ in
+            match xs with
+            | [ x ] -> x
+            | _ -> Tuple tuple)
+        | LBRACE _ ->
+            canApply := false;
+            blockExprAsExpr in_
+        | QUOTE quote ->
+            let x = quoted quote in_ in
+            Quoted x
+        | Knew ii ->
+            canApply := false;
+            skipToken in_;
+            let cparents, cbody = !template_ in_ in
+            (* ast: gen.mkNew(parents, self, stats) *)
+            let def =
+              { ckind = (Singleton, ii); cparams = []; cparents; cbody }
+            in
+            New (ii, def)
+        (* semgrep-ext: *)
+        | T.Ellipsis ii ->
+            skipToken in_;
+            AST.Ellipsis ii
+        | LDots ld ->
+            skipToken in_;
+            let e = expr in_ in
+            let rd = TH.info_of_tok in_.token in
+            accept (RDots ab) in_;
+            DeepEllipsis (ld, e, rd)
+        | _ -> error "illegal start of simple expression" in_
+      in
+      simpleExprRest ~canApply:!canApply t in_)
 
 and simpleExprRest ~canApply t in_ : expr =
   in_
   |> with_logging (spf "simpleExprRest(canApply:%b)" canApply) (fun () ->
-         (* crazy: again parsing depending on AST *)
-         if canApply then newLineOptWhenFollowedBy (LBRACE ab) in_;
+      (* crazy: again parsing depending on AST *)
+      if canApply then newLineOptWhenFollowedBy (LBRACE ab) in_;
 
-         let paren_or_brace () =
-           let xs = argumentExprs in_ in
-           let app =
-             (* AST: look for anonymous function application like (f _)(x) and
-              *      translate to (f _).apply(x), bug #460
-              * AST: let sel = ... Select(stripParens(t, nme.apply) in
-              *      Apply(sel, x)
-              *)
-             Apply (t, [ xs ])
-           in
-           simpleExprRest ~canApply:true app in_
-         in
-         match in_.token with
-         | DOT ii -> (
-             nextToken in_;
-             match in_.token with
-             | Ellipsis ii ->
-                 nextToken in_;
-                 let x = stripParens (DotAccessEllipsis (t, ii)) in
-                 simpleExprRest ~canApply:true x in_
-             | _ ->
-                 let id = selector (*t*) in_ in
-                 let x = stripParens (DotAccess (t, ii, id)) in
-                 simpleExprRest ~canApply:true x in_)
-         | LBRACKET _ ->
-             let t1 = stripParens t in
-             (* crazy: parsing depending on built AST: Ident(_) | Select(_, _) | Apply(_, _) | Literal(_) *)
-             let app = ref t1 in
-             while in_.token =~= LBRACKET ab do
-               let xs = exprTypeArgs in_ in
-               (* ast: app := TypeApply(app, xs) *)
-               app := InstanciatedExpr (!app, xs)
-             done;
-             simpleExprRest ~canApply:true !app in_
-         | LPAREN _ -> paren_or_brace ()
-         | LBRACE _ when canApply -> paren_or_brace ()
-         | USCORE _ ->
-             skipToken in_;
-             (* AST: MethodValue(stripParens(t)) *)
-             t
-         | _ ->
-             in_
-             |> with_logging "simpleExprRest: nothing to consume" (fun () -> t))
+      let paren_or_brace () =
+        let xs = argumentExprs in_ in
+        let app =
+          (* AST: look for anonymous function application like (f _)(x) and
+           *      translate to (f _).apply(x), bug #460
+           * AST: let sel = ... Select(stripParens(t, nme.apply) in
+           *      Apply(sel, x)
+           *)
+          Apply (t, [ xs ])
+        in
+        simpleExprRest ~canApply:true app in_
+      in
+      match in_.token with
+      | DOT ii -> (
+          nextToken in_;
+          match in_.token with
+          | Ellipsis ii ->
+              nextToken in_;
+              let x = stripParens (DotAccessEllipsis (t, ii)) in
+              simpleExprRest ~canApply:true x in_
+          | Kmatch ii ->
+              skipToken in_;
+              let xs = inBracesOrIndented caseClauses in_ in
+              let x = Match (stripParens t, ii, xs) in
+              simpleExprRest ~canApply:true x in_
+          | _ ->
+              let id = selector (*t*) in_ in
+              let x = stripParens (DotAccess (t, ii, id)) in
+              simpleExprRest ~canApply:true x in_)
+      | LBRACKET _ ->
+          let t1 = stripParens t in
+          (* crazy: parsing depending on built AST: Ident(_) | Select(_, _) | Apply(_, _) | Literal(_) *)
+          let app = ref t1 in
+          while in_.token =~= LBRACKET ab do
+            let xs = exprTypeArgs in_ in
+            (* ast: app := TypeApply(app, xs) *)
+            app := InstanciatedExpr (!app, xs)
+          done;
+          simpleExprRest ~canApply:true !app in_
+      | LPAREN _ -> paren_or_brace ()
+      | LBRACE _ when canApply -> paren_or_brace ()
+      | COLON _ when canApply && isColonArgument in_ ->
+          (* See NOTE: "Scala3 optional braces" *)
+          paren_or_brace ()
+      | USCORE _ ->
+          skipToken in_;
+          (* AST: MethodValue(stripParens(t)) *)
+          t
+      | _ ->
+          in_ |> with_logging "simpleExprRest: nothing to consume" (fun () -> t))
 
 (* and literal in_ = ...
  *  is now at the top because it's also used by SimplePattern
@@ -2301,9 +2428,17 @@ and interpolatedString ~inPattern in_ =
          * that?
          *)
         | ID_DOLLAR _ ->
-            let x = ident in_ in
+            let ((s, t) as x) = ident in_ in
             (* ast: Ident(x) *)
-            xs += EncapsDollarIdent x
+            (* if the identifier starts with $, it is a metavariable, not a variable
+             * inside an interpolated string. However, if we are not in semgrep_mode,
+             * we treat these identifiers as normal variables, so we need to strip this $
+             *)
+            if s.[0] =$= '$' then
+              if Hook.get Flag.sgrep_mode then
+                xs += EncapsExpr (Name (Id x, []))
+              else xs += EncapsDollarIdent (Str.string_after s 1, t)
+            else xs += EncapsDollarIdent x
         (* actually a ${, but using LBRACE allows to reuse blockExpr *)
         | LBRACE _ ->
             let x = expr in_ in
@@ -2332,12 +2467,12 @@ and interpolatedString ~inPattern in_ =
 and multipleArgumentExprs in_ : arguments list =
   in_
   |> with_logging "multipleArgumentExprs" (fun () ->
-         match in_.token with
-         | LPAREN _ ->
-             let x = argumentExprs in_ in
-             let xs = multipleArgumentExprs in_ in
-             x :: xs
-         | _ -> [])
+      match in_.token with
+      | LPAREN _ ->
+          let x = argumentExprs in_ in
+          let xs = multipleArgumentExprs in_ in
+          x :: xs
+      | _ -> [])
 
 (** {{{
  *  ArgumentExprs     ::= ParArgumentExprs
@@ -2370,11 +2505,63 @@ and parArgumentExprs in_ : arguments =
 and argumentExprs in_ : arguments =
   in_
   |> with_logging "argumentExprs" (fun () ->
-         match in_.token with
-         | LBRACE _ -> ArgBlock (blockExpr in_)
-         | LPAREN _ -> parArgumentExprs in_
-         (* TODO: is using this token a good idea? Would unsafe_fake_bracket be better or worse? *)
-         | _ -> Args (fb (TH.info_of_tok in_.token) []))
+      match in_.token with
+      | LBRACE _ -> ArgBlock (blockExpr in_)
+      | LPAREN _ -> parArgumentExprs in_
+      | COLON _ when isColonArgument in_ ->
+          (* See NOTE: "Scala3 optional braces" *)
+          let icolon = TH.info_of_tok in_.token in
+          skipToken in_;
+          if Option.is_some (passedIndent in_) then
+            (* Case 1: indent directly after colon *)
+            let _, body, closing = blockExpr in_ in
+            ArgBlock (icolon, body, closing)
+          else
+            (* Case 2: LambdaStart on same line, then indent.
+                  Covers both FunParams (ident =>) and
+                  HkTypeParamClause ([T] =>) forms. *)
+            let e =
+              match in_.token with
+              | LBRACKET _ ->
+                  (* [T, U, ...] => body — polymorphic function literal *)
+                  let tparams =
+                    inBrackets
+                      (fun in_ ->
+                        commaSeparated
+                          (fun in_ ->
+                            let tpname = wildcardOrIdent in_ in
+                            {
+                              tpannots = [];
+                              tpname;
+                              tpvariance = None;
+                              tpparams = None;
+                              tpbounds = { supertype = None; subtype = None };
+                              tpviewbounds = [];
+                              tpcolons = [];
+                            })
+                          in_)
+                      in_
+                  in
+                  let iarrow = TH.info_of_tok in_.token in
+                  accept (ARROW ab) in_;
+                  let fbody =
+                    if Option.is_some (passedIndent in_) then
+                      FBlock (blockExpr in_)
+                    else FExpr (iarrow, expr in_)
+                  in
+                  Lambda
+                    {
+                      fkind = (LambdaArrow, iarrow);
+                      ftparams = Some tparams;
+                      fparams = [];
+                      frettype = None;
+                      fbody = Some fbody;
+                    }
+              | _ -> expr in_
+            in
+            ArgBlock (fb icolon (BEBlock [ E e ]))
+      (* TODO: is using this token a good idea? Would unsafe_fake_bracket be better or worse? *)
+      | _ -> Args (fb (TH.info_of_tok in_.token) []))
 
 (* ------------------------------------------------------------------------- *)
 (* Case clauses *)
@@ -2387,12 +2574,12 @@ and argumentExprs in_ : arguments =
 and guard in_ : guard option =
   in_
   |> with_logging "guard" (fun () ->
-         match in_.token with
-         | Kif ii ->
-             nextToken in_;
-             let x = postfixExpr in_ in
-             Some (ii, stripParens x)
-         | _ -> None)
+      match in_.token with
+      | Kif ii ->
+          nextToken in_;
+          let x = postfixExpr in_ in
+          Some (ii, stripParens x)
+      | _ -> None)
 
 and caseRhs rhs_fn in_ : tok * block =
   let ii = TH.info_of_tok in_.token in
@@ -2553,6 +2740,7 @@ and implicitClosure implicitmod location in_ =
   let def =
     {
       fkind = (LambdaArrow, iarrow);
+      ftparams = None;
       fparams = [ fb iarrow ([ param ], None) ];
       frettype = None;
       fbody = Some body;
@@ -2653,11 +2841,12 @@ and followingIsEnclosedGenerators in_ =
         else if in_.token =~= RPAREN ab then decr parens;
         nextToken in_
       done;
-      if in_.token =~= LARROW ab then false
+      if in_.token =~= LARROW ab then
+        false
         (* it's a pattern *)
         (* nosemgrep *)
-      else if TH.isIdentBool in_.token then true
-        (* it's not a pattern since token cannot be an infix operator *)
+      else if TH.isIdentBool in_.token then
+        true (* it's not a pattern since token cannot be an infix operator *)
       else
         (* followedByToken(LARROW) // `<-` comes before possible statement starts
            In the Scala compiler, this is what it says ^
@@ -2813,8 +3002,9 @@ and statement (location : location) (in_ : env) : expr = expr ~location in_
 
 and block in_ : block =
   in_
-  |> with_logging "block" (fun () -> (* ast: makeBlock(xs) *)
-                                     !blockStatSeq_ in_)
+  |> with_logging "block" (fun () ->
+      (* ast: makeBlock(xs) *)
+      !blockStatSeq_ in_)
 
 (** {{{
   *  BlockExpr ::= <<< (CaseClauses | Block) >>>
@@ -2832,6 +3022,18 @@ and blockExpr in_ : block_expr =
           let xs = block in_ in
           BEBlock xs)
     in_
+
+(* Parse a block expression, but unwrap single-expression blocks into
+   plain expressions. This avoids unnecessary Block nodes for cases like:
+     def foo() =
+       3
+   where the indented `3` triggers a blockExpr parse but the result
+   should just be the literal, not Block([ExprStmt(3)]).
+*)
+and blockExprAsExpr in_ : expr =
+  match blockExpr in_ with
+  | _, BEBlock [ E e ], _ -> e
+  | e -> BlockExpr e
 
 (* ------------------------------------------------------------------------- *)
 (* Enumerator/generator *)
@@ -2856,17 +3058,15 @@ and isEnumeratorsEnd in_ =
 and enumerators in_ : enumerators =
   in_
   |> with_logging "enumerators" (fun () ->
-         let enums = ref [] in
-         let x = enumerator ~isFirst:true in_ in
-         enums += x;
-         while
-           TH.isStatSep in_.token && not (lookingAhead isEnumeratorsEnd in_)
-         do
-           nextToken in_;
-           let x = enumerator ~isFirst:false in_ in
-           enums += x
-         done;
-         List.rev !enums)
+      let enums = ref [] in
+      let x = enumerator ~isFirst:true in_ in
+      enums += x;
+      while TH.isStatSep in_.token && not (lookingAhead isEnumeratorsEnd in_) do
+        nextToken in_;
+        let x = enumerator ~isFirst:false in_ in
+        enums += x
+      done;
+      List.rev !enums)
 
 (* pad: this was duplicated in enumerator and generator in the original code*)
 and guard_loop in_ : guard list =
@@ -2890,13 +3090,13 @@ and guard_loop in_ : guard list =
 and enumerator ~isFirst ?(allowNestedIf = true) in_ : enumerator =
   in_
   |> with_logging "enumerator" (fun () ->
-         match in_.token with
-         | Ellipsis tok ->
-             nextToken in_;
-             GEllipsis tok
-         | _ ->
-             let g = generator ~eqOK:(not isFirst) ~allowNestedIf in_ in
-             G g)
+      match in_.token with
+      | Ellipsis tok ->
+          nextToken in_;
+          GEllipsis tok
+      | _ ->
+          let g = generator ~eqOK:(not isFirst) ~allowNestedIf in_ in
+          G g)
 
 (** {{{
  *  Generator ::= Pattern1 (`<-` | `=`) Expr [Guard]
@@ -2905,17 +3105,17 @@ and enumerator ~isFirst ?(allowNestedIf = true) in_ : enumerator =
 and generator ~eqOK ~allowNestedIf in_ : generator =
   in_
   |> with_logging "generator" (fun () ->
-         let hasVal = in_.token =~= Kval ab in
-         if hasVal then nextToken in_;
-         let pat = noSeq pattern1 in_ in
-         let hasEq = in_.token =~= EQUALS ab in
-         (* CHECK: scala3: "`val` keyword in for comprehension is" *)
-         let ieq = TH.info_of_tok in_.token in
-         if hasEq && eqOK then nextToken in_ else accept (LARROW ab) in_;
-         let rhs = expr in_ in
-         let tail = if allowNestedIf then guard_loop in_ else [] in
-         (* ast: gen.mkGenerator(genPos, pat, hasEq, rhs) :: tail *)
-         { genpat = pat; gentok = ieq; genbody = rhs; genguards = tail })
+      let hasVal = in_.token =~= Kval ab in
+      if hasVal then nextToken in_;
+      let pat = noSeq pattern1 in_ in
+      let hasEq = in_.token =~= EQUALS ab in
+      (* CHECK: scala3: "`val` keyword in for comprehension is" *)
+      let ieq = TH.info_of_tok in_.token in
+      if hasEq && eqOK then nextToken in_ else accept (LARROW ab) in_;
+      let rhs = expr in_ in
+      let tail = if allowNestedIf then guard_loop in_ else [] in
+      (* ast: gen.mkGenerator(genPos, pat, hasEq, rhs) :: tail *)
+      { genpat = pat; gentok = ieq; genbody = rhs; genguards = tail })
 
 (*****************************************************************************)
 (* Parsing annotations  *)
@@ -2940,12 +3140,12 @@ and annotationExpr in_ =
 and annotations ~skipNewLines in_ : annotation list =
   in_
   |> with_logging (spf "annotations(skipNewLines:%b)" skipNewLines) (fun () ->
-         readAnnots
-           (fun iat in_ ->
-             let t, args = annotationExpr in_ in
-             if skipNewLines then newLineOpt in_;
-             (iat, t, args))
-           in_)
+      readAnnots
+        (fun iat in_ ->
+          let t, args = annotationExpr in_ in
+          if skipNewLines then newLineOpt in_;
+          (iat, t, args))
+        in_)
 
 let annotTypeRest t in_ : type_ =
   let xs = annotations ~skipNewLines:false in_ in
@@ -3122,11 +3322,11 @@ let rec collect_import_path (path : import_path) in_ =
 and importExpr in_ : import_expr =
   in_
   |> with_logging "importExpr" (fun () ->
-         (* Walks down import `foo.bar.baz.{ ... }` until it ends at
-          * an underscore, a left brace, or an undotted identifier.
-          *)
-         let new_path_elem = read_path_elem in_ in
-         collect_import_path [ new_path_elem ] in_)
+      (* Walks down import `foo.bar.baz.{ ... }` until it ends at
+       * an underscore, a left brace, or an undotted identifier.
+       *)
+      let new_path_elem = read_path_elem in_ in
+      collect_import_path [ new_path_elem ] in_)
 
 (** {{{
  *  Import  ::= import ImportExpr {`,` ImportExpr}
@@ -3308,30 +3508,30 @@ let paramType ?(repeatedParameterOK = true) in_ : param_type =
   ignore repeatedParameterOK;
   in_
   |> with_logging "paramType" (fun () ->
-         match in_.token with
-         | ARROW ii ->
-             nextToken in_;
-             let t = typ in_ in
-             let star_opt =
-               match in_.token with
-               | tok when TH.isRawStar tok ->
-                   let ii = TH.info_of_tok in_.token in
-                   skipToken in_;
-                   Some ii
-               | _ -> None
-             in
-             (* ast: byNameApplication *)
-             PTByNameApplication (ii, t, star_opt)
-         | _ ->
-             let t = typ in_ in
-             if TH.isRawStar in_.token then (
-               let ii = TH.info_of_tok in_.token in
-               nextToken in_;
-               (* CHECK: if (!repeatedParameterOK)
-                * "repeated parameters are only allowed in method signatures" *)
-               (* ast: repeatedApplication t *)
-               PTRepeatedApplication (t, ii))
-             else PT t (* ast: t *))
+      match in_.token with
+      | ARROW ii ->
+          nextToken in_;
+          let t = typ in_ in
+          let star_opt =
+            match in_.token with
+            | tok when TH.isRawStar tok ->
+                let ii = TH.info_of_tok in_.token in
+                skipToken in_;
+                Some ii
+            | _ -> None
+          in
+          (* ast: byNameApplication *)
+          PTByNameApplication (ii, t, star_opt)
+      | _ ->
+          let t = typ in_ in
+          if TH.isRawStar in_.token then (
+            let ii = TH.info_of_tok in_.token in
+            nextToken in_;
+            (* CHECK: if (!repeatedParameterOK)
+                  "repeated parameters are only allowed in method signatures" *)
+            (* ast: repeatedApplication t *)
+            PTRepeatedApplication (t, ii))
+          else PT t (* ast: t *))
 
 (** {{{
  *  ParamClauses      ::= {ParamClause} [[nl] `(` implicit Params `)`]
@@ -3350,68 +3550,68 @@ let paramType ?(repeatedParameterOK = true) in_ : param_type =
 let param _owner implicitmod _caseParam in_ : binding =
   in_
   |> with_logging "param" (fun () ->
-         let annots = annotations ~skipNewLines:false in_ in
-         let mods =
-           (* crazy?: if owner.isTypeName *)
-           let xs = modifiers in_ in
-           let inline =
-             match in_.token with
-             | ID_LOWER ("inline", ii) ->
-                 nextToken in_;
-                 [ (Inline, ii) ]
-             | _ -> []
-           in
-           (* ast: mods = xs |= Flags.PARAMACCESSOR *)
-           (* CHECK: "lazy modifier not allowed here. " *)
-           implicitmod @ inline @ xs
-           @
-           match in_.token with
-           | Kval ii ->
-               nextToken in_;
-               [ (Val, ii) ]
-           | Kvar ii ->
-               nextToken in_;
-               (* ast: if (v == VAR) mods |= Flags.MUTABLE *)
-               [ (Var, ii) ]
-           | _ ->
-               (* CHECK: if (mods.flags != Flags.PARAMACCESSOR) accept(VAL) *)
-               (* ast: if (!caseParam) mods |= Flags.PrivateLocal *)
-               []
-           (* ast: if (caseParam) mods |= Flags.CASEACCESSOR *)
-         in
-         (* semgrep-ext: *)
-         match in_.token with
-         | Ellipsis ii ->
-             nextToken in_;
-             ParamEllipsis ii
-         | _ ->
-             let name = ident in_ in
-             let tpt =
-               match in_.token with
-               | COLON _ ->
-                   accept (COLON ab) in_;
-                   if in_.token =~= ARROW ab then
-                     ( (* CHECK: if owner.isTypeName && !mods.isLocalToThis
-                          * "var/val parameters may not be call-by-name" *)
-                       (* ast: bynamemod = Flags.BYNAMEPARAM *) );
-                   Some (paramType in_)
-               | _ -> None
-             in
-             let default =
-               match in_.token with
-               | EQUALS _ ->
-                   nextToken in_;
-                   (* ast: mods |= FLAGS.DEFAULTPARAM *)
-                   let x = expr in_ in
-                   Some x
-               | _ ->
-                   (* ast: emptyTree *)
-                   None
-             in
-             (* ast: ValDef((mods|implicitmod|bynamemod) with annots, name.toTermName, tpt, default) *)
-             let p_attrs = AST.mods_with_annots mods annots in
-             ParamClassic
-               { p_name = name; p_attrs; p_type = tpt; p_default = default })
+      let annots = annotations ~skipNewLines:false in_ in
+      let mods =
+        (* crazy?: if owner.isTypeName *)
+        let xs = modifiers in_ in
+        let inline =
+          match in_.token with
+          | ID_LOWER ("inline", ii) ->
+              nextToken in_;
+              [ (Inline, ii) ]
+          | _ -> []
+        in
+        (* ast: mods = xs |= Flags.PARAMACCESSOR *)
+        (* CHECK: "lazy modifier not allowed here. " *)
+        implicitmod @ inline @ xs
+        @
+        match in_.token with
+        | Kval ii ->
+            nextToken in_;
+            [ (Val, ii) ]
+        | Kvar ii ->
+            nextToken in_;
+            (* ast: if (v == VAR) mods |= Flags.MUTABLE *)
+            [ (Var, ii) ]
+        | _ ->
+            (* CHECK: if (mods.flags != Flags.PARAMACCESSOR) accept(VAL) *)
+            (* ast: if (!caseParam) mods |= Flags.PrivateLocal *)
+            []
+        (* ast: if (caseParam) mods |= Flags.CASEACCESSOR *)
+      in
+      (* semgrep-ext: *)
+      match in_.token with
+      | Ellipsis ii ->
+          nextToken in_;
+          ParamEllipsis ii
+      | _ ->
+          let name = ident in_ in
+          let tpt =
+            match in_.token with
+            | COLON _ ->
+                accept (COLON ab) in_;
+                if in_.token =~= ARROW ab then
+                  ( (* CHECK: if owner.isTypeName && !mods.isLocalToThis
+                          "var/val parameters may not be call-by-name" *)
+                    (* ast: bynamemod = Flags.BYNAMEPARAM *) );
+                Some (paramType in_)
+            | _ -> None
+          in
+          let default =
+            match in_.token with
+            | EQUALS _ ->
+                nextToken in_;
+                (* ast: mods |= FLAGS.DEFAULTPARAM *)
+                let x = expr in_ in
+                Some x
+            | _ ->
+                (* ast: emptyTree *)
+                None
+          in
+          (* ast: ValDef((mods|implicitmod|bynamemod) with annots, name.toTermName, tpt, default) *)
+          let p_attrs = AST.mods_with_annots mods annots in
+          ParamClassic
+            { p_name = name; p_attrs; p_type = tpt; p_default = default })
 
 (* parses the part of the using param clause, inside the parens *)
 let usingParamClauseInner ~caseParam owner implicitmod in_ =
@@ -3427,7 +3627,7 @@ let usingParamClauseInner ~caseParam owner implicitmod in_ =
       in
       if is_type then
         let tys = types in_ in
-        (List_.map (fun ty -> ParamType ty) tys, Some ii)
+        (List.map (fun ty -> ParamType ty) tys, Some ii)
       else
         (* TODO: not right to reuse? *)
         (* no implciitmod?*)
@@ -3496,68 +3696,69 @@ let paramClauses ~ofCaseClass owner _contextBoundBuf in_ : bindings list =
  *  TypeParam             ::= Id TypeParamClauseOpt TypeBounds {`<%` Type} {`:` Type}
  *  }}}
 *)
-let rec typeParamClauseOpt _owner _contextBoundBuf in_ : type_parameters =
+let rec typeParamClauseOpt _owner _contextBoundBuf in_ : type_parameters option
+    =
   in_
   |> with_logging "typeParamClauseOpt" (fun () ->
-         let typeParam in_ =
-           in_
-           |> with_logging "typeParam" (fun () ->
-                  (* ast: ms | Flags.PARAM *)
-                  let tpannots = annotations ~skipNewLines:true in_ in
-                  let tpvariance =
-                    match in_.token with
-                    (* STILL? is supposed to be only if isTypeName owner *)
-                    | PLUS ii ->
-                        nextToken in_;
-                        (* ast: mods |= Flags.COVARIANT *)
-                        Some (Covariant, ii)
-                    | MINUS ii ->
-                        nextToken in_;
-                        (* ast: mods |= Flags.CONTRAVARIANT *)
-                        Some (Contravariant, ii)
-                    | _ -> None
-                  in
-                  let tpname = wildcardOrIdent in_ in
-                  (* AST: toTypeName *)
-                  let tpparams = typeParamClauseOpt tpname None in_ in
-                  let tpbounds = typeBounds in_ in
-                  (* AST: TypeDef(mods, pname, tparams, xs) *)
-                  let viewbounds = ref [] in
-                  let colons = ref [] in
-                  (*if contextBoundBuf <> None
+      let typeParam in_ =
+        in_
+        |> with_logging "typeParam" (fun () ->
+            (* ast: ms | Flags.PARAM *)
+            let tpannots = annotations ~skipNewLines:true in_ in
+            let tpvariance =
+              match in_.token with
+              (* STILL? is supposed to be only if isTypeName owner *)
+              | PLUS ii ->
+                  nextToken in_;
+                  (* ast: mods |= Flags.COVARIANT *)
+                  Some (Covariant, ii)
+              | MINUS ii ->
+                  nextToken in_;
+                  (* ast: mods |= Flags.CONTRAVARIANT *)
+                  Some (Contravariant, ii)
+              | _ -> None
+            in
+            let tpname = wildcardOrIdent in_ in
+            (* AST: toTypeName *)
+            let tpparams = typeParamClauseOpt tpname None in_ in
+            let tpbounds = typeBounds in_ in
+            (* AST: TypeDef(mods, pname, tparams, xs) *)
+            let viewbounds = ref [] in
+            let colons = ref [] in
+            (*if contextBoundBuf <> None
                     then
                   *)
-                  while in_.token =~= VIEWBOUND ab do
-                    (* CHECK: scala3: "view bounds are unsupported" *)
-                    skipToken in_;
-                    let t = typ in_ in
-                    (* AST: contextBoundBuf +=
-                     *  makeFunctionTypeTree(List(Ident(pname)), t)
-                     *)
-                    viewbounds += t
-                  done;
-                  while in_.token =~= COLON ab do
-                    skipToken in_;
-                    let t = typ in_ in
-                    (* AST: contextBoundBuf += AppliedTypeTree(t, List(Ident(pname)))*)
-                    colons += t
-                  done;
-                  {
-                    tpannots;
-                    tpname;
-                    tpvariance;
-                    tpparams;
-                    tpbounds;
-                    tpviewbounds = List.rev !viewbounds;
-                    tpcolons = List.rev !colons;
-                  })
-         in
-         newLineOptWhenFollowedBy (LBRACKET ab) in_;
-         match in_.token with
-         | LBRACKET _ ->
-             let x = inBrackets (fun in_ -> commaSeparated typeParam in_) in_ in
-             Some x
-         | _ -> None)
+            while in_.token =~= VIEWBOUND ab do
+              (* CHECK: scala3: "view bounds are unsupported" *)
+              skipToken in_;
+              let t = typ in_ in
+              (* AST: contextBoundBuf +=
+               *  makeFunctionTypeTree(List(Ident(pname)), t)
+               *)
+              viewbounds += t
+            done;
+            while in_.token =~= COLON ab do
+              skipToken in_;
+              let t = typ in_ in
+              (* AST: contextBoundBuf += AppliedTypeTree(t, List(Ident(pname)))*)
+              colons += t
+            done;
+            {
+              tpannots;
+              tpname;
+              tpvariance;
+              tpparams;
+              tpbounds;
+              tpviewbounds = List.rev !viewbounds;
+              tpcolons = List.rev !colons;
+            })
+      in
+      newLineOptWhenFollowedBy (LBRACKET ab) in_;
+      match in_.token with
+      | LBRACKET _ ->
+          let x = inBrackets (fun in_ -> commaSeparated typeParam in_) in_ in
+          Some x
+      | _ -> None)
 
 (* ------------------------------------------------------------------------- *)
 (* Constructor body (as in 'def this(...) = { <body> }') *)
@@ -3641,91 +3842,97 @@ let constrExpr vparamss in_ : expr =
  *  FunSig ::= id [FunTypeParamClause] ParamClauses
  *  }}}
 *)
-let funDefRest fkind _attrs name in_ : function_definition * type_parameters =
+let funDefRest fkind _attrs name in_ :
+    function_definition * type_parameters option =
   in_
   |> with_logging "funDefRest" (fun () ->
-         (* let newmods = ref attrs in *)
-         (* contextBoundBuf is for context bounded type parameters of the form
-          * [T : B] or [T : => B]; it contains the equivalent implicit parameter type,
-          * i.e. (B[T] or T => B)
+      (* let newmods = ref attrs in *)
+      (* contextBoundBuf is for context bounded type parameters of the form
+            [T : B] or [T : => B]; it contains the equivalent implicit parameter type,
+            i.e. (B[T] or T => B)
           *)
-         let contextBoundBuf = ref [] in
-         let tparams = typeParamClauseOpt name (Some contextBoundBuf) in_ in
-         let vparamss =
-           paramClauses ~ofCaseClass:false name contextBoundBuf in_
-         in
-         newLineOptWhenFollowedBy (LBRACE ab) in_;
-         let restype = (* AST: fromWithinReturnType *) typedOpt in_ in
+      let contextBoundBuf = ref [] in
+      let tparams = typeParamClauseOpt name (Some contextBoundBuf) in_ in
+      let vparamss = paramClauses ~ofCaseClass:false name contextBoundBuf in_ in
+      newLineOptWhenFollowedBy (LBRACE ab) in_;
+      let restype = (* AST: fromWithinReturnType *) typedOpt in_ in
 
-         let rhs =
-           match in_.token with
-           | t when TH.isStatSep t || t =~= RBRACE ab ->
-               (* CHECK: if restype = None then deprecated missing type, use : Unit *)
-               (* AST: EmptyTree, newmods |= DEFERRED *)
-               None
-           | LBRACE _ when restype =*= None ->
-               (* CHECK: missing type *)
-               let x = blockExpr in_ in
-               Some (FBlock x)
-           | EQUALS ii ->
-               nextTokenAllow TH.nme_MACROkw in_;
-               if TH.isMacro in_.token then
-                 nextToken in_ (* AST: newmmods |= MACRO *);
-               let x = expr in_ in
-               Some (FExpr (ii, x))
-           | _ -> None
-         in
-         (* ast: DefDef(newmods, name.toTermName, tparams,vparamss,restype, rhs) *)
-         (* CHECK: "unary prefix operator definition with empty parameter list.."*)
-         ( { fkind; fparams = vparamss; frettype = restype; fbody = rhs },
-           tparams ))
+      let rhs =
+        match in_.token with
+        | t when TH.isStatSep t || t =~= RBRACE ab ->
+            (* CHECK: if restype = None then deprecated missing type, use : Unit *)
+            (* AST: EmptyTree, newmods |= DEFERRED *)
+            None
+        | LBRACE _ when restype =*= None ->
+            (* CHECK: missing type *)
+            let x = blockExpr in_ in
+            Some (FBlock x)
+        | EQUALS ii ->
+            nextTokenAllow TH.nme_MACROkw in_;
+            if TH.isMacro in_.token then
+              nextToken in_ (* AST: newmmods |= MACRO *);
+            let x = expr in_ in
+            Some (FExpr (ii, x))
+        | _ -> None
+      in
+      (* ast: DefDef(newmods, name.toTermName, tparams,vparamss,restype, rhs) *)
+      (* CHECK: "unary prefix operator definition with empty parameter list.."*)
+      ( {
+          fkind;
+          ftparams = None;
+          fparams = vparamss;
+          frettype = restype;
+          fbody = rhs;
+        },
+        tparams ))
 
 let funDefOrDcl attrs in_ : definition =
   in_
   |> with_logging "funDefOrDcl" (fun () ->
-         let idef = TH.info_of_tok in_.token in
-         nextToken in_;
-         match in_.token with
-         | Kthis ii ->
-             skipToken in_;
-             let classcontextBoundBuf = ref [] in
-             (* AST: STILL? *)
-             let name = (AST.this, ii (* ast: nme.CONSTRUCTOR *)) in
-             (* pad: quite similar to funDefRest *)
-             let vparamss =
-               paramClauses ~ofCaseClass:false name classcontextBoundBuf in_
-             in
-             newLineOptWhenFollowedBy (LBRACE ab) in_;
-             let (rhs : fbody) =
-               match in_.token with
-               | LBRACE _ ->
-                   (* CHECK: "procedure syntax is deprecated for constructors" *)
-                   let lb, xs, rb = constrBlock vparamss in_ in
-                   FBlock (lb, BEBlock xs, rb)
-               | EQUALS ii ->
-                   accept (EQUALS ab) in_;
-                   let x = constrExpr vparamss in_ in
-                   FExpr (ii, x)
-               | _ ->
-                   (* generate error message *)
-                   raise Impossible
-             in
-             (* ast: DefDef(mods, nme.CONSTRUCTOR, [], vparamss, TypeTree(), rhs)*)
-             let ent = { name; attrs; tparams = None } in
-             let fdef =
-               {
-                 fkind = (Def, idef);
-                 fparams = vparamss;
-                 frettype = None;
-                 fbody = Some rhs;
-               }
-             in
-             DefEnt (ent, FuncDef fdef)
-         | _ ->
-             let name = identOrMacro in_ in
-             let fdef, tparams = funDefRest (Def, idef) attrs name in_ in
-             let ent = { name; attrs; tparams } in
-             DefEnt (ent, FuncDef fdef))
+      let idef = TH.info_of_tok in_.token in
+      nextToken in_;
+      match in_.token with
+      | Kthis ii ->
+          skipToken in_;
+          let classcontextBoundBuf = ref [] in
+          (* AST: STILL? *)
+          let name = (AST.this, ii (* ast: nme.CONSTRUCTOR *)) in
+          (* pad: quite similar to funDefRest *)
+          let vparamss =
+            paramClauses ~ofCaseClass:false name classcontextBoundBuf in_
+          in
+          newLineOptWhenFollowedBy (LBRACE ab) in_;
+          let (rhs : fbody) =
+            match in_.token with
+            | LBRACE _ ->
+                (* CHECK: "procedure syntax is deprecated for constructors" *)
+                let lb, xs, rb = constrBlock vparamss in_ in
+                FBlock (lb, BEBlock xs, rb)
+            | EQUALS ii ->
+                accept (EQUALS ab) in_;
+                let x = constrExpr vparamss in_ in
+                FExpr (ii, x)
+            | _ ->
+                (* generate error message *)
+                raise Impossible
+          in
+          (* ast: DefDef(mods, nme.CONSTRUCTOR, [], vparamss, TypeTree(), rhs)*)
+          let ent = { name; attrs; tparams = None } in
+          let fdef =
+            {
+              fkind = (Def, idef);
+              ftparams = None;
+              fparams = vparamss;
+              frettype = None;
+              fbody = Some rhs;
+            }
+          in
+          DefEnt (ent, FuncDef fdef)
+      | _ ->
+          let name = identOrMacro in_ in
+          let fdef, tparams = funDefRest (Def, idef) attrs name in_ in
+          let ent = { name; attrs; tparams } in
+          DefEnt (ent, FuncDef fdef))
 
 (*****************************************************************************)
 (* Parsing types definitions or declarations  *)
@@ -3822,39 +4029,39 @@ let patDefOrDcl vkind attrs in_ : variable_definitions =
 let defOrDcl attrs in_ : definition =
   in_
   |> with_logging "defOrDcl" (fun () ->
-         (* CHECK: "lazy not allowed here. Only vals can be lazy" *)
-         match in_.token with
-         | Kval ii -> VarDefs (patDefOrDcl (Val, ii) attrs (* ast:VAL *) in_)
-         | Kvar ii ->
-             VarDefs (patDefOrDcl (Var, ii) attrs (* ast:VAR and Mutable*) in_)
-         | Kdef _ -> funDefOrDcl attrs (* ast:DEF *) in_
-         | Ktype _ -> typeDefOrDcl attrs (* ast:TYPE *) in_
-         (* classes/traits/objects (a.k.a templates) *)
-         | _ -> !tmplDef_ attrs in_)
+      (* CHECK: "lazy not allowed here. Only vals can be lazy" *)
+      match in_.token with
+      | Kval ii -> VarDefs (patDefOrDcl (Val, ii) attrs (* ast:VAL *) in_)
+      | Kvar ii ->
+          VarDefs (patDefOrDcl (Var, ii) attrs (* ast:VAR and Mutable*) in_)
+      | Kdef _ -> funDefOrDcl attrs (* ast:DEF *) in_
+      | Ktype _ -> typeDefOrDcl attrs (* ast:TYPE *) in_
+      (* classes/traits/objects (a.k.a templates) *)
+      | _ -> !tmplDef_ attrs in_)
 
 let nonLocalDefOrDcl in_ : definition =
   in_
   |> with_logging "nonLocalDefOrDcl" (fun () ->
-         let annots = annotations ~skipNewLines:true in_ in
-         let mods = modifiers in_ in
-         (* ast: mods withAnnotations annots *)
-         defOrDcl (mods_with_annots mods annots) in_)
+      let annots = annotations ~skipNewLines:true in_ in
+      let mods = modifiers in_ in
+      (* ast: mods withAnnotations annots *)
+      defOrDcl (mods_with_annots mods annots) in_)
 
 let localDef implicitMod in_ : definition =
   in_
   |> with_logging "localDef" (fun () ->
-         let annots = annotations ~skipNewLines:true in_ in
-         let mods = localModifiers in_ in
-         let mods = implicitMod @ mods in
-         (* ast: let mods = mods | implicitMod withAnnotations annots *)
-         (* crazy? parsing depends on AST *)
-         let defs =
-           (* STILL? !(mods hasFlag ~(Flags.IMPLICIT | Flags.LAZY))) *)
-           defOrDcl (mods_with_annots mods annots) in_
-           (* STILL?: else tmplDef mods in_ *)
-         in
-         defs
-         (* AST: if RBRACE | CASE defs :+ literalUnit *))
+      let annots = annotations ~skipNewLines:true in_ in
+      let mods = localModifiers in_ in
+      let mods = implicitMod @ mods in
+      (* ast: let mods = mods | implicitMod withAnnotations annots *)
+      (* crazy? parsing depends on AST *)
+      let defs =
+        (* STILL? !(mods hasFlag ~(Flags.IMPLICIT | Flags.LAZY))) *)
+        defOrDcl (mods_with_annots mods annots) in_
+        (* STILL?: else tmplDef mods in_ *)
+      in
+      defs
+      (* AST: if RBRACE | CASE defs :+ literalUnit *))
 
 (* ------------------------------------------------------------------------- *)
 (* End Marker *)
@@ -4018,8 +4225,16 @@ let isCaseDefEnd in_ =
   | _ -> false
 
 let blockStatSeqInner in_ : top_stat option =
+  (* Don't demand a statement separator if we're at a token that
+     terminates the block, such as `)` or `,` from an enclosing
+     context. Without this, parsing e.g.:
+       foo(x =>
+         (3))
+     would fail because `)` is not a valid statement separator.
+  *)
   let acceptStatSepOptOrEndCase in_ =
-    if not (TH.isCaseDefEnd in_.token) then acceptStatSepOpt in_
+    if (not (TH.isCaseDefEnd in_.token)) && not (isClosingIndentRegion in_) then
+      acceptStatSepOpt in_
   in
   match in_.token with
   | ID_LOWER ("end", _) ->
@@ -4033,7 +4248,7 @@ let blockStatSeqInner in_ : top_stat option =
       let res = I x in
       acceptStatSepOptOrEndCase in_;
       Some res
-  | t when TH.isDefIntro t || TH.isLocalModifier t || TH.isAnnotation t ->
+  | t when TH.isDefIntro t || is_modifier in_ || TH.isAnnotation t ->
       let res =
         match in_.token with
         | Kimplicit ii ->
@@ -4042,7 +4257,7 @@ let blockStatSeqInner in_ : top_stat option =
               E (implicitClosure (Implicit, ii) InBlock in_)
               (* ast: Flags.IMPLICIT*)
             else D (localDef [ (Implicit, ii) ] in_)
-        | _ -> D (localDef [] in_)
+        | _ -> D (nonLocalDefOrDcl in_)
       in
       acceptStatSepOptOrEndCase in_;
       Some res
@@ -4053,12 +4268,19 @@ let blockStatSeqInner in_ : top_stat option =
   | t when TH.isStatSep t ->
       nextToken in_;
       None
-  | _ when is_modifier in_ -> error "no modifiers allowed here" in_
   | _ -> error "illegal start of statement" in_
 
+(* Also terminate the loop when a closing grouper or comma from an
+   enclosing context is reached, ending the implicit indent region.
+   See isClosingIndentRegion.
+*)
 let blockStatSeq in_ : block_stat list =
   let stats = ref [] in
-  while (not (TH.isStatSeqEnd in_.token)) && not (isCaseDefEnd in_) do
+  while
+    (not (TH.isStatSeqEnd in_.token))
+    && (not (isCaseDefEnd in_))
+    && not (isClosingIndentRegion in_)
+  do
     match blockStatSeqInner in_ with
     | None -> ()
     | Some x -> stats += x
@@ -4088,7 +4310,7 @@ let blockStatSeq in_ : block_stat list =
      if (true) then
        1 else 4
 *)
-let indentedExprOrBlockStatSeqUntil ?(until = None) in_ =
+let indentedExprOrBlockStatSeqUntil ?until in_ =
   let hit_until tok =
     match until with
     | Some tok' -> tok' =~= tok
@@ -4344,7 +4566,7 @@ let templateParents in_ : template_parents =
     if args <> [] then error "only the first parent type can have arguments" in_;
     cwith += parent
   done;
-  { cextends = Some (parent, args); cwith = List.rev !cwith }
+  { cextends = Some (parent, args); cwith = List.rev !cwith; cderives = [] }
 
 (** {{{
  *  ClassTemplate ::= [EarlyDefs with] ClassParents [TemplateBody]
@@ -4354,13 +4576,32 @@ let templateParents in_ : template_parents =
  *  }}}
 *)
 
+(* Scala 3: InheritClauses ::= ['extends' ConstrApps] ['derives' QualId {',' QualId}] *)
+let parseDerives in_ : type_ list =
+  match in_.token with
+  | ID_LOWER ("derives", _) ->
+      nextToken in_;
+      let first = startAnnotType in_ in
+      let rest = ref [] in
+      while in_.token =~= COMMA ab do
+        nextToken in_;
+        rest := startAnnotType in_ :: !rest
+      done;
+      first :: List.rev !rest
+  | _ -> []
+
 let afterTemplate in_ body =
   match in_.token with
   | Kwith _ (* crazy? && self eq noSelfType *) ->
       (* CHECK: "use traint parameters instead" when scala3 *)
-      let _earlyDefs = body (* CHECK: map ensureEarlyDef AST: filter *) in
+      let _earlyDefs =
+        body
+        (* CHECK: map ensureEarlyDef AST: filter *)
+      in
       nextToken in_;
       let parents = templateParents in_ in
+      let cderives = parseDerives in_ in
+      let parents = { parents with cderives } in
       let body1opt = templateBodyOpt ~parenMeansSyntaxError:false in_ in
       (* AST: earlyDefs @ *)
       (parents, body1opt)
@@ -4369,18 +4610,20 @@ let afterTemplate in_ body =
 let template in_ : template_parents * template_body option =
   in_
   |> with_logging "template" (fun () ->
-         newLineOptWhenFollowedBy (LBRACE ab) in_;
-         match in_.token with
-         | COLON _ when isIndentAfterColon in_ ->
-             let body = templateBody ~isPre:true in_ in
-             afterTemplate in_ body
-         | LBRACE _ ->
-             let body = templateBody ~isPre:true in_ in
-             afterTemplate in_ body
-         | _ ->
-             let parents = templateParents in_ in
-             let bodyopt = templateBodyOpt ~parenMeansSyntaxError:false in_ in
-             (parents, bodyopt))
+      newLineOptWhenFollowedBy (LBRACE ab) in_;
+      match in_.token with
+      | COLON _ when isIndentAfterColon in_ ->
+          let body = templateBody ~isPre:true in_ in
+          afterTemplate in_ body
+      | LBRACE _ ->
+          let body = templateBody ~isPre:true in_ in
+          afterTemplate in_ body
+      | _ ->
+          let parents = templateParents in_ in
+          let cderives = parseDerives in_ in
+          let parents = { parents with cderives } in
+          let bodyopt = templateBodyOpt ~parenMeansSyntaxError:false in_ in
+          (parents, bodyopt))
 
 (* AST: name, mods, constrMods, vparams *)
 
@@ -4398,13 +4641,14 @@ let templateOpt ckind vparams in_ : template_definition =
         nextToken in_;
         template in_
     | _ ->
+        let cderives = parseDerives in_ in
         newLineOptWhenFollowedBy (LBRACE ab) in_;
         let bodyopt =
           (* AST: mods.isTrait || name.isTermName *)
           let parenMeansSyntaxError = true in
           templateBodyOpt ~parenMeansSyntaxError in_
         in
-        (AST.empty_cparents, bodyopt)
+        ({ AST.empty_cparents with cderives }, bodyopt)
   in
   (* AST: Template(parents, self, anyvalConstructor()::body))
    * CHECK: "package object inheritance is deprecated"
@@ -4421,31 +4665,30 @@ let templateOpt ckind vparams in_ : template_definition =
  *  ObjectDef       ::= Id ClassTemplateOpt
  *  }}}
 *)
-let objectDef ?(isCase = None) ?(isPackageObject = None) attrs in_ : definition
-    =
+let objectDef ?isCase ?isPackageObject attrs in_ : definition =
   in_
   |> with_logging "objectDef" (fun () ->
-         let ikind = TH.info_of_tok in_.token in
-         nextToken in_;
-         (* 'object' *)
-         let name = ident in_ in
-         (* ast: mods if isPackageObject ... *)
-         let mods =
-           (match isCase with
-           | None -> []
-           | Some ii -> [ (CaseClassOrObject, ii) ])
-           @
-           match isPackageObject with
-           | None -> []
-           | Some ii -> [ (PackageObject, ii) ]
-         in
-         let ckind = (Object, ikind) in
-         let tmpl = templateOpt ckind [] in_ in
-         (* AST: ModuleDef (mods, name.toTermName, template) *)
-         let ent =
-           { name; attrs = attrs @ AST.attrs_of_mods mods; tparams = None }
-         in
-         DefEnt (ent, Template tmpl))
+      let ikind = TH.info_of_tok in_.token in
+      nextToken in_;
+      (* 'object' *)
+      let name = ident in_ in
+      (* ast: mods if isPackageObject ... *)
+      let mods =
+        (match isCase with
+          | None -> []
+          | Some ii -> [ (CaseClassOrObject, ii) ])
+        @
+        match isPackageObject with
+        | None -> []
+        | Some ii -> [ (PackageObject, ii) ]
+      in
+      let ckind = (Object, ikind) in
+      let tmpl = templateOpt ckind [] in_ in
+      (* AST: ModuleDef (mods, name.toTermName, template) *)
+      let ent =
+        { name; attrs = attrs @ AST.attrs_of_mods mods; tparams = None }
+      in
+      DefEnt (ent, Template tmpl))
 
 (* ------------------------------------------------------------------------- *)
 (* Package object *)
@@ -4465,7 +4708,7 @@ let objectDef ?(isCase = None) ?(isPackageObject = None) attrs in_ : definition
  *  }}}
 *)
 let packageObjectDef ipackage in_ : definition =
-  objectDef noMods ~isPackageObject:(Some ipackage) in_
+  objectDef noMods ~isPackageObject:ipackage in_
 (* AST: gen.mkPackageObject(defn, pidPos, pkgPos) *)
 
 let packageOrPackageObject ipackage in_ : top_stat =
@@ -4486,69 +4729,72 @@ let packageOrPackageObject ipackage in_ : top_stat =
 let constructorAnnotations in_ : annotation list =
   in_
   |> with_logging "constructorAnnotations" (fun () ->
-         readAnnots
-           (fun iat in_ ->
-             let t = exprSimpleType in_ in
-             let (es : arguments) = argumentExprs in_ in
-             (* ast: New(t, List(es)) *)
-             (iat, t, [ es ]))
-           in_)
+      readAnnots
+        (fun iat in_ ->
+          let t = exprSimpleType in_ in
+          let (es : arguments) = argumentExprs in_ in
+          (* ast: New(t, List(es)) *)
+          (iat, t, [ es ]))
+        in_)
 
 (** {{{
  *  ClassDef ::= Id [TypeParamClause] ConstrAnnotations
  *               [AccessModifier] ClassParamClauses RequiresTypeOpt ClassTemplateOpt
- *  TraitDef ::= Id [TypeParamClause] RequiresTypeOpt TraitTemplateOpt
+ *  TraitDef ::= Id [TypeParamClause] [ClassParamClauses] RequiresTypeOpt TraitTemplateOpt
  *  }}}
 *)
 
 (* pad: I added isTrait and isCase instead of abusing mods *)
-let classDef ?(isTrait = false) ?(isCase = None) attrs in_ : definition =
+let classDef ?(isTrait = false) ?isCase attrs in_ : definition =
   in_
   |> with_logging "classDef" (fun () ->
-         let ikind = TH.info_of_tok in_.token in
-         nextToken in_;
-         (* 'class' or 'trait' *)
-         let name = identForType in_ in
+      let ikind = TH.info_of_tok in_.token in
+      nextToken in_;
+      (* 'class' or 'trait' *)
+      let name = identForType in_ in
 
-         (* AST: savingClassContextBounds *)
-         let contextBoundBuf = ref [] in
-         let tparams = typeParamClauseOpt name (Some contextBoundBuf) in_ in
-         let classContextBounds = !contextBoundBuf in
+      (* AST: savingClassContextBounds *)
+      let contextBoundBuf = ref [] in
+      let tparams = typeParamClauseOpt name (Some contextBoundBuf) in_ in
+      let classContextBounds = !contextBoundBuf in
 
-         (* CHECK: "traits cannot have type parameters with context bounds" *)
-         let constrAnnots =
-           if not isTrait then constructorAnnotations in_ else []
-         in
+      (* CHECK: "traits cannot have type parameters with context bounds" *)
+      let constrAnnots =
+        if not isTrait then constructorAnnotations in_ else []
+      in
 
-         let constrMods, vparamss =
-           if isTrait then ([], [] (* AST: (Modifiers(Flags.TRAIT), List()) *))
-           else
-             let constrMods = accessModifierOpt in_ in
-             let vparamss =
-               paramClauses ~ofCaseClass:(isCase <> None) name
-                 classContextBounds in_
-             in
-             (Option.to_list constrMods, vparamss)
-         in
+      let constrMods, vparamss =
+        if isTrait then
+          (* Scala 3.4+: traits can have parameters *)
+          let vparamss =
+            paramClauses ~ofCaseClass:false name classContextBounds in_
+          in
+          ([], vparamss)
+        else
+          let constrMods = accessModifierOpt in_ in
+          let vparamss =
+            paramClauses ~ofCaseClass:(isCase <> None) name classContextBounds
+              in_
+          in
+          (Option.to_list constrMods, vparamss)
+      in
 
-         let kind = ((if isTrait then Trait else Class), ikind) in
-         let mods =
-           match isCase with
-           | None -> []
-           | Some ii -> [ (CaseClassOrObject, ii) ]
-         in
-         (* ast: name ... constrMods withAnnotations...*)
-         let attrs =
-           mods_with_annots (mods @ constrMods) constrAnnots @ attrs
-         in
-         let ent = { name; attrs; tparams } in
-         let tmpl = templateOpt kind vparamss in_ in
-         (* AST: gen.mkClassDef(mods, name, tparams, template) *)
-         (* CHECK: Context bounds generate implicit parameters (part of the template)
-          *  with types from tparams: we need to ensure these don't overlap
-          * ensureNonOverlapping(template, tparams)
+      let kind = ((if isTrait then Trait else Class), ikind) in
+      let mods =
+        match isCase with
+        | None -> []
+        | Some ii -> [ (CaseClassOrObject, ii) ]
+      in
+      (* ast: name ... constrMods withAnnotations...*)
+      let attrs = mods_with_annots (mods @ constrMods) constrAnnots @ attrs in
+      let ent = { name; attrs; tparams } in
+      let tmpl = templateOpt kind vparamss in_ in
+      (* AST: gen.mkClassDef(mods, name, tparams, template) *)
+      (* CHECK: Context bounds generate implicit parameters (part of the template)
+            with types from tparams: we need to ensure these don't overlap
+            ensureNonOverlapping(template, tparams)
           *)
-         DefEnt (ent, Template tmpl))
+      DefEnt (ent, Template tmpl))
 
 (* ------------------------------------------------------------------------- *)
 (* Enums *)
@@ -4658,31 +4904,28 @@ let enumCaseRest in_ : enum_case_definition =
 let enumDef attrs in_ =
   in_
   |> with_logging "enumDef" (fun () ->
-         (* 'enum' *)
-         let ikind = TH.info_of_tok in_.token in
-         accept (ID_LOWER ("enum", ab)) in_;
+      (* 'enum' *)
+      let ikind = TH.info_of_tok in_.token in
+      accept (ID_LOWER ("enum", ab)) in_;
 
-         let name = ident in_ in
+      let name = ident in_ in
 
-         let tparams, constrAnnots, access_mods, vparamss =
-           classConstr name in_
-         in
+      let tparams, constrAnnots, access_mods, vparamss = classConstr name in_ in
 
-         let kind = (Enum, ikind) in
+      let kind = (Enum, ikind) in
 
-         let attrs = mods_with_annots access_mods constrAnnots @ attrs in
-         let ent = { name; attrs; tparams } in
+      let attrs = mods_with_annots access_mods constrAnnots @ attrs in
+      let ent = { name; attrs; tparams } in
 
-         (* TODO: InheritClauses *)
-         let tmpl = templateOpt kind vparamss in_ in
-         (* AST: gen.mkClassDef(mods, name, tparams, template) *)
-         (* CHECK: Context bounds generate implicit parameters (part of the template)
-          *  with types from tparams: we need to ensure these don't overlap
-          * ensureNonOverlapping(template, tparams)
+      (* InheritClauses: derives is handled inside templateOpt *)
+      let tmpl = templateOpt kind vparamss in_ in
+      (* AST: gen.mkClassDef(mods, name, tparams, template) *)
+      (* CHECK: Context bounds generate implicit parameters (part of the template)
+             with types from tparams: we need to ensure these don't overlap
+            ensureNonOverlapping(template, tparams)
           *)
-         DefEnt
-           ( { ent with attrs = M (EnumClass, ikind) :: ent.attrs },
-             Template tmpl ))
+      DefEnt
+        ({ ent with attrs = M (EnumClass, ikind) :: ent.attrs }, Template tmpl))
 
 (* ------------------------------------------------------------------------- *)
 (* GivenDef *)
@@ -4827,8 +5070,8 @@ let tmplDef attrs in_ : definition =
   | Kcase ii -> (
       nextToken in_;
       match in_.token with
-      | Kclass _ -> classDef ~isCase:(Some ii) attrs in_
-      | Kobject _ -> objectDef ~isCase:(Some ii) attrs in_
+      | Kclass _ -> classDef ~isCase:ii attrs in_
+      | Kobject _ -> objectDef ~isCase:ii attrs in_
       | _ when TH.isIdentBool in_.token -> EnumCaseDef (attrs, enumCaseRest in_)
       (* pad: my error message *)
       | _ -> error "expecting class or object after a case" in_)
@@ -4850,7 +5093,7 @@ let _ =
   tmplDef_ := tmplDef;
   blockStatSeq_ := blockStatSeq;
   (indentedExprOrBlockStatSeqUntil_ :=
-     fun env ~until -> indentedExprOrBlockStatSeqUntil ~until env);
+     fun env ~until -> indentedExprOrBlockStatSeqUntil ?until env);
   packageOrPackageObject_ := packageOrPackageObject;
 
   exprTypeArgs_ := exprTypeArgs;
@@ -4932,8 +5175,17 @@ let parse toks =
       | Parsing_error.Syntax_error _ -> Exception.reraise e1)
 
 let semgrep_pattern toks =
+  let partialCaseClause in_ =
+    match in_.token with
+    | Kcase ii ->
+        nextToken in_;
+        caseClause block ii in_
+    | _ -> error "expected case clause" in_
+  in
   try try_rule toks (fun in_ -> Ex (expr in_)) with
   | Parsing_error.Syntax_error _ -> (
       try try_rule toks (fun in_ -> Ss (block in_)) with
-      | Parsing_error.Syntax_error _ ->
-          try_rule toks (fun in_ -> Pr (compilationUnit in_)))
+      | Parsing_error.Syntax_error _ -> (
+          try try_rule toks (fun in_ -> Cs (partialCaseClause in_)) with
+          | Parsing_error.Syntax_error _ ->
+              try_rule toks (fun in_ -> Pr (compilationUnit in_))))

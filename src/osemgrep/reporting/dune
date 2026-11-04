@@ -4,15 +4,25 @@
  (name osemgrep_reporting)
  (wrapped false)
  (libraries
+   base
+   collections
    commons
-   fmt
+   fmt ; TODO: get rid of this dependency
    terminal_size
    digestif
+   xmlm
+   sarif
+   python-str-repr
+   ; for Console_spinner
+   lwt
+   lwt_platform
 
+   murmur3
+   osemgrep_configuring
    osemgrep_core
-   osemgrep_core_runner
    semgrep.reporting
    semgrep.targeting
+   semgrep.fixing ; for Cli_json_output.ml
  )
  (preprocess
    (pps
@@ -20,6 +30,8 @@
      ppx_deriving.show
      ppx_deriving.eq
      ppx_hash
+     lwt_ppx
+     commons.ppx
    )
  )
 )

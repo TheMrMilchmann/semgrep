@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (*************************************************************************)
 (* Prelude *)
 (*************************************************************************)
@@ -14,9 +26,9 @@
  *)
 let abort_if_use_of_legacy_dot_semgrep_yml () =
   if
-    Sys.file_exists ".semgrep.yml"
-    || Sys.file_exists ".semgrep"
-       && not (Sys.file_exists ".semgrep/settings.yml")
+    Sys_.file_exists ".semgrep.yml"
+    || Sys_.file_exists ".semgrep"
+       && not (Sys_.file_exists ".semgrep/settings.yml")
   then (
     flush stdout;
     Logs.err (fun m ->
@@ -24,4 +36,4 @@ let abort_if_use_of_legacy_dot_semgrep_yml () =
           "The implicit use of .semgrep.yml (or .semgrep/) has been deprecated \
            in Semgrep 1.38.0.\n\
            Please use an explicit --config .semgrep.yml (or --config .semgrep/)");
-    Error.exit Exit_code.fatal)
+    Error.exit_code_exn (Exit_code.fatal ~__LOC__))

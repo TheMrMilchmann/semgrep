@@ -1,21 +1,27 @@
 // Factorize utility jobs or steps for repeated use across multiple workflows
+local uses = import './uses.libsonnet';
 
 {
   setup_docker_tag: function() {
     name: 'Reconstruct Docker tag created by docker/metadata-action',
     'runs-on': 'ubuntu-22.04',
     outputs: {
-      'docker-tag': '${{ steps.setup-docker-tag.outputs.docker-tag }}'
+      'docker-tag': '${{ steps.setup-docker-tag.outputs.docker-tag }}',
     },
     steps: [{
       id: 'setup-docker-tag',
       run: |||
         echo "Github event is ${{ github.event_name }}"
+        if [ "${{ github.repository }}" = "semgrep/semgrep-proprietary" ]; then
+          PRO_PREFIX="pro-"
+        else
+          PRO_PREFIX=""
+        fi
         if [ "${{ github.event_name }}" = "pull_request" ]; then
-          echo "docker-tag=pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          echo "docker-tag=${PRO_PREFIX}pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           echo "Setting docker tag to current pull request number"
         else
-          echo "docker-tag=develop" >> "$GITHUB_OUTPUT"
+          echo "docker-tag=${PRO_PREFIX}develop" >> "$GITHUB_OUTPUT"
           echo "Setting dry-run to develop"
         fi
       |||,
@@ -29,7 +35,7 @@
     },
     steps: [
       {
-        uses: 'actions/checkout@v3',
+        uses: uses.actions.checkout,
       },
       {
         id: 'get-sha',
@@ -51,7 +57,7 @@
   },
   // workflow_inputs is a JSON object that looks like [{ "name": "name_1", "value": "value_1" }, ...]
   // "value_1" should be a string that can include GHA expression for the value, e.g.,
-  // "returntocorp/semgrep:${{ needs.setup-docker-tag.outputs.docker-tag }}".
+  // "semgrep/semgrep:${{ needs.setup-docker-tag.outputs.docker-tag }}".
   // This will be converted into env vars to avoid accidental script injections
   // and reconstructed as the JSON body in the POST request to Argo.
   trigger_argo_workflow: function(trigger_url, workflow_inputs) {
@@ -64,7 +70,8 @@
         SHA: '${{ needs.get-sha.outputs.sha }}',
         TOKEN: '${{ secrets.ARGO_WORKFLOWS_TOKEN }}',
       } + {
-        [std.asciiUpper(e.name)]: e.value for e in workflow_inputs
+        [std.asciiUpper(e.name)]: e.value
+        for e in workflow_inputs
       },
       run: |||
         echo "Repository: $REPOSITORY"
@@ -72,14 +79,15 @@
         curl --fail-with-body -X POST %s \
           -H "Authorization: Bearer $TOKEN" \
           -d %s
-      ||| % [ trigger_url, std.escapeStringJson(std.toString(
+      ||| % [trigger_url, std.escapeStringJson(std.toString(
         {
           repository: '$REPOSITORY',
           sha: '$SHA',
         } + {
-          [e.name]: "$" + std.asciiUpper(e.name) for e in workflow_inputs
+          [e.name]: '$' + std.asciiUpper(e.name)
+          for e in workflow_inputs
         }
       ))],
-    }]
-  }
+    }],
+  },
 }

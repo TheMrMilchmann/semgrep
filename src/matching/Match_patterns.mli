@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2020-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* This is the entry point function for matching/. check() below is called
  * from engine/ in Match_search_mode.matches_of_patterns, called itself
  * from Match_rules.check().
@@ -12,15 +24,19 @@
  * worry about sub-expressions, they will be visited regardless.
  *)
 val check :
-  hook:(Pattern_match.t -> unit) ->
-  ?mvar_context:Metavariable.bindings option ->
+  hook:(Core_match.t -> unit) ->
+  (* as-metavariable: whether this rule whose patterns we are matching
+     contains an `as-metavariable`
+  *)
+  ?has_as_metavariable:bool ->
+  ?mvar_context:Metavariable.bindings ->
   ?range_filter:(Tok.location * Tok.location -> bool) ->
-  Rule_options.t * Equivalence.equivalences ->
+  Rule_options.t ->
   Mini_rule.rules ->
-  Fpath.t * Lang.t * Target.t ->
-  Pattern_match.t list
+  Fpath.t * Origin.t * Lang.t * AST_generic.program ->
+  Core_match.t list
 
-val last_matched_rule : Mini_rule.t option ref
+val last_matched_rule : Mini_rule.t option Domain.DLS.key
 
 (* used by tainting *)
 val match_e_e : Mini_rule.t -> AST_generic.expr Matching_generic.matcher

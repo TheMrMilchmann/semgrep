@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 module Arg = Cmdliner.Arg
 module Term = Cmdliner.Term
 
@@ -41,21 +53,26 @@ type t =
 (* osemgrep-only:  *)
 let o_experimental : bool Term.t =
   let info =
-    Arg.info [ "experimental" ] ~doc:{|Enable experimental features.|}
+    Arg.info [ "experimental" ] ~docs:Cmdliner.Manpage.s_common_options
+      ~doc:{|Enable experimental features.|}
   in
   Arg.value (Arg.flag info)
 
 (* osemgrep-only: (well it is also supported by pysemgrep but
  * by handling (and filtering it) in cli/bin/semgrep *)
 let o_legacy : bool Term.t =
-  let info = Arg.info [ "legacy" ] ~doc:{|Prefer old (legacy) behavior.|} in
+  let info =
+    Arg.info [ "legacy" ] ~docs:Cmdliner.Manpage.s_common_options
+      ~doc:{|Prefer old (legacy) behavior.|}
+  in
   Arg.value (Arg.flag info)
 
 (* osemgrep-only: *)
 let o_develop : bool Term.t =
   let info =
     (* alt: get rid  of the pysemgrep behaviors/limitations/errors *)
-    Arg.info [ "develop" ] ~doc:{|Living on the edge.|}
+    Arg.info [ "develop" ] ~docs:Cmdliner.Manpage.s_common_options
+      ~doc:{|Living on the edge.|}
   in
   Arg.value (Arg.flag info)
 

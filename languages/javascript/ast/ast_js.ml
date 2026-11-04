@@ -92,7 +92,11 @@ type sc = Tok.t [@@deriving show]
 (* Name *)
 (* ------------------------------------------------------------------------- *)
 
-type a_ident = string wrap [@@deriving show]
+type a_ident = { str : string; tok : tok; fake : bool } [@@deriving show]
+
+let real_id str tok = { str; tok; fake = false }
+let fake_id str tok = { str; tok; fake = true }
+let to_real_id (str, tok) = { str; tok; fake = false }
 
 type special =
   (* Special values *)
@@ -157,8 +161,19 @@ type a_filename = string wrap [@@deriving show]
  *)
 type a_dotted_ident = a_ident list [@@deriving show]
 
-(* when doing export default Foo and import Bar, ... *)
-let default_entity = "!default!"
+(* In ECMAScript modules, there's a notion of a "default" import/export, which
+   is used, e.g., when doing `import bar from 'foo';`
+   (cf. `import { bar } from 'foo';`). In these cases, `default` is a keyword
+   and cannot be used as an identifier, so we can use it here directly to refer
+   to that default entity. This allows us to have a pattern matching the name
+   `foo.default` to match against the imported name in both `import { default
+   as example } from 'foo';` and `import example from 'foo';`, as it ought
+   to---this value being used in the latter case to construct the name.
+
+   When not using ECMAScript modules, this isn't a keyword, but we don't use
+   it, so there's no chance of a conflict.
+*)
+let default_entity = "default"
 
 type property_name =
   (* this can even be a string or number *)
@@ -198,12 +213,12 @@ and expr =
   | ArrAccess of expr * expr bracket
   (* ident is a Some when recursive lambda or assigned in module.exports *)
   | Fun of function_definition * a_ident option
-  | Apply of expr * a_arguments
+  | Apply of expr * type_ list bracket * a_arguments
   | New of tok * expr * a_arguments
   (* copy-paste of AST_generic.xml (but with different 'expr') *)
   | Xml of xml
   (* could unify with Apply, but need Lazy special then *)
-  | Conditional of expr * expr * expr
+  | Conditional of expr * tok (* '?' *) * expr * tok (* ':' *) * expr
   (* typescript: *)
   (* I'm not sure E : T is valid TS code actually; tree-sitter-ts allows it
    * but I can't find doc about it. Looks like the 'as' or <T> syntax
@@ -211,6 +226,8 @@ and expr =
    *)
   | Cast of expr * tok (* ':' *) * type_
   | TypeAssert of expr * tok (* 'as' or '<' *) * type_ (* X as T or <T> X *)
+  | Satisfies of expr * tok (* 'satisfies' *) * type_
+  | Instantiation of expr * type_ list bracket
   (* this is used mostly for unsupported typescript features *)
   | ExprTodo of a_todo_category * expr list
   | ParenExpr of tok * expr * tok
@@ -388,6 +405,7 @@ and keyword_attribute =
   (* only inside classes *)
   | Get
   | Set
+  | Accessor
 
 (*****************************************************************************)
 (* Definitions *)
@@ -613,9 +631,9 @@ let special_of_id_opt s =
 let idexp id = Id id
 
 let idexp_or_special id =
-  match special_of_id_opt (fst id) with
+  match special_of_id_opt id.str with
   | None -> idexp id
-  | Some special -> IdSpecial (special, snd id)
+  | Some special -> IdSpecial (special, id.tok)
 
 (* note that this should be avoided as much as possible for sgrep, because
  * what was before a simple sequence of stmts in the same block can suddently
@@ -632,7 +650,7 @@ let unsafe_stmt1 xs = stmt1_with Tok.unsafe_fake_bracket xs
 let basic_entity id = { name = id; attrs = [] }
 
 let mk_default_entity_def tok exp =
-  let n = (default_entity, tok) in
+  let n = real_id default_entity tok in
   (* TODO: look at exp and transform in FuncDef/ClassDef? *)
   let def =
     ( basic_entity n,
@@ -649,7 +667,7 @@ let var_pattern_to_var v_kind pat tok init_opt =
   | Id id, None -> (basic_entity id, { v_kind; v_init = None; v_type = None })
   | _ ->
       let s = AST_generic.special_multivardef_pattern in
-      let id = (s, tok) in
+      let id = fake_id s tok in
       let init =
         match init_opt with
         | Some init -> Assign (pat, tok, init)
@@ -698,7 +716,7 @@ let parameter_to_pattern tok (param : parameter) : a_pattern =
 
 let mk_const_var id e =
   ( basic_entity id,
-    VarDef { v_kind = (Const, snd id); v_init = Some e; v_type = None } )
+    VarDef { v_kind = (Const, id.tok); v_init = Some e; v_type = None } )
 
 let add_decorators_to_declaration decorators declaration =
   let ent, defkind = declaration in

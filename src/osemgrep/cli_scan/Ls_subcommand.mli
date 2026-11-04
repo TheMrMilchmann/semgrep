@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    List files that semgrep treats as targets before rule-specific
    or language-specific filtering.
 
@@ -10,10 +22,17 @@
 *)
 
 (*
+   Print just the paths (like 'ls') or print a bunch of details (like 'ls -l')
+*)
+type format = Paths_only | Long [@@deriving show]
+
+val default_format : format
+
+(*
    Print the list of selected targets in alphabetical order, one per line.
 *)
 val run :
-  target_roots:Fpath.t list ->
+  target_roots:Scanning_root.t list ->
   targeting_conf:Find_targets.conf ->
-  unit ->
+  format:format ->
   Exit_code.t

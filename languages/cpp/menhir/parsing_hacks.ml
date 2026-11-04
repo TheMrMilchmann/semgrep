@@ -122,11 +122,11 @@ let insert_virtual_positions l =
 (*****************************************************************************)
 let fix_tokens_for_language lang xs =
   xs
-  |> List_.map (fun tok ->
-         if lang =*= Flag_parsing_cpp.C && TH.is_cpp_keyword tok then
-           let ii = TH.info_of_tok tok in
-           T.TIdent (Tok.content_of_tok ii, ii)
-         else tok)
+  |> List.map (fun tok ->
+      if lang =*= Flag_parsing_cpp.C && TH.is_cpp_keyword tok then
+        let ii = TH.info_of_tok tok in
+        T.TIdent (Tok.content_of_tok ii, ii)
+      else tok)
 
 (*****************************************************************************)
 (* Fuzzy build *)
@@ -139,14 +139,14 @@ let fix_tokens_fuzzy toks =
         { Lib_ast_fuzzy.tokf = TH.info_of_tok; kind = TH.token_kind_of_tok }
         toks
     in
-    let retag_lambda = Hashtbl.create 101 in
+    let retag_lambda = Base.Hashtbl.Poly.create ~size:101 () in
 
     let rec aux env trees =
       match trees with
       | [] -> ()
       (* [...] { } *)
       | F.Bracket (l, xs, _r) :: F.Braces _ :: ys ->
-          Hashtbl.add retag_lambda l true;
+          Base.Hashtbl.set retag_lambda ~key:l ~data:true;
           aux env xs;
           aux env ys
       | x :: xs ->
@@ -163,20 +163,20 @@ let fix_tokens_fuzzy toks =
     and iter_parens env xs =
       xs
       |> List.iter (function
-           | Either.Left trees -> aux env trees
-           | Either.Right _comma -> ())
+        | Either.Left trees -> aux env trees
+        | Either.Right _comma -> ())
     in
     aux () trees;
 
     (* use the tagged information and transform tokens *)
     toks
     |> List.map (function
-         | T.TOCro info when Hashtbl.mem retag_lambda info ->
-             T.TOCro_Lambda info
-         | x -> x)
+      | T.TOCro info when Base.Hashtbl.mem retag_lambda info ->
+          T.TOCro_Lambda info
+      | x -> x)
   with
   | Lib_ast_fuzzy.Unclosed (msg, info) ->
-      if !Flag.error_recovery then toks
+      if Hook.get Flag.error_recovery then toks
       else raise (Parsing_error.Lexical_error (msg, info))
 
 (*****************************************************************************)
@@ -210,7 +210,7 @@ let fix_tokens_c ~macro_defs tokens =
   let tokens = Parsing_hacks_define.fix_tokens_define tokens in
   let tokens = fix_tokens_for_language Flag_cpp.C tokens in
 
-  let tokens2 = ref (tokens |> Common2.acc_map TV.mk_token_extended) in
+  let tokens2 = ref (tokens |> List.map TV.mk_token_extended) in
 
   (* ifdef *)
   let cleaner = !tokens2 |> filter_comment_stuff in
@@ -241,13 +241,13 @@ let fix_tokens_c ~macro_defs tokens =
   let xxs = Parsing_hacks_typedef.filter_for_typedef multi_grouped in
   Parsing_hacks_typedef.find_typedefs xxs;
 
-  insert_virtual_positions (!tokens2 |> Common2.acc_map (fun x -> x.TV.t))
+  insert_virtual_positions (!tokens2 |> List.map (fun x -> x.TV.t))
 
 let fix_tokens_cpp ~macro_defs tokens =
   let tokens = Parsing_hacks_define.fix_tokens_define tokens in
 
   (* let tokens = fix_tokens_for_language Flag_cpp.Cplusplus tokens in *)
-  let tokens2 = ref (tokens |> Common2.acc_map TV.mk_token_extended) in
+  let tokens2 = ref (tokens |> List.map TV.mk_token_extended) in
 
   (* ifdef *)
   let cleaner = !tokens2 |> filter_comment_stuff in
@@ -291,7 +291,7 @@ let fix_tokens_cpp ~macro_defs tokens =
   let line_paren_grouped = TV.mk_line_parenthised paren_grouped in
   Parsing_hacks_pp.find_define_init_brace_paren paren_grouped;
   Parsing_hacks_pp.find_string_macro_paren paren_grouped;
-  if not !Flag_parsing.sgrep_mode then (
+  if not (Hook.get Flag_parsing.sgrep_mode) then (
     Parsing_hacks_pp.find_macro_lineparen line_paren_grouped;
     Parsing_hacks_pp.find_macro_paren paren_grouped);
 
@@ -330,12 +330,12 @@ let fix_tokens_cpp ~macro_defs tokens =
   Parsing_hacks_cpp.reclassify_tokens_before_idents_or_typedefs multi_grouped;
 
   let toks =
-    insert_virtual_positions (!tokens2 |> Common2.acc_map (fun x -> x.TV.t))
+    insert_virtual_positions (!tokens2 |> List.map (fun x -> x.TV.t))
   in
   fix_tokens_fuzzy toks
 
 let fix_tokens ~macro_defs lang a =
-  Profiling.profile_code "C++ parsing.fix_tokens" (fun () ->
+  Profiling.measure "C++ parsing.fix_tokens" (fun () ->
       match lang with
       | Flag_parsing_cpp.C -> fix_tokens_c ~macro_defs a
       | Flag_parsing_cpp.Cplusplus -> fix_tokens_cpp ~macro_defs a)

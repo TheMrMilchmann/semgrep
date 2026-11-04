@@ -22,7 +22,9 @@
 name: PR-checklist
 
 on:
-  pull_request:
+  # pull_request_target gives fork PRs a writable token. Safe only because this
+  # job never checks out or runs PR code; keep it that way.
+  pull_request_target:
     types: [opened, edited]
 
 env:
@@ -42,7 +44,7 @@ jobs:
   add-checklist-comment:
     runs-on: ubuntu-latest
     steps:
-      - uses: marocchino/sticky-pull-request-comment@v2
+      - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # ratchet:marocchino/sticky-pull-request-comment@v3.0.5
         with:
           header: pr-checklist
           only_create: true
@@ -52,7 +54,7 @@ jobs:
             - [ ] Purpose of the code is [evident to future readers](https://semgrep.dev/docs/contributing/contributing-code/#explaining-code)
             - [ ] Tests included or PR comment includes a reproducible test plan
             - [ ] Documentation is up-to-date
-            - [ ] A changelog entry was [added to changelog.d](https://semgrep.dev/docs/contributing/contributing-code/#adding-a-changelog-entry) for any user-facing change
+            - [ ] A changelog entry was [added to changelog.d](https://semgrep.dev/docs/contributing/contributing-code/#adding-a-changelog-entry) for any significant or user-affecting changes
             - [ ] Change has no security implications (otherwise, ping security team)
 
             If you're unsure about any of this, please see:

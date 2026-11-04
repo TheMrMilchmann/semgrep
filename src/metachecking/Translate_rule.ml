@@ -1,6 +1,6 @@
 (* Cooper Pierce
  *
- * Copyright (C) 2019-2021 r2c
+ * Copyright (C) 2019-2021 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -16,8 +16,6 @@ open Common
 open Fpath_.Operators
 module FT = File_type
 open Rule
-
-let logger = Logging.get_logger [ __MODULE__ ]
 
 (*****************************************************************************)
 (* Prelude *)
@@ -35,41 +33,72 @@ let logger = Logging.get_logger [ __MODULE__ ]
 (* Main translation logic *)
 (*****************************************************************************)
 
-let rec range_to_string (range : (Tok.location * Tok.location) option) =
+let range_to_string (range : (Tok.location * Tok.location) option) =
   match range with
   | Some (start, end_) ->
-      UCommon.with_open_infile start.pos.file (fun chan ->
+      UFile.with_open_in start.pos.file (fun chan ->
           let extract_size = end_.pos.bytepos - start.pos.bytepos in
           seek_in chan start.pos.bytepos;
           really_input_string chan extract_size)
   | None -> failwith "invalid source/sink requires"
 
-and translate_metavar_cond cond : [> `O of (string * Yaml.value) list ] =
+let translate_entropy_v2_options mode =
+  ( "options",
+    `O
+      [
+        ( "mode",
+          `String
+            (match mode with
+            | Lax -> "lax"
+            | Strict -> "strict"
+            (* kb - how2optional node*)
+            | Default -> "default") );
+      ] )
+
+let rec translate_metavar_cond cond : [> `O of (string * Yaml.value) list ] =
   match cond with
   | CondEval e -> `O [ ("comparison", `String (range_to_string e.e_range)) ]
   | CondType (mv, lang, strs, _) ->
       `O
         ([
            ("metavariable", `String mv);
-           ("types", `A (List_.map (fun s -> `String s) strs));
+           ("types", `A (List.map (fun s -> `String s) strs));
          ]
         @
         match lang with
         | None -> []
-        | Some x -> [ ("language", `String (Xlang.to_string x)) ])
+        | Some x -> [ ("language", `String (Analyzer.to_string x)) ])
+  | CondName { mvar; kind; modules; fqns } ->
+      `O
+        ([ ("metavariable", `String mvar) ]
+        @ (match kind with
+          | Some DjangoView -> [ ("kind", `String "django-view") ]
+          | Some ExpressApp -> [ ("kind", `String "express-app") ]
+          | Some ExpressController -> [ ("kind", `String "express-controller") ]
+          | None -> [])
+        @ (match modules with
+          | Some [ name ] -> [ ("module", `String name) ]
+          | Some names ->
+              [ ("modules", `A (List.map (fun n -> `String n) names)) ]
+          | None -> [])
+        @
+        match fqns with
+        | Some [ name ] -> [ ("fqn", `String name) ]
+        | Some names -> [ ("fqns", `A (List.map (fun n -> `String n) names)) ]
+        | None -> [])
   | CondRegexp (mv, re_str, _) ->
       `O [ ("metavariable", `String mv); ("regex", `String re_str) ]
   | CondAnalysis (mv, analysis) ->
+      let analyzer, options =
+        match analysis with
+        | CondEntropy -> ("entropy", [])
+        | CondEntropyV2 options ->
+            ("entropy_v2", [ translate_entropy_v2_options options ])
+        | CondReDoS -> ("redos", [])
+      in
       `O
-        [
-          ("metavariable", `String mv);
-          ( "analyzer",
-            `String
-              (match analysis with
-              | CondEntropy -> "entropy"
-              | CondEntropyV2 -> "entropy_v2"
-              | CondReDoS -> "redos") );
-        ]
+        ([ ("metavariable", `String mv); ("analyzer", `String analyzer) ]
+        @ options)
   | CondNestedFormula (mv, lang, f) ->
       let (`O fs) = translate_formula f in
       `O
@@ -78,7 +107,7 @@ and translate_metavar_cond cond : [> `O of (string * Yaml.value) list ] =
         @
         match lang with
         | None -> []
-        | Some x -> [ ("language", `String (Xlang.to_string x)) ])
+        | Some x -> [ ("language", `String (Analyzer.to_string x)) ])
 
 and translate_taint_source
     {
@@ -90,7 +119,12 @@ and translate_taint_source
       source_control;
       source_requires;
     } : [> `O of (string * Yaml.value) list ] =
-  let (`O source_f) = translate_formula source_formula in
+  let (`O source_f) =
+    match source_formula with
+    | Rule.Formula f -> translate_formula f
+    | Rule.Ranges _ ->
+        failwith "cannot translate ranges-based taint source to YAML"
+  in
   let label_obj =
     if label = Rule.default_source_label then []
     else [ ("label", `String label) ]
@@ -111,7 +145,7 @@ and translate_taint_source
     if source_control then [ ("control", `Bool true) ] else []
   in
   `O
-    (List.concat
+    (List_.flatten
        [
          source_f;
          exact_obj;
@@ -125,18 +159,34 @@ and translate_taint_sink
     {
       sink_id = _;
       sink_formula;
+      sink_exact;
       sink_requires;
       sink_at_exit;
-      sink_is_func_with_focus = _;
+      sink_has_focus = _;
     } : [> `O of (string * Yaml.value) list ] =
-  let (`O sink_f) = translate_formula sink_formula in
+  let (`O sink_f) =
+    match sink_formula with
+    | Rule.Formula f -> translate_formula f
+    | Rule.Ranges _ ->
+        failwith "cannot translate ranges-based taint sink to YAML"
+  in
+  let exact_obj = if sink_exact then [] else [ ("exact", `Bool false) ] in
   let at_exit_obj = if sink_at_exit then [ ("at-exit", `Bool true) ] else [] in
   let requires_obj =
     match sink_requires with
     | None -> []
-    | Some { range; _ } -> [ ("requires", `String (range_to_string range)) ]
+    | Some (UniReq { range; _ }) ->
+        [ ("requires", `String (range_to_string range)) ]
+    | Some (MultiReq mvars_w_preconds) ->
+        [
+          ( "requires",
+            `A
+              (mvars_w_preconds
+              |> List.map (fun ((mvar, _tok), { range; _ }) ->
+                  `O [ (mvar, `String (range_to_string range)) ])) );
+        ]
   in
-  `O (List.concat [ sink_f; requires_obj; at_exit_obj ])
+  `O (List_.flatten [ sink_f; exact_obj; requires_obj; at_exit_obj ])
 
 and translate_taint_sanitizer
     {
@@ -146,7 +196,12 @@ and translate_taint_sanitizer
       sanitizer_by_side_effect;
       not_conflicting;
     } : [> `O of (string * Yaml.value) list ] =
-  let (`O san_f) = translate_formula sanitizer_formula in
+  let (`O san_f) =
+    match sanitizer_formula with
+    | Rule.Formula f -> translate_formula f
+    | Rule.Ranges _ ->
+        failwith "cannot translate ranges-based taint sanitizer to YAML"
+  in
   let side_effect_obj =
     if sanitizer_by_side_effect then [ ("by-side-effect", `Bool true) ] else []
   in
@@ -154,7 +209,7 @@ and translate_taint_sanitizer
   let not_conflicting_obj =
     if not_conflicting then [ ("not-conflicting", `Bool true) ] else []
   in
-  `O (List.concat [ san_f; exact_obj; side_effect_obj; not_conflicting_obj ])
+  `O (List_.flatten [ san_f; exact_obj; side_effect_obj; not_conflicting_obj ])
 
 and translate_taint_propagator
     {
@@ -186,12 +241,12 @@ and translate_taint_propagator
     match propagator_replace_labels with
     | None -> []
     | Some strs ->
-        [ ("replace-labels", `A (List_.map (fun s -> `String s) strs)) ]
+        [ ("replace-labels", `A (List.map (fun s -> `String s) strs)) ]
   in
   let from_obj = [ ("from", `String (fst from)) ] in
   let to_obj = [ ("to", `String (fst to_)) ] in
   `O
-    (List.concat
+    (List_.flatten
        [
          prop_f;
          side_effect_obj;
@@ -209,64 +264,80 @@ and translate_taint_spec
     match sanitizers with
     | None -> []
     | Some (_, sanitizers) ->
-        [ ("sanitizers", `A (List_.map translate_taint_sanitizer sanitizers)) ]
+        [ ("sanitizers", `A (List.map translate_taint_sanitizer sanitizers)) ]
   in
   let propagators =
-    match List_.map translate_taint_propagator propagators with
+    match List.map translate_taint_propagator propagators with
     | [] -> []
     | other -> [ ("propagators", `A other) ]
   in
   `O
-    (List.concat
+    (List_.flatten
        [
-         [ ("sources", `A (List_.map translate_taint_source (snd sources))) ];
+         [ ("sources", `A (List.map translate_taint_source (snd sources))) ];
          sanitizers;
          propagators;
-         [ ("sinks", `A (List_.map translate_taint_sink (snd sinks))) ];
+         [ ("sinks", `A (List.map translate_taint_sink (snd sinks))) ];
        ])
 
 and translate_formula f : [> `O of (string * Yaml.value) list ] =
-  match f with
-  | P { pat; pstr; _ } -> (
-      match pat with
-      | Sem (_, _)
-      | Spacegrep _
-      | Aliengrep _ ->
-          `O [ ("pattern", `String (fst pstr)) ]
-      | Regexp _ -> `O [ ("regex", `String (fst pstr)) ])
-  | Anywhere (_, f) -> `O [ ("anywhere", (translate_formula f :> Yaml.value)) ]
-  | Inside (_, f) -> `O [ ("inside", (translate_formula f :> Yaml.value)) ]
-  | And (_, { conjuncts; focus; conditions; _ }) ->
-      let mk_focus_obj (_, mv_list) =
-        match mv_list with
-        | [] ->
-            (* probably shouldn't happen... *)
-            []
-        | [ mv ] -> [ `O [ ("focus", `String mv) ] ]
-        | mvs -> [ `O [ ("focus", `A (List_.map (fun x -> `String x) mvs)) ] ]
-      in
-      `O
-        (("all", `A (List_.map translate_formula conjuncts :> Yaml.value list))
-        ::
-        (if focus =*= [] && conditions =*= [] then []
-         else
-           [
-             ( "where",
-               `A
-                 (List_.map
-                    (fun (_, cond) -> translate_metavar_cond cond)
-                    conditions
-                 @ List.concat_map mk_focus_obj focus) );
-           ]))
-  | Or (_, fs) ->
-      `O [ ("any", `A (List_.map translate_formula fs :> Yaml.value list)) ]
-  | Not (_, f) -> `O [ ("not", (translate_formula f :> Yaml.value)) ]
+  let rec aux { f; focus; conditions; fix; as_ } =
+    let mk_focus_obj (_, mv_list) =
+      match mv_list with
+      | [] ->
+          (* probably shouldn't happen... *)
+          []
+      | [ mv ] -> [ `O [ ("focus", `String mv) ] ]
+      | mvs -> [ `O [ ("focus", `A (List.map (fun x -> `String x) mvs)) ] ]
+    in
+    let where_obj =
+      match (focus, conditions) with
+      | [], [] -> []
+      | _ ->
+          [
+            ( "where",
+              `A
+                (List.map
+                   (fun (_, cond) -> translate_metavar_cond cond)
+                   conditions
+                @ List.concat_map mk_focus_obj focus) );
+          ]
+    in
+    let fix_obj =
+      match fix with
+      | None -> []
+      | Some fix -> [ ("fix", `String fix) ]
+    in
+    let as_obj =
+      match as_ with
+      | None -> []
+      | Some mvar -> [ ("as", `String mvar) ]
+    in
+    let (`O objs) = aux' f in
+    `O (objs @ where_obj @ fix_obj @ as_obj)
+  and aux' kind =
+    match kind with
+    | P { pat; pstr; _ } -> (
+        match pat with
+        | Sem (_, _)
+        | Spacegrep _
+        | Aliengrep _ ->
+            `O [ ("pattern", `String (fst pstr)) ]
+        | Regexp _ -> `O [ ("regex", `String (fst pstr)) ])
+    | Inside (_, f) -> `O [ ("inside", (aux f :> Yaml.value)) ]
+    | Anywhere (_, f) -> `O [ ("anywhere", (aux f :> Yaml.value)) ]
+    | Not (_, f) -> `O [ ("not", (aux f :> Yaml.value)) ]
+    | And (_, conjuncts) ->
+        `O [ ("all", `A (List.map aux conjuncts :> Yaml.value list)) ]
+    | Or (_, fs) -> `O [ ("any", `A (List.map aux fs :> Yaml.value list)) ]
+  in
+  aux f
 
 let rec json_to_yaml json : Yaml.value =
   match json with
   | JSON.Object fields ->
-      `O (List_.map (fun (name, value) -> (name, json_to_yaml value)) fields)
-  | Array items -> `A (List_.map json_to_yaml items)
+      `O (List.map (fun (name, value) -> (name, json_to_yaml value)) fields)
+  | Array items -> `A (List.map json_to_yaml items)
   | String s -> `String s
   | Int i -> `Float (float_of_int i)
   | Float f -> `Float f
@@ -305,24 +376,28 @@ let replace_pattern rule_fields translated_formula : (string * Yaml.value) list
 let translate_files fparser xs =
   let formulas_by_file =
     xs
-    |> List_.map (fun file ->
-           logger#info "processing %s" !!file;
-           let formulas =
-             fparser file
-             |> List_.map (fun rule ->
-                    match rule.mode with
-                    | `Search formula
-                    | `Extract { formula; _ } ->
-                        [
-                          ("match", (formula |> translate_formula :> Yaml.value));
-                        ]
-                    | `Taint spec ->
-                        [ ("taint", (translate_taint_spec spec :> Yaml.value)) ]
-                    | `Steps _ -> failwith "step rules not currently handled"
-                    | `Secrets _ ->
-                        failwith "secrets rules not currently handled")
-           in
-           (file, formulas))
+    |> List.map (fun file ->
+        Logs.info (fun m -> m "translate_files: processing %s" !!file);
+        let formulas =
+          match fparser file with
+          | Ok rules ->
+              rules
+              |> List.map (fun rule ->
+                  match rule.mode with
+                  | `Search formula
+                  | `Extract { formula; _ } ->
+                      [
+                        ("match", (formula |> translate_formula :> Yaml.value));
+                      ]
+                  | `Taint spec ->
+                      [ ("taint", (translate_taint_spec spec :> Yaml.value)) ]
+                  | `SCA _ -> failwith "sca rules not currently translated"
+                  | `Join _ -> failwith "join rules not currently translated"
+                  | `Steps _ -> failwith "step rules not currently handled")
+          | Error e ->
+              failwith ("parsing failure: " ^ Rule_error.string_of_error e)
+        in
+        (file, formulas))
   in
   List.iter
     (fun (file, formulas) ->
@@ -333,14 +408,17 @@ let translate_files fparser xs =
         | FT.Config FT.Yaml ->
             Yaml.of_string (UFile.read_file file) |> Result.get_ok
         | _ ->
-            logger#error "wrong rule format, only JSON/YAML/JSONNET are valid";
-            logger#info "trying to parse %s as YAML" !!file;
+            Logs.err (fun m ->
+                m
+                  "Wrong rule format, only JSON/YAML/JSONNET are valid. Trying \
+                   to parse %s as YAML"
+                  !!file);
             Yaml.of_string (UFile.read_file file) |> Result.get_ok
       in
       match rules with
       | `O [ ("rules", `A rules) ] ->
           let new_rules =
-            List_.map2
+            List_.map2_exn
               (fun rule new_formula ->
                 match rule with
                 | `O rule_fields -> `O (replace_pattern rule_fields new_formula)

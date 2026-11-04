@@ -30,7 +30,7 @@ let fb = Tok.unsafe_fake_bracket
 let map_argument (arg : argument) : G.definition =
   let id, _teq, e = arg in
   let ent = G.basic_entity id in
-  let def = { G.vinit = Some e; vtype = None } in
+  let def = { G.vinit = Some e; vtype = None; vtok = G.no_sc } in
   (ent, G.VarDef def)
 
 (* We convert to a field, to be similar to Parse_terraform_xxx.map_object,
@@ -44,7 +44,7 @@ let rec map_block_body_element (x : block_body_element) : G.field =
   | Block blk ->
       let e = map_block blk in
       G.F (G.exprstmt e)
-  | BlockEllipsis t -> G.fieldEllipsis t
+  | BlockEllipsis t -> G.field_ellipsis t
 
 (* TODO? convert to a definition? a class_def?
  * coupling: Constant_propagation.terraform_stmt_to_vardefs
@@ -54,19 +54,19 @@ and map_block ({ btype = _kind, tk; blabels; bbody = lb, body, rb } : block) :
   let id = (Tok.content_of_tok tk, tk) in
   let labels_id =
     blabels
-    |> List_.map (function
-         | LblStr x -> G.L (G.String (fb x)) |> G.e
-         | LblId id ->
-             let n = H2.name_of_id id in
-             G.N n |> G.e)
+    |> List.map (function
+      | LblStr x -> G.L (G.String (fb x)) |> G.e
+      | LblId id ->
+          let n = H2.name_of_id id in
+          G.N n |> G.e)
   in
 
   let n = H2.name_of_id id in
   (* convert in a Record like map_object *)
-  let flds = List_.map map_block_body_element body in
+  let flds = List.map map_block_body_element body in
   let body = G.Record (lb, flds, rb) |> G.e in
   let es = labels_id @ [ body ] in
-  let args = es |> List_.map G.arg in
+  let args = es |> List.map G.arg in
   (* coupling: if you modify this code, you should adjust
    * Constant_propagation.terraform_stmt_to_vardefs.
    * bugfix: I used to transform that in a New (..., TyN n, ...) but
@@ -92,15 +92,15 @@ and map_block ({ btype = _kind, tk; blabels; bbody = lb, body, rb } : block) :
  *)
 let program (xs : config) : G.program =
   xs
-  |> List_.map (function
-       (* TODO? this should never happen in terraform files at the toplevel *)
-       | Argument e ->
-           let def = map_argument e in
-           G.DefStmt def |> G.s
-       | BlockEllipsis t -> G.exprstmt (G.Ellipsis t |> G.e)
-       | Block blk ->
-           let e = map_block blk in
-           G.exprstmt e)
+  |> List.map (function
+    (* TODO? this should never happen in terraform files at the toplevel *)
+    | Argument e ->
+        let def = map_argument e in
+        G.DefStmt def |> G.s
+    | BlockEllipsis t -> G.exprstmt (G.Ellipsis t |> G.e)
+    | Block blk ->
+        let e = map_block blk in
+        G.exprstmt e)
 
 let any (x : any) : G.any =
   match x with

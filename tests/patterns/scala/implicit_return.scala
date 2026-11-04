@@ -14,10 +14,10 @@ def f(x) =
     // ERROR:
     "implicit return if"
   else if x == 0 then
-    // TODO:
+    // ERROR:
     "implicit return else if"
   else
-    // TODO:
+    // ERROR:
     "implicit return else"
 
 def f(x) =
@@ -26,7 +26,7 @@ def f(x) =
     "no implicit return because not the last statement"
   else
     "no implicit return because not the last statement"
-   
+
   // ERROR:
   "implicit return last statement after non trivial"
 
@@ -40,7 +40,7 @@ def f() =
 
 def f() =
   try
-    // TODO:
+    // ERROR:
     "implicit return in try clause"
   catch
     case e => "no implicit return in catch clause if there is no exception"
@@ -51,7 +51,7 @@ def f() =
   catch
     case e => "no implicit return in catch clause if finally is present"
   finally
-    // TODO:
+    // ERROR:
     "implicit return in finally clause"
 
 package p:
@@ -72,3 +72,6 @@ def f() =
   // ERROR:
   return "explicit return should still work"
 
+def f(x) =
+  // ERROR:
+  s"Implicit return of string interpolation should still work $x"

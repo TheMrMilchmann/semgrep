@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Extended version of Fpath.
 
    Provides operations on file system paths only, without any access
@@ -8,7 +20,7 @@
 (*
   Extra utilities to convert between lists of files between
   string and Fpath.t without having to write
-  'Common.map Fpath.v ...' every time.
+  'List.map Fpath.v ...' every time.
 
   For converting a single path, use Fpath.v and Fpath.to_string directly.
 
@@ -24,10 +36,67 @@
  *)
 val of_strings : string list -> Fpath.t list
 val to_strings : Fpath.t list -> string list
+val to_yojson : Fpath.t -> Yojson.Safe.t
+val of_yojson : Yojson.Safe.t -> (Fpath.t, string) result
+
+val to_posix_string : Fpath.t -> string
+(** [to_posix_string p] is [Fpath.segs p |> String.concat "/"].
+
+    This produces a POSIX formatted string representing [p]. E.g.,
+
+    {[
+    # to_posix_string (Fpath.v "foo/bar/baz");;
+    - : string = "foo/bar/baz"
+    # to_posix_string (Fpath.v "foo\\bar\\baz");;
+    - : string = "foo/bar/baz"
+    # to_posix_string (Fpath.v "C:\\foo\\bar\\baz");;
+    - : string = "/foo/bar/baz"
+    ]}
+
+    Note that the treatment of Windows drives means that this function is not
+    generally invertible. In particular,
+
+    {[
+    # let p = Fpath.v "C:\\foo\\bar\\baz" in
+      Fpath.v (to_posix_string p) <> p;;
+    - : bool = true
+    ]}
+
+    The intended use case of this function is to display paths in a canonical
+    form, primarily in tests and such. It should not be used when accessing
+    files from the system or for showing paths on the system to users. *)
+
+(* alias but with derived available *)
+type t = Fpath.t [@@deriving show, eq, ord, sexp, hash]
+
+(*
+   Take a nonempty list of path segments and turn them in to relative path.
+   Only the last segment may by empty, representing a trailing slash.
+   For example, ["a"; "b"; ""] becomes "/a/b/" and
+   ["a"; "b"] becomes "a/b".
+   Raises Invalid_argument.
+*)
+val of_relative_segments : string list -> Fpath.t
 
 (* Fpath.to_string. Like for the other operators, we recommend using it
    with 'open File.Operators'. *)
 val ( !! ) : Fpath.t -> string
+
+(* Same as Fpath.append or Fpath.(//) but if the first argument is ".",
+   the second argument is returned as-is.
+   For example, 'append_no_dot (Fpath.v ".") (Fpath.v "a")'
+   equals 'Fpath.v "a"' rather than 'Fpath.v "./a"'. *)
+val append_no_dot : Fpath.t -> Fpath.t -> Fpath.t
+
+(* Returns the list of ancestors of a path
+   For example, [parents (Fpath.v "a/b/foo.js")] returns
+   ["a/b/"; "a/"; "./"]
+   This is only syntactical so the code below is still fragile because if the
+   path is ../../foo.js the parents are infinite (hence depth_limit below).
+   This is why you should prefer to use realpath or enforce that the given path
+   is absolute or does not contain any '..'
+*)
+val parents : ?depth_limit:int -> Fpath.t -> Fpath.t list
 
 (*
    Operators on files or file paths or anything related to files.
@@ -55,4 +124,30 @@ module Operators : sig
   *)
 end
 
-val readable : root:Fpath.t -> Fpath.t -> Fpath.t
+val dirname : Fpath.t -> Fpath.t
+(** Get the directory part of a path. fpath wrapper for
+    Filename.dirname.
+
+    "foo/bar/baz" => "foo/bar"
+    "/foo/bar/baz" => "/foo/bar"
+    "/foo/bar/baz/" => "/foo/bar"
+    "baz" => "." *)
+
+(* Fpath.v "." *)
+val current_dir : Fpath.t
+
+(* exts (Fpath.v "foo.tar.gz") = ["tar";"gz"] *)
+val exts : Fpath.t -> string list
+
+(* split_ext ~multi:true (Fpath.v "a/foo.tar.gz") = Fpath.v "a/foo", ".tar.gz" *)
+val split_ext : ?multi:bool -> Fpath.t -> Fpath.t * string
+
+(* DO NOT USE THIS *)
+val fake_file : Fpath.t
+val is_fake_file : Fpath.t -> bool
+
+(*****************************************************************************)
+(* Data Structures *)
+(*****************************************************************************)
+
+module Fpath_set : Set.S with type elt = Fpath.t

@@ -1,5 +1,18 @@
 (*
-   List files recursively in a safe, efficient, and portable manner.
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
+   List files recursively in a safe, efficient, and portable manner
+   (should work on Linux, macOS, and also Windows).
 
    Replaces the functions in libs/commons/ that use external UNIX commands
    such as 'find'.
@@ -8,6 +21,7 @@
 (*
    List all files recursively. Exclude folders/directories.
    For further filtering based on file type, use 'list_with_stat'.
+   ex: [list "a/" --> ["a/foo.txt"; "a/bar.txt"; "a/b/foobar.txt"]]
 *)
 val list : Fpath.t -> Fpath.t list
 
@@ -30,7 +44,7 @@ val list_regular_files : ?keep_root:bool -> Fpath.t -> Fpath.t list
 
 (*
    List all files recursively. Exclude folders/directories.
-   Use Common.map_filter to exclude more file types.
+   Use List_.map_filter to exclude more file types.
 *)
 val list_with_stat : Fpath.t -> (Fpath.t * Unix.stats) list
 
@@ -41,8 +55,3 @@ val fold_left :
   ('acc -> Fpath.t -> Unix.stats -> 'acc) -> 'acc -> Fpath.t -> 'acc
 
 val iter : (Fpath.t -> Unix.stats -> unit) -> Fpath.t -> unit
-
-(* internals *)
-
-(* Read the names found in a directory, excluding "." and "..". *)
-val read_dir_entries : Fpath.t -> string list

@@ -1,9 +1,22 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* Define a flag that can be negated e.g. --foo and --no-foo.
    It's not supported out-of-the-box by cmdliner but we want it for
    backward compatibility with the Python CLI.
 *)
 val negatable_flag :
   ?default:bool ->
+  ?docs:string ->
   neg_options:string list ->
   doc:string ->
   string list ->

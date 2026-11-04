@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
@@ -12,9 +24,16 @@
 (* Types *)
 (*****************************************************************************)
 
-type name = Name of string
-type args = string list
-type t = name * args
+type name = Name of string [@@deriving show]
+type args = string list [@@deriving show]
+type t = name * args [@@deriving show]
+
+(* alt: we could also make it part of [t] and have a triple *)
+type env = { vars : (string * string) list; inherit_parent_env : bool }
+
+let env_of_list ?(inherit_parent_env = true) (vars : (string * string) list) :
+    env =
+  { vars; inherit_parent_env }
 
 (* shortcut *)
 type run_status = Bos.OS.Cmd.run_status
@@ -23,8 +42,7 @@ type run_status = Bos.OS.Cmd.run_status
 (* API *)
 (*****************************************************************************)
 (* Note that we use here just Bos.Cmd, which is safe, and not Bos.OS.Cmd
- * which actually execute stuff and is so unsafe (and people should prefer
- * to use CapExec.ml)
+ * which actually executes stuff (see UCmd.ml for that).
  *)
 
 let to_cmd (Name str, args) = Bos.Cmd.(v str %% of_list args)

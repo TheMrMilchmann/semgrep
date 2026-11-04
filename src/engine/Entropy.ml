@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    A special built-in string analyzer that estimates whether a string
    looks like a secret.
 *)
@@ -17,22 +29,19 @@ let normalize_string s =
   let buf = Buffer.create (String.length s) in
   s
   |> String.iter (fun c ->
-         match c with
-         | 'a' .. 'z' -> Buffer.add_char buf (Char.uppercase_ascii c)
-         | 'A' .. 'Z' -> Buffer.add_char buf c
-         | c ->
-             (* everything else, including:
+      match c with
+      | 'a' .. 'z' -> Buffer.add_char buf (Char.uppercase_ascii c)
+      | 'A' .. 'Z' -> Buffer.add_char buf c
+      | c ->
+          (* everything else, including:
                 - digits
                 - punctuation
                 - non-ascii UTF-8 bytes
              *)
-             Buffer.add_char buf c);
+          Buffer.add_char buf c);
   Buffer.contents buf
 
-(* Set in Data_init.init() from data in Entropy_data.ml
- * The intermediate variable below is used to save space in engine.js
- *)
-let english_trigrams_ref = ref [||]
+let english_trigrams = Entropy_data.english_trigrams
 
 (*
    Load trigrams:
@@ -44,9 +53,9 @@ let english_trigrams_ref = ref [||]
    end of strings where we don't have full trigrams.
 *)
 let load_trigrams () =
-  let ar = !english_trigrams_ref in
+  let ar = english_trigrams in
   (* Load trigram frequencies *)
-  let trigram_entropies = Hashtbl.create (Array.length ar) in
+  let trigram_entropies = Base.Hashtbl.Poly.create ~size:(Array.length ar) () in
   (* we explicitly use int64 here to avoid overflow *)
   (* on 32 bit systems (like Js_of_ocaml), trigram_total_count *)
   (* overflows :( *)
@@ -65,7 +74,7 @@ let load_trigrams () =
       in
       (* Ensure is not nan *)
       assert (not Float.(is_nan trigram_entropy));
-      Hashtbl.add trigram_entropies trigram trigram_entropy)
+      Base.Hashtbl.set trigram_entropies ~key:trigram ~data:trigram_entropy)
     ar;
   (* Load character frequencies *)
   let char_total_count = Int64.mul 3L trigram_total_count in
@@ -74,8 +83,8 @@ let load_trigrams () =
     (fun (trigram, count) ->
       trigram
       |> String.iter (fun c ->
-             let i = Char.code c in
-             char_counts.(i) <- char_counts.(i) + count))
+          let i = Char.code c in
+          char_counts.(i) <- char_counts.(i) + count))
     ar;
   let char_entropies =
     Array.init 256 (fun i ->
@@ -86,7 +95,7 @@ let load_trigrams () =
   in
   (trigram_entropies, char_entropies)
 
-let data_tables = lazy (load_trigrams ())
+let data_tables = lazy_safe (load_trigrams ())
 
 (*
    A string is scanned as follows:
@@ -105,11 +114,11 @@ let data_tables = lazy (load_trigrams ())
    get back the entropy corresponding to a single byte.
 *)
 let get_substring_entropy s =
-  let trigram_entropies, char_entropies = Lazy.force data_tables in
+  let trigram_entropies, char_entropies = Lazy_safe.force data_tables in
   match String.length s with
   | 3 ->
       let trigram_entropy =
-        match Hashtbl.find_opt trigram_entropies s with
+        match Base.Hashtbl.find trigram_entropies s with
         | Some x -> x
         | None ->
             let e1 = s.[0] |> Char.code |> Array.get char_entropies in

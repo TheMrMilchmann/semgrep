@@ -1,10 +1,22 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
-(* This module contains functions (and types) which are very often used.
+(* This module contains functions which are very often used.
  * They are so common (hence the name of this file) that lots of modules
  * just 'open Common' to get in scope those functions.
- * This file acts like a second stdlib.ml.
+ * This file acts like a second stdlib.ml (which was called pervasives.ml before)
  *
  * However, because this module is often open'ed, it should
  * not define too many functions (<100) because we can't impose
@@ -18,35 +30,17 @@
 (*****************************************************************************)
 
 (* You should not use the polymorphic '='. It is convenient but
- * its use will eventually backfire. You should use instead 'deriving eq'
- * where the equality function can be customized.
- * To enforce this rule, this module redefines '=' to just operate
- * on strings, so ocaml can statically detect when you wrongly use '='
+ * its use will eventually backfire
+ * (see https://blog.janestreet.com/the-perils-of-polymorphic-compare/).
+ * You should use instead 'deriving eq' where the equality function can be
+ * customized. To enforce this rule, this module redefines '=' to just operate
+ * on strings, so ocamlc can statically detect when you wrongly use '='
  * on other types.
  *
  * See also the Operators submodule at the end of this file.
  *)
-val ( = ) : string -> string -> bool
 
-(* If you need to use '=', at least use the more precise operators below. *)
-val ( =|= ) : int -> int -> bool
-val ( =$= ) : char -> char -> bool
-val ( =:= ) : bool -> bool -> bool
-
-(* if you really really need to use the polymorphic '=', at least use
- * the operator below so it's easier to grep for it if one needs to refactor
- * the code to use 'deriving eq' instead.
- *)
-val ( =*= ) : 'a -> 'a -> bool
-
-val equal_ref_option :
-  ('a -> 'b -> bool) -> 'a option ref -> 'b option ref -> bool
-
-(*
-   Disable the use of (==) since some people confuse it with structural
-   equality. We do this here since we're disabling in with semgrep anyway
-   and it's quicker if the compiler can report it.
-*)
+include module type of Eq.Operators
 
 (* Physical (shallow) equality, normally available as (==) *)
 val phys_equal : 'a -> 'a -> bool
@@ -54,33 +48,13 @@ val phys_equal : 'a -> 'a -> bool
 (* Physical (shallow) inequality, normally available as (!=) *)
 val phys_not_equal : 'a -> 'a -> bool
 
-type hidden_by_your_nanny
-
-val ( == ) : hidden_by_your_nanny
-val ( != ) : hidden_by_your_nanny
+val equal_ref_option :
+  ('a -> 'b -> bool) -> 'a option ref -> 'b option ref -> bool
 
 (*****************************************************************************)
 (* Comparison *)
 (*****************************************************************************)
-
-type order = Less | Equal | Greater
-
-val binary_search_arr :
-  f:(int -> 'a -> order) -> 'a array -> (int * 'a, int) result
-(** [binary_search_arr f A] returns Ok (idx, x) if the element x can be found
-    at idx x, according to comparison function f.
-    Otherwise, it returns Error idx, where idx is the index that the element
-    must be inserted at, if it were to be in the array.
-    For instance, when searching for 2 in [|0, 3|], we get Error 1.
-    Inserting at the beginning is Error 0, and at the end is Error 2.
-  *)
-
-val binary_search_bigarr1 :
-  f:(int -> 'a -> order) ->
-  ('a, 'b, 'c) Bigarray.Array1.t ->
-  (int * 'a, int) result
-
-val to_comparison : ('a -> 'a -> int) -> 'a -> 'a -> order
+(* now in Ord.ml *)
 
 (*****************************************************************************)
 (* Composition/Control *)
@@ -101,7 +75,7 @@ val on : ('b -> 'b -> 'c) -> ('a -> 'b) -> 'a -> 'a -> 'c
 (* Exceptions *)
 (*****************************************************************************)
 (* see also Exception.ml functions as well as Time_limit.Timeout
- * in the process_limits library.
+ * and Memory_limit.ExceededMemoryLimit in the process_limits library.
  *)
 
 exception Todo
@@ -112,6 +86,12 @@ exception Impossible
 (* similar to Not_found but to use when something returns too many findings *)
 exception Multi_found
 
+(* it's usually far easier to diagnose an error when you know on which
+ * file it occured. An [Invalid_argument("index out of bounds")] is not
+ * as good as [ErrorOnFile("out of bounds in lines_of_file()", 'foo.c')]
+ *)
+exception ErrorOnFile of string (* error message *) * Fpath.t
+
 (* If the user use some [exit 0] in his code, then no one can intercept this
  * exit and do something before exiting. There is exn handler for exit 0
  * so better never use exit 0 but instead use an exception and just at
@@ -120,7 +100,7 @@ exception Multi_found
  * subtil: same problem than with Timeout. Do not intercept such exception
  * with some blind try (...) with _ -> ...
  *)
-exception UnixExit of int
+exception UnixExit of (int * string)
 
 (* Convert any exception to a string *)
 val exn_to_s : exn -> string
@@ -128,14 +108,13 @@ val exn_to_s : exn -> string
 (* if set then certain functions like unwind_protect will not
  * do a try and finalize and instead just call the function, which
  * helps in ocamldebug and also in getting better backtraces.
- * This is also useful to set in a js_of_ocaml (jsoo) context to
- * again get better backtraces.
  *)
 val debugger : bool ref
 
 (* Emacs-inspired finalize-like function. *)
 val unwind_protect : (unit -> 'a) -> (Exception.t -> unit) -> 'a
 val save_excursion : 'a ref -> 'a -> (unit -> 'b) -> 'b
+val save_excursion_atomic : 'a Atomic.t -> 'a -> (unit -> 'b) -> 'b
 
 (* Java-inspired combinator (DEPRECATED, use protect()) *)
 val finalize : (unit -> 'a) -> (unit -> unit) -> 'a
@@ -175,7 +154,25 @@ val spf : ('a, unit, string) format -> 'a
  *      let after_f, endpart = Common.matched2 s in
  *      ...
  *)
+
 val ( =~ ) : string -> string -> bool
+(** NOTE: Do {b not} use this for matching paths, as it is not portable
+    accrosses operating systems. Use {! (=/~)} instead. *)
+
+val ( =/~ ) : Fpath.t -> string -> bool
+(** [path =/~ pattern] is [true] if the regex [pattern] matches [path] after
+    [path] has been normalized to always use a single ["/"] to separate
+    segments. E.g.,
+
+    {[
+    let p = ".*/bar/.*" in
+    assert ((Fpath.v "foo\\bar\\baz" =/~ p)
+            = (Fpath.v "foo/bar/baz" =/~ p)
+            = (Fpath.v "foo//bar/baz =/~ p"))
+    ]}
+
+    This provides a portable way to test paths against regexs. *)
+
 val matched1 : string -> string
 val matched2 : string -> string * string
 val matched3 : string -> string * string * string
@@ -212,15 +209,6 @@ val matched7 :
 (* now in Set_.mli and Map_.mli *)
 
 (*****************************************************************************)
-(* Polymorphic String Map *)
-(*****************************************************************************)
-
-(* type of maps from string to `a *)
-module SMap : Map.S with type key = String.t
-
-type 'a smap = 'a SMap.t
-
-(*****************************************************************************)
 (* Option *)
 (*****************************************************************************)
 (* See also List_.mli with many option related functions (e.g., map_filter) *)
@@ -246,6 +234,15 @@ type 'a smap = 'a SMap.t
  *)
 val ( let* ) : 'a option -> ('a -> 'b option) -> 'b option
 val ( ||| ) : 'a option -> 'a -> 'a
+val combine_opt : ('a -> 'a -> 'a) -> 'a option -> 'a option -> 'a option
+
+(*****************************************************************************)
+(* Result *)
+(*****************************************************************************)
+
+(* similar to let* above but for Result instead of Option *)
+val ( let/ ) :
+  ('a, 'e) Result.t -> ('a -> ('b, 'e) Result.t) -> ('b, 'e) Result.t
 
 (*****************************************************************************)
 (* Either *)
@@ -266,7 +263,8 @@ val input_text_line : in_channel -> string
 (* Optimizations *)
 (*****************************************************************************)
 
-val memoized : ?use_cache:bool -> ('a, 'b) Hashtbl.t -> 'a -> (unit -> 'b) -> 'b
+val memoized :
+  ?use_cache:bool -> ('a, 'b) Base.Hashtbl.t -> 'a -> (unit -> 'b) -> 'b
 
 (*****************************************************************************)
 (* Profiling *)
@@ -280,6 +278,10 @@ val memoized : ?use_cache:bool -> ('a, 'b) Hashtbl.t -> 'a -> (unit -> 'b) -> 'b
 *)
 val with_time : (unit -> 'a) -> 'a * float
 
+val force_lazy_with_time : 'a Lazy_safe.t -> 'a * float option
+(** Force a lazy value, and if it had to be forced, then return the time it took
+  in seconds. *)
+
 (*****************************************************************************)
 (* Operators *)
 (*****************************************************************************)
@@ -292,13 +294,6 @@ module Operators : sig
   val ( =$= ) : char -> char -> bool
   val ( =:= ) : bool -> bool -> bool
   val ( =*= ) : 'a -> 'a -> bool
-  val ( == ) : hidden_by_your_nanny
-  val ( != ) : hidden_by_your_nanny
+  val ( == ) : Eq.hidden_by_your_nanny
+  val ( != ) : Eq.hidden_by_your_nanny
 end
-
-(*****************************************************************************)
-(* Misc *)
-(*****************************************************************************)
-
-(* you should set this flag when you run code compiled by js_of_ocaml *)
-val jsoo : bool ref

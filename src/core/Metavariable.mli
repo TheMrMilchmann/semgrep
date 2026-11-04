@@ -1,5 +1,17 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* metavariable name (e.g., "$FOO") *)
-type mvar = string [@@deriving show, eq, hash]
+type mvar = Mvar.t [@@deriving eq, hash, ord, sexp, show]
 
 (* metavariable content *)
 type mvalue =
@@ -26,13 +38,20 @@ type mvalue =
       string
       * (* token without enclosing quotes *) AST_generic.tok
       * (* original token *) AST_generic.tok
-[@@deriving show, eq]
+  (* We keep the `Any` variant here, despite it being a superset of the above
+     variants, as a "last resort" so that we can embed any match into an
+     mvalue.
+     This is primarily useful for the `as:` rule feature, which lets us
+     bind arbitrary matches to metavariables.
+  *)
+  | Any of AST_generic.any
+[@@deriving eq, ord, show]
 
 (* note that the mvalue acts as the value of the metavar and also
    as its concrete code "witness". You can get position information from it
    (if it is not Tok.Ab(stractPos)).
 *)
-type bindings = (mvar * mvalue) list [@@deriving show, eq]
+type bindings = (mvar * mvalue) list [@@deriving eq, ord, sexp, show]
 
 (* Mvalue equality reduces to equality on ASTs, which ignores the tokens
    and instead compares the structure. It may optionally include the ident
@@ -46,43 +65,17 @@ type bindings = (mvar * mvalue) list [@@deriving show, eq]
    possible.
 *)
 val location_aware_equal_mvalue : mvalue -> mvalue -> bool
-
-(* return whether a string could be a metavariable name (e.g., "$FOO", but not
- * "FOO"). This mostly check for the regexp $[A-Z_][A-Z_0-9]* but
- * also handles special variables like $_GET in PHP which are actually
- * not metavariables.
- *)
-val is_metavar_name : string -> bool
-
-(* example: "$...FOO" is a metavariable ellipsis *)
-val is_metavar_ellipsis : string -> bool
-val mvars_of_regexp_string : string -> mvar list
-
-(* example: "$1" *)
-val is_metavar_for_capture_group : string -> bool
 val ii_of_mval : mvalue -> Tok.t list
 val str_of_mval : mvalue -> string
-val range_of_mvalue : mvalue -> (string (* filename *) * Range.t) option
+val range_of_mvalue : mvalue -> (Fpath.t * Range.t) option
 
 (* we sometimes need to convert to an any to be able to use
  * Lib_AST.ii_of_any, or Lib_AST.abstract_position_info_any
  *)
 val mvalue_to_any : mvalue -> AST_generic.any
-val mvalue_of_any : AST_generic.any -> mvalue option
+val mvalue_of_any : AST_generic.any -> mvalue
+val mvalue_to_expr : mvalue -> AST_generic.expr option
 
 (* This is used for metavariable-pattern: where we need to transform the content
  * of a metavariable into a program so we can use evaluate_formula on it *)
 val program_of_mvalue : mvalue -> AST_generic.program option
-
-(* See the comment in AST_generic_equals.ml for the difference between
- * the Syntactic and Structural equal.
- *)
-module Syntactic : sig
-  val equal_mvalue : mvalue -> mvalue -> bool
-  val equal_bindings : bindings -> bindings -> bool
-end
-
-module Structural : sig
-  val equal_mvalue : mvalue -> mvalue -> bool
-  val equal_bindings : bindings -> bindings -> bool
-end

@@ -1,7 +1,20 @@
 (*
- * OCaml hacks to support reflection (works with ocamltarzan).
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
+ * OCaml hacks to support reflection (works with ocamltarzan and tools/otarzan).
  *
- * See also sexp.ml, json.ml, and xml.ml for other "reflective" techniques.
+ * See also sexp.ml, JSON.ml, and xml.ml in pfff for other "reflective"
+ * techniques.
  *
  * DEPRECATED: this module is deprecated, you should prefer to use
  * the deriving ppx technique (e.g., deriving show).
@@ -61,6 +74,7 @@ val string_ofv : v -> string
 val list_ofv : (v -> 'a) -> v -> 'a list
 val option_ofv : (v -> 'a) -> v -> 'a option
 
+(* TODO? Move to a Otarzan_runtime.ml ? *)
 (* other building blocks, used by code generated using ocamltarzan *)
 val map_of_unit : unit -> unit
 val map_of_bool : bool -> bool

@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2020-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import dataclasses
 import inspect
 import sys
@@ -13,9 +25,9 @@ import attr
 
 import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 from semgrep.constants import Colors
-from semgrep.rule_lang import Position
-from semgrep.rule_lang import SourceTracker
-from semgrep.rule_lang import Span
+from semgrep.error_location import Position
+from semgrep.error_location import SourceTracker
+from semgrep.error_location import Span
 from semgrep.util import with_color
 from semgrep.verbose_logging import getLogger
 
@@ -36,9 +48,10 @@ INVALID_LANGUAGE_EXIT_CODE = 8
 # LEXICAL_ERROR_EXIT_CODE = 11
 # TOO_MANY_MATCHES_EXIT_CODE = 12
 INVALID_API_KEY_EXIT_CODE = 13
-SCAN_FAIL_EXIT_CODE = 14
+# SCAN_FAIL_EXIT_CODE = 14
 
 default_level = out.ErrorSeverity(out.Error_())
+warning_level = out.ErrorSeverity(out.Warning_())
 
 
 class SemgrepError(Exception):
@@ -51,12 +64,21 @@ class SemgrepError(Exception):
     For pretty-printing, exceptions should override `__str__`.
     """
 
-    # In theory we should define those fields here:
+    # Please use @dataclass if you know how to make it work.
+    # Here, we would declare properties:
     # code: int
     # level: out.ErrorSeverity
-    # type_: out.CoreErrorKind
 
-    def __init__(
+    # @dataclasses and @attrs used in inherited classes override __init__,
+    # causing instance variables to not be inherited automatically.
+    # In those cases, __init__ should be inherited explicitly by calling it
+    # from one of these methods:
+    # - __post_init__ is an initialization method called by @dataclasses.
+    # - __attrs_post_init__ is an initialization method called by @attrs.
+    #
+    # noqa: B042 — kwargs are intentionally stored as instance attributes
+    # and not forwarded to Exception.__init__(), which doesn't accept them.
+    def __init__(  # noqa: B042
         self,
         *args: object,
         code: int = FATAL_EXIT_CODE,
@@ -96,6 +118,24 @@ class SemgrepError(Exception):
         return f"{level_tag} {self}"
 
 
+# Track which errors were already reported to ensure every SemgrepError is
+# reported exactly once. The problem is that some SemgrepErrors are caught and
+# reported somewhere else before being reraised. wrapper.py is where
+# all the exceptions are caught and where we check whether they were
+# reported, reporting them as needed.
+# This wouldn't be necessary if exceptions were not reraised once
+# handled.
+REPORTED_SEMGREP_ERRORS = set()
+
+
+def mark_semgrep_error_as_reported(e: SemgrepError) -> None:
+    REPORTED_SEMGREP_ERRORS.add(e)
+
+
+def is_semgrep_error_already_reported(e: SemgrepError) -> bool:
+    return e in REPORTED_SEMGREP_ERRORS
+
+
 # used in text and sarif output, and currently also stored in our metrics
 # payload.errors.errors
 def error_type_string(type_: out.ErrorType) -> str:
@@ -113,7 +153,15 @@ def error_type_string(type_: out.ErrorType) -> str:
         return str(type_.to_json())
 
 
-@dataclass(frozen=True)
+def is_real_error(severity: out.ErrorSeverity) -> bool:
+    return severity.kind == "Error_"
+
+
+def select_real_errors(errors: List[SemgrepError]) -> List[SemgrepError]:
+    return [x for x in errors if is_real_error(x.level)]
+
+
+@dataclass()
 class SemgrepCoreError(SemgrepError):
     code: int
     level: out.ErrorSeverity
@@ -124,16 +172,22 @@ class SemgrepCoreError(SemgrepError):
     def type_(self) -> out.ErrorType:
         return self.core.error_type
 
+    @property
+    def rule_id(self) -> Optional[out.RuleId]:
+        return self.core.rule_id
+
     def adjust_CliError(self, base: out.CliError) -> out.CliError:
         base = dataclasses.replace(base, message=str(self))
         if self.core.rule_id:
             base = dataclasses.replace(base, rule_id=self.core.rule_id)
 
-        # For rule errors path is a temp file so for now will just be confusing to add
-        if not isinstance(
-            self.core.error_type.value, out.RuleParseError
-        ) and not isinstance(self.core.error_type.value, out.PatternParseError):
-            base = dataclasses.replace(base, path=self.core.location.path)
+        if self.core.location:
+            # For rule errors path is a temp file so for now will just be
+            # confusing to add
+            if not isinstance(
+                self.core.error_type.value, out.RuleParseError
+            ) and not isinstance(self.core.error_type.value, out.PatternParseError):
+                base = dataclasses.replace(base, path=self.core.location.path)
 
         if self.spans:
             base = dataclasses.replace(base, spans=self.spans)
@@ -160,6 +214,37 @@ class SemgrepCoreError(SemgrepError):
         """
         return isinstance(self.core.error_type.value, out.Timeout)
 
+    def is_scan_failure(self) -> bool:
+        """
+        Returns True if this error prevented complete file scanning.
+
+        These error types indicate the file was detected but could not be
+        fully scanned, so findings from this file should not be marked as fixed.
+
+        Note: The authoritative source for scan failure error types is
+        semgrep_output_v1.atd (error_type variants). If new failure types
+        are added to semgrep-core (e.g., new interfile variants), they may
+        need to be added here as well.
+        """
+        error_type = self.core.error_type.value
+        return isinstance(
+            error_type,
+            (
+                out.Timeout,
+                out.OutOfMemory,
+                out.StackOverflow,
+                out.FixpointTimeout,
+                out.TimeoutDuringInterfile,
+                out.OutOfMemoryDuringInterfile,
+            ),
+        )
+
+    def is_missing_plugin(self) -> bool:
+        """
+        Return if this error is due to a missing plugin
+        """
+        return isinstance(self.core.error_type.value, out.MissingPlugin)
+
     @property
     def _error_message(self) -> str:
         """
@@ -176,11 +261,15 @@ class SemgrepCoreError(SemgrepError):
                 error_context = self.core.rule_id.value
             elif isinstance(self.core.error_type.value, out.MissingPlugin):
                 error_context = f"for rule {self.core.rule_id.value}"
-            else:
+            elif self.core.location:
                 # This message is suitable only if the error is in a target file:
                 error_context = f"when running {self.core.rule_id.value} on {self.core.location.path.value}"
-        else:
+            else:
+                error_context = f"when running {self.core.rule_id.value}"
+        elif self.core.location:
             error_context = f"at line {self.core.location.path.value}:{self.core.location.start.line}"
+        else:
+            error_context = ""
 
         return f"{error_type_string(self.core.error_type)} {error_context}:\n {self.core.message}"
 
@@ -201,29 +290,50 @@ class SemgrepCoreError(SemgrepError):
     # TODO: I didn't manage to get out.Error to be hashable because it contains lists or
     # objects (e.g., Error_) which are not hashable
     def __hash__(self) -> int:
-        return hash(
-            (
-                self.code,
-                self.level,
-                self.core.rule_id,
-                self.core.error_type.kind,
-                self.core.location.path.value,
-                self.core.location.start,
-                self.core.location.end,
-                self.core.message,
-                self.core.details,
+        if self.core.location:
+            return hash(
+                (
+                    self.code,
+                    self.level,
+                    self.core.rule_id,
+                    self.core.error_type.kind,
+                    self.core.location.path.value,
+                    self.core.location.start,
+                    self.core.location.end,
+                    self.core.message,
+                    self.core.details,
+                )
             )
-        )
+        else:
+            return hash(
+                (
+                    self.code,
+                    self.level,
+                    self.core.rule_id,
+                    self.core.error_type.kind,
+                    self.core.message,
+                    self.core.details,
+                )
+            )
 
 
 @attr.s(auto_attribs=True, frozen=True)
-class FilesNotFoundError(SemgrepError):
+class InvalidScanningRootError(SemgrepError):
     level = out.ErrorSeverity(out.Error_())
     code = FATAL_EXIT_CODE
     paths: Sequence[Path]
 
     def __str__(self) -> str:
-        lines = (f"File not found: {pathname}" for pathname in self.paths)
+        lines = []
+        for pathname in self.paths:
+            if pathname.is_symlink():
+                lines.append(
+                    f"Invalid scanning root: {pathname} is a symbolic link.\n"
+                    f"  Semgrep skips symbolic links to avoid scanning the same file twice.\n"
+                    f"  Consider passing the target it points to directly: {pathname.resolve()}"
+                )
+            else:
+                lines.append(f"Invalid scanning root: {pathname}")
         return "\n".join(lines)
 
 
@@ -283,6 +393,7 @@ class ErrorWithSpan(SemgrepError):
     spans: List[Span] = attr.ib(converter=span_list_to_tuple)
     help: Optional[str] = attr.ib(default=None)
 
+    # This is called by @attrs after the generated __init__ method
     def __attrs_post_init__(self) -> None:
         if not hasattr(self, "code"):
             raise ValueError("Inheritors of SemgrepError must define an exit code")
@@ -409,7 +520,7 @@ class ErrorWithSpan(SemgrepError):
         return f"{header}\n{snippet_str_with_newline}{help_str}\n{with_color(Colors.red, self.long_msg or '')}\n"
 
 
-@attr.s(frozen=True, eq=True)
+@attr.s(eq=True, frozen=True)
 class InvalidRuleSchemaError(ErrorWithSpan):
     code = RULE_PARSE_FAILURE_EXIT_CODE
     level = out.ErrorSeverity(out.Error_())
@@ -418,13 +529,57 @@ class InvalidRuleSchemaError(ErrorWithSpan):
         return out.ErrorType(out.InvalidRuleSchemaError())
 
 
-@attr.s(frozen=True, eq=True)
+@attr.s(eq=True, frozen=True)
 class UnknownLanguageError(ErrorWithSpan):
     code = INVALID_LANGUAGE_EXIT_CODE
     level = out.ErrorSeverity(out.Error_())
 
     def type_(self) -> out.ErrorType:
         return out.ErrorType(out.UnknownLanguageError())
+
+
+# TODO: generalize in a SemgrepCliError and just pass the level, code and type_
+# and move __str__ special code below in an _error_message like
+# for SemgrepCoreError
+class DependencyResolutionSemgrepError(SemgrepError):
+    """
+    An error that occurred during dependency resolution.
+    """
+
+    # noqa: B042 — kwargs are intentionally stored as instance attributes
+    # and not forwarded to Exception.__init__(), which doesn't accept them.
+    def __init__(  # noqa: B042
+        self,
+        *args: object,
+        type_: out.ResolutionErrorKind,
+        dependency_source_file: Path,
+        code: int = OK_EXIT_CODE,
+        level: out.ErrorSeverity = warning_level,
+    ) -> None:
+        self.error_type = type_
+        self.dependency_source_file = dependency_source_file
+        super().__init__(*args, code=code, level=level)
+
+    def __str__(self) -> str:
+        # duplicated mostly in scan_report.py in _print_sca_resolution_error
+        def print_resolution_error(err: out.ResolutionErrorKind) -> str:
+            if isinstance(err.value, out.UnsupportedManifest):
+                return "Unsupported Manifest"
+            elif isinstance(err.value, out.MissingRequirement):
+                return f"Missing Requirement ({err.value.value})"
+            elif isinstance(err.value, out.ResolutionCmdFailed_):
+                return f"Resolution Command Failed (command: {err.value.value.command}) (result: {err.value.value.message})"
+            elif isinstance(err.value, out.IncompleteDependencyResolution_):
+                return f"Incomplete Dependency Resolution (command: {err.value.value.command}) (message: {err.value.value.message})"
+            elif isinstance(err.value, out.ResourceInaccessible_):
+                return f"Resource Inaccessible (command: {err.value.value.command}) (registry_url: {err.value.value.registry_url}) (message: {err.value.value.message})"
+            else:
+                return f"Parsing dependency output failed ({err.value.value})"
+
+        return f"Failed to resolve dependencies for {str(self.dependency_source_file)}. {print_resolution_error(self.error_type)}"
+
+    def type_(self) -> out.ErrorType:
+        return out.ErrorType(out.DependencyResolutionError(self.error_type))
 
 
 # cf. https://stackoverflow.com/questions/1796180/how-can-i-get-a-list-of-all-classes-within-current-module-in-python/1796247#1796247

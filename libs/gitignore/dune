@@ -4,9 +4,13 @@
   (name gitignore)
   (wrapped false)
   (libraries
+    base
+    collections
+    commons
     glob
     profiling
     paths
+    logs
   )
   (preprocess (pps
     ppx_deriving.show

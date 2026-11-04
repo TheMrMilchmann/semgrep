@@ -418,7 +418,7 @@ and type_parameter = {
   tpvariance : variance wrap option;
   tpannots : annotation list;
   (* wow, this is complicated *)
-  tpparams : type_parameters;
+  tpparams : type_parameters option;
   tpbounds : type_bounds;
   tpviewbounds : (* <% *) type_ list;
   tpcolons : (* : *) type_ list;
@@ -429,7 +429,7 @@ and variance =
   (* + *)
   | Contravariant (* - *)
 
-and type_parameters = type_parameter list bracket option
+and type_parameters = type_parameter list bracket
 
 (*****************************************************************************)
 (* Definitions *)
@@ -464,7 +464,7 @@ and entity = {
   (* can be "this" for constructor *)
   name : ident;
   attrs : attribute list;
-  tparams : type_parameters;
+  tparams : type_parameters option;
 }
 
 (* less: also work for declaration, in which case the [fc]body is empty *)
@@ -484,7 +484,7 @@ and end_marker = { end_tok : tok; end_kind : tok }
 (*****************************************************************************)
 and extension = {
   ext_tok : tok; (* extension *)
-  ext_tparams : type_parameters;
+  ext_tparams : type_parameters option;
   ext_using : bindings list;
   ext_param : binding;
   ext_methods : ext_method list;
@@ -499,7 +499,7 @@ and enum_case_definition = EnumConstr of enum_constr | EnumIds of ident list
 
 and enum_constr = {
   eid : ident;
-  etyparams : type_parameters;
+  etyparams : type_parameters option;
   eparams : bindings list;
   eattrs : attribute list;
   eextends : constr_app list;
@@ -513,6 +513,8 @@ and constr_app = type_ * arguments list
 (* ------------------------------------------------------------------------- *)
 and function_definition = {
   fkind : function_kind wrap;
+  (* scala3: polymorphic function literal type params, e.g. [T] => body *)
+  ftparams : type_parameters option;
   (* a list of list of parameters! but usually 0/1/2 *)
   fparams : bindings list;
   (* scala3? remove None and force : Unit ? *)
@@ -574,6 +576,7 @@ and template_definition = {
 and template_parents = {
   cextends : (type_ * arguments list) option;
   cwith : type_ list;
+  cderives : type_ list;
 }
 
 and template_body = (self_type option * block) bracket
@@ -595,7 +598,7 @@ and template_kind =
 (* ------------------------------------------------------------------------- *)
 and given_sig = {
   g_id : ident option;
-  g_tparams : type_parameters;
+  g_tparams : type_parameters option;
   g_using : bindings list;
   g_colon : tok;
 }
@@ -625,14 +628,19 @@ type program = top_stat list [@@deriving show]
 (* Any *)
 (*****************************************************************************)
 
-type any = Pr of program | Ex of expr | Ss of block | Tk of tok
+type any =
+  | Pr of program
+  | Ex of expr
+  | Ss of block
+  | Cs of (pattern, block) case_clause
+  | Tk of tok
 [@@deriving show { with_path = false }]
 
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
 
-let empty_cparents = { cextends = None; cwith = [] }
+let empty_cparents = { cextends = None; cwith = []; cderives = [] }
 let attrs_of_mods xs = List.map (fun x -> M x) xs
 let attrs_of_annots xs = List.map (fun x -> A x) xs
 let mods_with_annots mods annots = attrs_of_annots annots @ attrs_of_mods mods

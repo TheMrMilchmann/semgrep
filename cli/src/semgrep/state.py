@@ -1,5 +1,19 @@
+#
+# Copyright (c) 2022-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 from enum import auto
 from enum import Enum
+from typing import Any
+from typing import cast
 from typing import List
 from uuid import UUID
 
@@ -8,11 +22,13 @@ from attrs import Factory
 from attrs import frozen
 
 from semgrep.app.session import AppSession
+from semgrep.constants import MemoryPolicy
 from semgrep.env import Env
 from semgrep.error_handler import ErrorHandler
 from semgrep.metrics import Metrics
 from semgrep.semgrep_types import get_frozen_id
 from semgrep.settings import Settings
+from semgrep.telemetry import Telemetry
 from semgrep.terminal import Terminal
 
 
@@ -38,6 +54,20 @@ class SemgrepState:
     error_handler: ErrorHandler = Factory(ErrorHandler)
     settings: Settings = Factory(Settings)
     terminal: Terminal = Factory(Terminal)
+    telemetry: Telemetry = Factory(Telemetry)
+
+    @staticmethod
+    def cli_arg(param_name: str) -> Any:
+        """
+        Returns the argument set for the current CLI invocation, if set.
+
+        This is a bit hacky but we do this so we can easily pass, for instance,
+        the number of jobs to the rpc client without threading it through every
+        single function that needs it.
+        """
+        ctx = get_context()
+        params = ctx.params if hasattr(ctx, "params") else {}
+        return params.get(param_name, None)
 
     @staticmethod
     def get_cli_ux_flavor() -> DesignTreatment:
@@ -73,14 +103,33 @@ class SemgrepState:
         """
         Returns True iff the current CLI invocation is a pattern invocation via `semgrep -e` or `semgrep --pattern`.
         """
-        ctx = get_context()
-        params = ctx.params if hasattr(ctx, "params") else {}
-        return params.get("pattern") is not None
+        return SemgrepState.cli_arg("pattern") is not None
+
+    @staticmethod
+    def memory_policy() -> MemoryPolicy | None:
+        """
+        Returns, if set, the memory policy for the scan.
+        """
+        return cast(MemoryPolicy | None, SemgrepState.cli_arg("x_mem_policy"))
+
+    @staticmethod
+    def jobs() -> int | None:
+        """
+        Returns the number of jobs to use for the current CLI invocation.
+        """
+        jobs_str = SemgrepState.cli_arg("jobs")
+        jobs = int(jobs_str) if jobs_str is not None else None
+        return jobs
 
 
 def get_context() -> click.Context:
     """
     Get the current CLI invocation's click context.
+
+    !!! WARNING(sal): This is NOT thread-safe. Click context is not available
+    in threads, so you need to propagate it manually.
+
+    See `get_state` for more details.
     """
     ctx = click.get_current_context(silent=True)
     if ctx is None:
@@ -105,6 +154,17 @@ def get_config() -> List[str]:
 def get_state() -> SemgrepState:
     """
     Get the current CLI invocation's global state.
+
+    !!! WARNING(sal): This is NOT thread-safe. If you call this from a thread,
+    you will get a different SemgrepState object than the one you started with.
+    In fact, it'll re-configure the SemgrepState object, losing any state
+    that was set on it. You'll lose logging levels, and perhaps see weird
+    issues.
+
+    See `parse_config_string` in `config_resolver.py` details on how to
+    propagate the state to threads.
+
+    See https://pocoo-click.readthedocs.io/en/latest/advanced/#global-context-access
     """
     ctx = get_context()
     return ctx.ensure_object(SemgrepState)

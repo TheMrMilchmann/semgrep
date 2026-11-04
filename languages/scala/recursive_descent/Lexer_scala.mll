@@ -1,7 +1,7 @@
 {
 (* Yoann Padioleau
  *
- * Copyright (C) 2021 r2c
+ * Copyright (C) 2021 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -16,6 +16,7 @@
 open Common
 open Token_scala
 module Flag = Flag_parsing
+module Log = Log_parser_scala.Log
 
 (*****************************************************************************)
 (* Prelude *)
@@ -59,23 +60,26 @@ type state_mode =
 
 let default_state = ST_IN_CODE
 
-let _mode_stack =
-  ref [default_state]
+let _mode_stack : state_mode list Domain.DLS.key =
+  Domain.DLS.new_key (Fun.const [default_state])
 
 let reset () =
-  _mode_stack := [default_state];
+  Domain.DLS.set _mode_stack [default_state];
   ()
 
 let rec current_mode () =
-  match !_mode_stack with
+  match Domain.DLS.get _mode_stack with
   | top :: _ -> top
   | [] ->
-      UCommon.pr2("mode_stack is empty, defaulting to INITIAL");
+      Log.warn (fun m-> m "mode_stack is empty, defaulting to INITIAL");
       reset();
       current_mode ()
 
-let push_mode mode = Stack_.push mode _mode_stack
-let pop_mode () = ignore(Stack_.pop _mode_stack)
+let push_mode mode =
+  Domain.DLS.set _mode_stack (mode :: Domain.DLS.get _mode_stack)
+let pop_mode () =
+  let ms = Domain.DLS.get _mode_stack in
+  Domain.DLS.set _mode_stack (List_.tl_exn "unexpected empty mode stack" ms)
 
 }
 
@@ -224,6 +228,9 @@ let alphaid = upper idrest | varid
  *)
 let id_after_dollar =
   ['A'-'Z''a'-'z''_'] (['A'-'Z''a'-'z''_'] | digit)* ('_' op)?
+
+let metavar_id_after_dollar =
+  ['A'-'Z''_'] (['A'-'Z''_'] | digit)*
 
 (*****************************************************************************)
 (* Rule initial *)
@@ -514,6 +521,8 @@ and in_interpolated_double = parse
   | escapeSeq as s { StringLiteral (s, tokinfo lexbuf) }
   | [^'"''$''\\']+ as s { StringLiteral (s, tokinfo lexbuf) }
   | "${" { push_mode ST_IN_CODE; LBRACE (tokinfo lexbuf) }
+  (* for metavariables, we keep the $ sign, which we strip later if not in semgrep mode *)
+  | ("$" metavar_id_after_dollar) as s { ID_DOLLAR (s, tokinfo lexbuf) }
   | "$" (id_after_dollar as s) { ID_DOLLAR (s, tokinfo lexbuf) }
   | "$$" { StringLiteral("$", tokinfo lexbuf) }
 
@@ -538,6 +547,8 @@ and in_interpolated_triple = parse
   | escapeSeq as s { StringLiteral (s, tokinfo lexbuf) }
   | [^'"''$''\\']+ as s { StringLiteral (s, tokinfo lexbuf) }
   | "${" { push_mode ST_IN_CODE; LBRACE (tokinfo lexbuf) }
+  (* for metavariables, we keep the $ sign, which we strip later if not in semgrep mode *)
+  | ("$" metavar_id_after_dollar) as s { ID_DOLLAR (s, tokinfo lexbuf) }
   | "$" (id_after_dollar as s) { ID_DOLLAR (s, tokinfo lexbuf) }
   | "$$" { StringLiteral("$", tokinfo lexbuf) }
 

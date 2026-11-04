@@ -46,9 +46,9 @@ open Parser_cpp
  *)
 
 (*****************************************************************************)
-(* Some debugging functions  *)
+(* Logging *)
 (*****************************************************************************)
-let pr2, _pr2_once = Common2.mk_pr2_wrappers Flag.verbose_parsing
+let pr2 = Printf.eprintf
 
 (*****************************************************************************)
 (* Types *)
@@ -149,10 +149,10 @@ let rebuild_tokens_extented toks_ext =
   let _tokens = ref [] in
   toks_ext
   |> List.iter (fun tok ->
-         tok.new_tokens_before |> List.iter (fun x -> Stack_.push x _tokens);
-         Stack_.push tok.t _tokens);
+      tok.new_tokens_before |> List.iter (fun x -> Stack_.push x _tokens);
+      Stack_.push tok.t _tokens);
   let tokens = List.rev !_tokens in
-  tokens |> Common2.acc_map mk_token_extended
+  tokens |> List.map mk_token_extended
 
 (*****************************************************************************)
 (* View builders  *)
@@ -260,9 +260,7 @@ let rec mk_ifdef xs =
           let body, extra, xs = mk_ifdef_parameters [ x ] [] xs in
 
           (* if not passing, then consider a #if 0 as an ordinary #ifdef *)
-          if !Flag_cpp.if0_passing then
-            Ifdefbool (b, body, extra) :: mk_ifdef xs
-          else Ifdef (body, extra) :: mk_ifdef xs
+          Ifdefbool (b, body, extra) :: mk_ifdef xs
       | TIfdefMisc (b, _)
       | TIfdefVersion (b, _) ->
           let body, extra, xs = mk_ifdef_parameters [ x ] [] xs in
@@ -293,14 +291,9 @@ and mk_ifdef_parameters extras acc_before_sep xs =
       | TIfdefBool (b, _) ->
           let body, extrasnest, xs = mk_ifdef_parameters [ x ] [] xs in
 
-          if !Flag_cpp.if0_passing then
-            mk_ifdef_parameters extras
-              (Ifdefbool (b, body, extrasnest) :: acc_before_sep)
-              xs
-          else
-            mk_ifdef_parameters extras
-              (Ifdef (body, extrasnest) :: acc_before_sep)
-              xs
+          mk_ifdef_parameters extras
+            (Ifdefbool (b, body, extrasnest) :: acc_before_sep)
+            xs
       | TIfdefMisc (b, _)
       | TIfdefVersion (b, _) ->
           let body, extrasnest, xs = mk_ifdef_parameters [ x ] [] xs in
@@ -487,8 +480,8 @@ let mk_multi xs =
 let split_comma xs =
   xs
   |> Common2.split_gen_when (function
-       | Tok { t = TComma _; _ } :: xs -> Some xs
-       | _ -> None)
+    | Tok { t = TComma _; _ } :: xs -> Some xs
+    | _ -> None)
 
 (*****************************************************************************)
 (* View iterators  *)
@@ -497,39 +490,39 @@ let split_comma xs =
 let rec iter_token_paren f xs =
   xs
   |> List.iter (function
-       | PToken tok -> f tok
-       | Parenthised (xxs, info_parens) ->
-           info_parens |> List.iter f;
-           xxs |> List.iter (fun xs -> iter_token_paren f xs))
+    | PToken tok -> f tok
+    | Parenthised (xxs, info_parens) ->
+        info_parens |> List.iter f;
+        xxs |> List.iter (fun xs -> iter_token_paren f xs))
 
 let rec iter_token_brace f xs =
   xs
   |> List.iter (function
-       | BToken tok -> f tok
-       | Braceised (xxs, tok1, tok2opt) ->
-           f tok1;
-           Option.iter f tok2opt;
-           xxs |> List.iter (fun xs -> iter_token_brace f xs))
+    | BToken tok -> f tok
+    | Braceised (xxs, tok1, tok2opt) ->
+        f tok1;
+        Option.iter f tok2opt;
+        xxs |> List.iter (fun xs -> iter_token_brace f xs))
 
 let rec iter_token_ifdef f xs =
   xs
   |> List.iter (function
-       | NotIfdefLine xs -> xs |> List.iter f
-       | Ifdefbool (_, xxs, info_ifdef)
-       | Ifdef (xxs, info_ifdef) ->
-           info_ifdef |> List.iter f;
-           xxs |> List.iter (iter_token_ifdef f))
+    | NotIfdefLine xs -> xs |> List.iter f
+    | Ifdefbool (_, xxs, info_ifdef)
+    | Ifdef (xxs, info_ifdef) ->
+        info_ifdef |> List.iter f;
+        xxs |> List.iter (iter_token_ifdef f))
 
 let rec iter_token_multi f xs =
   xs
   |> List.iter (function
-       | Tok t -> f t
-       | Braces (t1, xs, t2)
-       | Parens (t1, xs, t2)
-       | Angle (t1, xs, t2) ->
-           f t1;
-           iter_token_multi f xs;
-           Option.iter f t2)
+    | Tok t -> f t
+    | Braces (t1, xs, t2)
+    | Parens (t1, xs, t2)
+    | Angle (t1, xs, t2) ->
+        f t1;
+        iter_token_multi f xs;
+        Option.iter f t2)
 
 let tokens_of_paren xs =
   let g = ref [] in
@@ -575,13 +568,13 @@ let tokens_of_multi_grouped xs =
   let rec aux xs =
     xs
     |> List.iter (function
-         | Tok t1 -> add t1
-         | Braces (t1, xs, t2)
-         | Parens (t1, xs, t2)
-         | Angle (t1, xs, t2) ->
-             add t1;
-             aux xs;
-             Option.iter add t2)
+      | Tok t1 -> add t1
+      | Braces (t1, xs, t2)
+      | Parens (t1, xs, t2)
+      | Angle (t1, xs, t2) ->
+          add t1;
+          aux xs;
+          Option.iter add t2)
   in
   aux xs;
   List.rev !res

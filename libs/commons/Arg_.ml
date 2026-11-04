@@ -66,22 +66,28 @@ let (lines : string -> string list) =
 (* Entry points *)
 (*****************************************************************************)
 
-(* now I use argv as I like at the call sites to show that
- * this function internally use argv.
- *)
 let parse_options options usage_msg argv =
   let args = ref [] in
   try
-    Arg.parse_argv argv options (fun file -> args := file :: !args) usage_msg;
+    (* We explicitly pass in 0 for current to avoid Arg's default behaviour
+     * of internally mutating an internal [optind]-style value.  This means
+     * we can repeatedly parse options "from scratch", which we need for
+     * in-process e2e tests.
+     * https://ocaml.org/manual/5.3/api/Arg.html#VALcurrent
+     *)
+    let current = ref 0 in
+    Arg.parse_argv ~current argv options
+      (fun file -> args := file :: !args)
+      usage_msg;
     args := List.rev !args;
     !args
   with
   | Arg.Bad msg ->
       Printf.eprintf "%s" msg;
-      raise (UnixExit 2)
+      raise (UnixExit (2, msg))
   | Arg.Help msg ->
-      UPrintf.printf "%s" msg;
-      raise (UnixExit 0)
+      Printf.printf "%s" msg;
+      raise (UnixExit (0, msg))
 
 let usage usage_msg options = Arg.usage (Arg.align options) usage_msg
 
@@ -101,14 +107,14 @@ let long_usage usage_msg ~short_opt ~long_opt =
   let all_options_with_title = ("main options", "", short_opt) :: long_opt in
   all_options_with_title
   |> List.iter (fun (title, explanations, xs) ->
-         UCommon.pr title;
-         pr_xxxxxxxxxxxxxxxxx ();
-         if explanations <> "" then (
-           UCommon.pr explanations;
-           UCommon.pr "");
-         arg_align2 xs
-         |> List.iter (fun (key, _action, s) -> UCommon.pr ("  " ^ key ^ s));
-         UCommon.pr "");
+      UCommon.pr title;
+      pr_xxxxxxxxxxxxxxxxx ();
+      if explanations <> "" then (
+        UCommon.pr explanations;
+        UCommon.pr "");
+      arg_align2 xs
+      |> List.iter (fun (key, _action, s) -> UCommon.pr ("  " ^ key ^ s));
+      UCommon.pr "");
   ()
 
 (* copy paste of Arg.parse. Don't want the default -help msg *)
@@ -117,17 +123,18 @@ let arg_parse2 l msg short_usage_fun =
   let f file = args := file :: !args in
   let l = Arg.align l in
   try
-    Arg.parse_argv USys.argv l f msg;
+    let current = ref 0 in
+    Arg.parse_argv ~current Sys.argv l f msg;
     args := List.rev !args;
     !args
   with
   | Arg.Bad msg ->
-      (* eprintf "%s" msg; exit 2; *)
       let xs = lines msg in
       (* take only head, it's where the error msg is *)
-      UCommon.pr2 (List_.hd_exn "unexpected empty list" xs);
+      (* nosemgrep: no-logs-in-library *)
+      Logs.err (fun m -> m "%s" (List_.hd_exn "unexpected empty list" xs));
       short_usage_fun ();
-      raise (UnixExit 2)
+      raise (UnixExit (2, msg))
   | Arg.Help _msg ->
       (* printf "%s" msg; exit 0; *)
       raise Impossible (* -help is specified in speclist *)
@@ -145,15 +152,15 @@ exception WrongNumberOfArguments
 
 let options_of_actions action_ref actions =
   actions
-  |> List_.map (fun (key, doc, _func) ->
-         (key, Arg.Unit (fun () -> action_ref := key), doc))
+  |> List.map (fun (key, doc, _func) ->
+      (key, Arg.Unit (fun () -> action_ref := key), doc))
 
 let (action_list : cmdline_actions -> Arg.key list) =
- fun xs -> List_.map (fun (a, _b, _c) -> a) xs
+ fun xs -> List.map (fun (a, _b, _c) -> a) xs
 
 let (do_action : Arg.key -> string list (* args *) -> cmdline_actions -> unit) =
  fun key args xs ->
-  let assoc = xs |> List_.map (fun (a, _b, c) -> (a, c)) in
+  let assoc = xs |> List.map (fun (a, _b, c) -> (a, c)) in
   let action_func = List.assoc key assoc in
   action_func args
 
@@ -183,4 +190,4 @@ let mk_action_4_arg f = function
 
 let mk_action_n_arg f = f
 let mk_action_1_conv conv f = mk_action_1_arg (fun str -> f (conv str))
-let mk_action_n_conv conv f = mk_action_n_arg (fun xs -> f (List_.map conv xs))
+let mk_action_n_conv conv f = mk_action_n_arg (fun xs -> f (List.map conv xs))

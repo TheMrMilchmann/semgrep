@@ -37,13 +37,13 @@ module H = AST_generic_helpers
 (*****************************************************************************)
 let id x = x
 let option = Option.map
-let list = List_.map
+let list = List.map
 let bool = id
 let string = id
 let fake tok s = Tok.fake_tok tok s
 let unsafe_fake s = Tok.unsafe_fake_tok s
 let fb = Tok.unsafe_fake_bracket
-let nonbasic_entity id_or_e = { G.name = id_or_e; attrs = []; tparams = [] }
+let nonbasic_entity id_or_e = { G.name = id_or_e; attrs = []; tparams = None }
 
 (*****************************************************************************)
 (* Entry point *)
@@ -60,7 +60,7 @@ let bracket of_a (t1, x, t2) = (info t1, of_a x, info t2)
 let ident x = wrap string x
 
 let concatenate_string_wraps xs =
-  let strings, toks = List.split xs in
+  let strings, toks = List_.split xs in
   match toks with
   | [] -> None
   | x :: xs -> Some (String.concat "" strings, Tok.combine_toks x xs)
@@ -75,148 +75,150 @@ let concatenate_literal_fragments xs =
 
 let rec expr e =
   (match e with
-  | Literal x -> literal x
-  | Atom (tk, x) -> atom tk x
-  | Id (id, kind) -> (
-      match kind with
-      | ID_Self -> G.IdSpecial (G.Self, snd id)
-      | ID_Super -> G.IdSpecial (G.Super, snd id)
-      | _ -> G.N (G.Id (ident id, G.empty_id_info ())))
-  | ScopedId x ->
-      let name = scope_resolution x in
-      G.N name
-  | Hash (_bool, xs) -> G.Container (G.Dict, bracket (list expr) xs)
-  | Array (l, xs, r) ->
-      let xs = args_to_exprs xs in
-      G.Container (G.Array, (l, list expr xs, r))
-  | Tuple xs -> G.Container (G.Tuple, Tok.unsafe_fake_bracket (list expr xs))
-  | Unary (op, e) ->
-      let e = expr e in
-      unary op e
-  | Binop (e1, op, e2) ->
-      let e1 = expr e1 in
-      let e2 = expr e2 in
-      binary op e1 e2
-  | Ternary (e1, _t1, e2, _t2, e3) ->
-      let e1 = expr e1 in
-      let e2 = expr e2 in
-      let e3 = expr e3 in
-      G.Conditional (e1, e2, e3)
-  | Call (e, xs, bopt) -> (
-      let e = expr e in
-      let lb, xs, rb = bracket (list argument) xs in
-      let e_call = G.Call (e, (lb, xs, rb)) in
-      match bopt with
-      | None -> e_call
-      | Some b ->
-          (* There is a block to pass to `e`. We add an extra `Call` so that
-           * `f(x) { |n| puts n }` is translated as `f(x)({ |n| puts n })`
-           * rather than as `f(x, { |n| puts n })`. This way the pattern
-           * `f(...)` will only match `f(x)` and not the entire block,
-           * and `f($X)` will match `f(x)`. *)
-          let barg = b |> expr |> G.arg in
-          G.Call (G.e e_call, (lb, [ barg ], rb)))
-  | DotAccess (e, t, m) -> (
-      let e = expr e in
-      match m with
-      | MethodEllipsis t -> G.DotAccessEllipsis (e, t)
-      | _ ->
-          let fld =
-            match method_name m with
-            | Left id -> G.FN (G.Id (id, G.empty_id_info ()))
-            | Right e -> G.FDynamic e
-          in
-          G.DotAccess (e, t, fld))
-  | DotAccessEllipsis (e, t) -> G.DotAccessEllipsis (expr e, t)
-  | Splat (t, eopt) ->
-      let xs = option expr eopt |> Option.to_list |> List_.map G.arg in
-      let special = G.IdSpecial (G.Spread, t) |> G.e in
-      G.Call (special, fb xs)
-  | CodeBlock ((t1, _, t2), params_opt, xs) ->
-      let params =
-        match params_opt with
-        | None -> []
-        | Some xs -> xs
-      in
-      let params = list formal_param params in
-      let st = G.Block (t1, list_stmts xs, t2) |> G.s in
-      let def =
-        {
-          G.fparams = fb params;
-          frettype = None;
-          fbody = G.FBStmt st;
-          fkind = (G.LambdaKind, t1);
-        }
-      in
-      G.Lambda def
-  | Lambda (tok, params_opt, xs) ->
-      let params =
-        match params_opt with
-        | None -> []
-        | Some xs -> xs
-      in
-      let params = list formal_param params in
-      let st = G.Block (tok, list_stmts xs, tok) |> G.s in
-      let def =
-        {
-          G.fparams = fb params;
-          frettype = None;
-          fbody = G.FBStmt st;
-          fkind = (G.LambdaKind, tok);
-        }
-      in
-      G.Lambda def
-  | Rescue (e1, t, e2) ->
-      (* We translate `e1 rescue e2` to
+    | Literal x -> literal x
+    | Atom (tk, x) -> atom tk x
+    | Id (id, kind) -> (
+        match kind with
+        | ID_Self -> G.N (G.IdSpecial ((G.Self, snd id), G.empty_id_info ()))
+        | ID_Super -> G.N (G.IdSpecial ((G.Super, snd id), G.empty_id_info ()))
+        | _ -> G.N (G.Id (ident id, G.empty_id_info ())))
+    | ScopedId x ->
+        let name = scope_resolution x in
+        G.N name
+    | Hash (_bool, xs) -> G.Container (G.Dict, bracket (list expr) xs)
+    | Array (l, xs, r) ->
+        let xs = args_to_exprs xs in
+        G.Container (G.Array, (l, list expr xs, r))
+    | Tuple xs -> G.Container (G.Tuple, Tok.unsafe_fake_bracket (list expr xs))
+    | Unary (op, e) ->
+        let e = expr e in
+        unary op e
+    | Binop (e1, op, e2) ->
+        let e1 = expr e1 in
+        let e2 = expr e2 in
+        binary op e1 e2
+    | Ternary (e1, _t1, e2, _t2, e3) ->
+        let e1 = expr e1 in
+        let e2 = expr e2 in
+        let e3 = expr e3 in
+        G.Conditional (e1, e2, e3)
+    | Call (e, xs, bopt) -> (
+        let e = expr e in
+        let lb, xs, rb = bracket (list argument) xs in
+        let e_call = G.Call (e, (lb, xs, rb)) in
+        match bopt with
+        | None -> e_call
+        | Some b ->
+            (* There is a block to pass to `e`. We add an extra `Call` so that
+             * `f(x) { |n| puts n }` is translated as `f(x)({ |n| puts n })`
+             * rather than as `f(x, { |n| puts n })`. This way the pattern
+             * `f(...)` will only match `f(x)` and not the entire block,
+             * and `f($X)` will match `f(x)`. *)
+            let barg = b |> expr |> G.arg in
+            G.Call (G.e e_call, (lb, [ barg ], rb)))
+    | DotAccess (e, t, m) -> (
+        let e = expr e in
+        match m with
+        | MethodEllipsis t -> G.DotAccessEllipsis (e, t)
+        | _ ->
+            let fld =
+              match method_name m with
+              | Left id -> G.FN (G.Id (id, G.empty_id_info ()))
+              | Right e -> G.FDynamic e
+            in
+            G.DotAccess (e, t, fld))
+    | DotAccessEllipsis (e, t) -> G.DotAccessEllipsis (expr e, t)
+    | Splat (t, eopt) ->
+        let xs = option expr eopt |> Option.to_list |> List.map G.arg in
+        let special = G.Special (G.Spread, t) |> G.e in
+        G.Call (special, fb xs)
+    | CodeBlock ((t1, _, t2), params_opt, xs) ->
+        let params =
+          match params_opt with
+          | None -> []
+          | Some xs -> xs
+        in
+        let params = list formal_param params in
+        let st = G.Block (t1, list_stmts xs, t2) |> G.s in
+        let def =
+          {
+            G.fparams = fb params;
+            frettype = None;
+            fbody = G.FBStmt st;
+            fkind = (G.LambdaKind, t1);
+          }
+        in
+        G.Lambda def
+    | Lambda (tok, params_opt, xs) ->
+        let params =
+          match params_opt with
+          | None -> []
+          | Some xs -> xs
+        in
+        let params = list formal_param params in
+        let st = G.Block (tok, list_stmts xs, tok) |> G.s in
+        let def =
+          {
+            G.fparams = fb params;
+            frettype = None;
+            fbody = G.FBStmt st;
+            fkind = (G.LambdaKind, tok);
+          }
+        in
+        G.Lambda def
+    | Rescue (e1, t, e2) ->
+        (* We translate `e1 rescue e2` to
 
          try e1 with _ -> e2
       *)
-      let e1 = expr e1 in
-      let e2 = expr e2 in
-      let st =
-        G.Try
-          ( t,
-            G.exprstmt e1,
-            [ (t, CatchPattern (PatUnderscore t), G.exprstmt e2) ],
-            None,
-            None )
-        |> G.s
-      in
-      let x = G.stmt_to_expr st in
-      x.G.e
-  | Match (e, tk, p) ->
-      (* we translate `e in p` to
+        let e1 = expr e1 in
+        let e2 = expr e2 in
+        let st =
+          G.Try
+            ( t,
+              G.exprstmt e1,
+              [ (t, CatchPattern (PatWildcard t), G.exprstmt e2) ],
+              None,
+              None )
+          |> G.s
+        in
+        let x = G.stmt_to_expr st in
+        x.G.e
+    | Match (e, tk, p) ->
+        (* we translate `e in p` to
 
          switch e of
            p => true
          | _ => false
       *)
-      let t = G.N (Id (("true", G.fake "true"), G.empty_id_info ())) |> G.e in
-      let f = G.N (Id (("false", G.fake "false"), G.empty_id_info ())) |> G.e in
-      let case = G.case_of_pat_and_expr ~tok:(Some tk) (pattern p, t) in
-      let uncase =
-        G.CasesAndBody ([ Case (tk, PatUnderscore tk) ], G.exprstmt f)
-      in
-      G.StmtExpr (Switch (tk, Some (Cond (expr e)), [ case; uncase ]) |> G.s)
-  | S x ->
-      let st = stmt x in
-      let x = G.stmt_to_expr st in
-      x.G.e
-  | D x ->
-      let st = definition x in
-      let x = G.stmt_to_expr st in
-      x.G.e
-  | Ellipsis x ->
-      let x = info x in
-      G.Ellipsis x
-  | DeepEllipsis x ->
-      let x = bracket expr x in
-      G.DeepEllipsis x
-  | TypedMetavar (v1, v2, v3) ->
-      let v1 = ident v1 in
-      let v3 = type_ v3 in
-      G.TypedMetavar (v1, v2, v3)
-  | TodoExpr (s, tk) -> G.OtherExpr ((s, G.fake s), [ G.Tk tk ]))
+        let t = G.N (Id (("true", G.fake "true"), G.empty_id_info ())) |> G.e in
+        let f =
+          G.N (Id (("false", G.fake "false"), G.empty_id_info ())) |> G.e
+        in
+        let case = G.case_of_pat_and_expr ~tok:tk (pattern p, t) in
+        let uncase =
+          G.CasesAndBody ([ Case (tk, PatWildcard tk) ], G.exprstmt f)
+        in
+        G.StmtExpr (Switch (tk, Some (Cond (expr e)), [ case; uncase ]) |> G.s)
+    | S x ->
+        let st = stmt x in
+        let x = G.stmt_to_expr st in
+        x.G.e
+    | D x ->
+        let st = definition x in
+        let x = G.stmt_to_expr st in
+        x.G.e
+    | Ellipsis x ->
+        let x = info x in
+        G.Ellipsis x
+    | DeepEllipsis x ->
+        let x = bracket expr x in
+        G.DeepEllipsis x
+    | TypedMetavar (v1, v2, v3) ->
+        let v1 = ident v1 in
+        let v3 = type_ v3 in
+        G.TypedMetavar (v1, v2, v3)
+    | TodoExpr (s, tk) -> G.OtherExpr ((s, G.fake s), [ G.Tk tk ]))
   |> G.e
 
 and argument arg : G.argument =
@@ -325,12 +327,12 @@ and scope_resolution x : G.name =
          G.e =
            G.N
              (G.IdQualified
-               {
-                 name_last;
-                 name_middle = Some (G.QDots middle);
-                 name_top = None;
-                 _;
-               });
+                {
+                  name_last;
+                  name_middle = Some (G.QDots middle);
+                  name_top = None;
+                  _;
+                });
          _;
         } ->
             G.QDots (middle @ [ name_last ])
@@ -395,14 +397,14 @@ and interpolated_string (t1, xs, t2) : G.expr_kind =
   in
   let xs = xs |> fold_constants |> list (string_contents t1) in
   G.Call
-    ( G.IdSpecial (G.ConcatString G.InterpolatedConcat, t1) |> G.e,
-      (t1, xs |> List_.map (fun e -> G.Arg e), t2) )
+    ( G.Special (G.ConcatString G.InterpolatedConcat, t1) |> G.e,
+      (t1, xs |> List.map (fun e -> G.Arg e), t2) )
 
 and string_contents tok = function
   | StrChars s -> G.L (G.String (fb s)) |> G.e
   | StrExpr (l, e, r) ->
       G.Call
-        ( G.IdSpecial (G.InterpolatedElement, tok) |> G.e,
+        ( G.Special (G.InterpolatedElement, tok) |> G.e,
           (l, [ G.Arg (expr e) ], r) )
       |> G.e
 
@@ -418,7 +420,8 @@ and binary_msg = function
   | Op_REM -> G.Mod
   | Op_DIV -> G.Div
   | Op_LSHIFT -> G.LSL
-  | Op_RSHIFT -> G.LSR
+  | Op_RSHIFT ->
+      G.ASR (* Ruby ints are signed arbitrary-precision; >> is arithmetic *)
   | Op_BAND -> G.BitAnd
   | Op_BOR -> G.BitOr
   | Op_XOR -> G.BitXor
@@ -443,13 +446,13 @@ and binary (op, t) e1 e2 =
   match op with
   | B msg ->
       let op = binary_msg msg in
-      G.Call (G.IdSpecial (G.Op op, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
+      G.Call (G.Special (G.Op op, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
   | Op_kAND
   | Op_AND ->
-      G.Call (G.IdSpecial (G.Op G.And, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
+      G.Call (G.Special (G.Op G.And, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
   | Op_kOR
   | Op_OR ->
-      G.Call (G.IdSpecial (G.Op G.Or, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
+      G.Call (G.Special (G.Op G.Or, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
   | Op_ASSIGN -> G.Assign (e1, t, e2)
   | Op_OP_ASGN op ->
       let op =
@@ -464,7 +467,7 @@ and binary (op, t) e1 e2 =
   | Op_ASSOC -> (G.keyval e1 t e2).e
   | Op_DOT3 ->
       (* coupling: make sure to check for the string in generic_vs_generic *)
-      G.Call (G.IdSpecial (G.Op G.Range, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
+      G.Call (G.Special (G.Op G.Range, t) |> G.e, fb [ G.Arg e1; G.Arg e2 ])
 
 and unary (op, t) e =
   match op with
@@ -476,11 +479,11 @@ and unary (op, t) e =
         | Op_UBang -> G.Not
         | Op_UTilde -> G.BitNot
       in
-      G.Call (G.IdSpecial (G.Op op, t) |> G.e, fb [ G.Arg e ])
-  | Op_UNot -> G.Call (G.IdSpecial (G.Op G.Not, t) |> G.e, fb [ G.Arg e ])
+      G.Call (G.Special (G.Op op, t) |> G.e, fb [ G.Arg e ])
+  | Op_UNot -> G.Call (G.Special (G.Op G.Not, t) |> G.e, fb [ G.Arg e ])
   | Op_DefinedQuestion ->
-      G.Call (G.IdSpecial (G.Defined, t) |> G.e, fb [ G.Arg e ])
-  | Op_UStarStar -> G.Call (G.IdSpecial (G.HashSplat, t) |> G.e, fb [ G.Arg e ])
+      G.Call (G.Special (G.Defined, t) |> G.e, fb [ G.Arg e ])
+  | Op_UStarStar -> G.Call (G.Special (G.HashSplat, t) |> G.e, fb [ G.Arg e ])
   (* should be only in arguments, to pass procs. I abuse Ref for now *)
   | Op_UAmper -> G.Ref (t, e)
 
@@ -561,11 +564,11 @@ and expr_as_stmt = function
       let e = expr e in
       match e.G.e with
       (* targets only: a single name on its own line is probably an hidden fun call,
-         * unless it's a metavariable
-      *)
+       * unless it's a metavariable
+       *)
       | G.N (G.Id ((s, _), _)) ->
-          if AST_generic.is_metavar_name s || !Flag_parsing.sgrep_mode then
-            G.exprstmt e
+          if AST_generic.is_metavar_name s || Hook.get Flag_parsing.sgrep_mode
+          then G.exprstmt e
           else
             let call = G.Call (e, fb []) |> G.e in
             G.exprstmt call
@@ -591,7 +594,7 @@ and stmt st =
       G.While (t, G.Cond e, st) |> G.s
   | Until (t, _bool, e, st) ->
       let e = expr e in
-      let special = G.IdSpecial (G.Op G.Not, t) |> G.e in
+      let special = G.Special (G.Op G.Not, t) |> G.e in
       let e = G.Call (special, fb [ G.Arg e ]) |> G.e in
       let st = list_stmt1 st in
       G.While (t, G.Cond e, st) |> G.s
@@ -599,7 +602,7 @@ and stmt st =
       let e = expr e in
       let st = list_stmt1 st in
       let elseopt = option_tok_stmts elseopt in
-      let special = G.IdSpecial (G.Op G.Not, t) |> G.e in
+      let special = G.Special (G.Op G.Not, t) |> G.e in
       let e = G.Call (special, fb [ G.Arg e ]) |> G.e in
       let st1 =
         match elseopt with
@@ -647,14 +650,14 @@ and stmt st =
         | Some e -> Some (G.Cond e)
       in
       G.Switch
-        (t, condopt, whens @ default |> List_.map (fun x -> G.CasesAndBody x))
+        (t, condopt, whens @ default |> List.map (fun x -> G.CasesAndBody x))
       |> G.s
   | ExnBlock b -> body_exn b
 
 and when_clause (t, pats, sts) =
   let pats = list pattern pats in
   let st = list_stmt1 sts in
-  (pats |> List_.map (fun pat -> G.Case (t, pat)), st)
+  (pats |> List.map (fun pat -> G.Case (t, pat)), st)
 
 and args_to_label_ident xs = xs |> args_to_exprs |> exprs_to_label_ident
 
@@ -677,7 +680,7 @@ and exprs_to_eopt = function
       let xs = list expr xs in
       Some (G.Container (G.Tuple, Tok.unsafe_fake_bracket xs) |> G.e)
 
-and qualified qual = List_.map variable qual
+and qualified qual = List.map variable qual
 
 and pattern_as_exp pat =
   match pat with
@@ -704,7 +707,7 @@ and pattern pat =
   | PatAtom (tk, a) -> promote (atom tk a)
   | PatDisj (p1, p2) -> G.PatDisj (pattern p1, pattern p2)
   | PatExpr e -> promote (expr e).G.e
-  | PatTuple (l, ps, r) -> G.PatTuple (l, List_.map pattern ps, r)
+  | PatTuple (l, ps, r) -> G.PatTuple (l, List.map pattern ps, r)
   | PatConstructor (qual, ps) ->
       let name =
         match List.rev (qualified qual) with
@@ -713,7 +716,7 @@ and pattern pat =
             raise Impossible
         | last :: rev_prefix ->
             let qualifier =
-              List_.map (fun id -> (id, None)) rev_prefix |> List.rev
+              List.map (fun id -> (id, None)) rev_prefix |> List.rev
             in
             G.IdQualified
               {
@@ -723,8 +726,8 @@ and pattern pat =
                 name_info = G.empty_id_info ();
               }
       in
-      G.PatConstructor (name, List_.map pattern ps)
-  | PatList (l, ps, r) -> G.PatList (l, List_.map patlist_arg ps, r)
+      G.PatConstructor (name, List.map pattern ps)
+  | PatList (l, ps, r) -> G.PatList (l, List.map patlist_arg ps, r)
   | PatWhen (pat, exp) -> G.PatWhen (pattern pat, expr exp)
   | PatAs (pat, id) -> G.PatAs (pattern pat, (ident id, G.empty_id_info ()))
   | PatPin (_tk, exp) ->
@@ -738,14 +741,14 @@ and patlist_arg = function
         | Some x -> [ G.Arg (G.N (G.Id (ident x, G.empty_id_info ())) |> G.e) ]
       in
       let exp =
-        G.E (G.Call (G.IdSpecial (G.Spread, tk) |> G.e, arg |> fb) |> G.e)
+        G.E (G.Call (G.Special (G.Spread, tk) |> G.e, arg |> fb) |> G.e)
       in
       G.OtherPat (("PArgSplat", G.fake "PArgSplat"), [ exp ])
   | PArgKeyVal (p1, tk, p2) ->
       let p2 =
         match p2 with
         | Some p2 -> pattern p2
-        | None -> PatUnderscore tk
+        | None -> PatWildcard tk
       in
       G.PatKeyVal (pattern p1, p2)
   | PArgPat p -> pattern p
@@ -848,7 +851,7 @@ and definition def =
         | Left id -> G.EN (G.Id (id, G.empty_id_info ()))
         | Right e -> G.EDynamic e
       in
-      let ent = { G.name = name_or_dyn; attrs = []; tparams = [] } in
+      let ent = { G.name = name_or_dyn; attrs = []; tparams = None } in
       let def = G.OtherDef (("Alias", t), [ method_name_to_any mn2 ]) in
       G.DefStmt (ent, def) |> G.s
   | Undef (t, mns) ->
@@ -879,7 +882,7 @@ and rescue_clause (t, exns, exnvaropt, sts) : G.catch =
   let st = list_stmt1 sts in
   let exns = list exception_ exns in
   match (exns, exnvaropt) with
-  | [], None -> (t, G.CatchPattern (G.PatUnderscore t), st)
+  | [], None -> (t, G.CatchPattern (G.PatWildcard t), st)
   | [], Some (t, lhs) ->
       let e = expr lhs in
       (t, G.CatchPattern (G.OtherPat (("Rescue", t), [ G.E e ])), st)
@@ -937,7 +940,7 @@ and list_stmt1 xs =
 and list_stmts xs = list expr_as_stmt xs
 
 let program xs =
-  Common.save_excursion Flag_parsing.sgrep_mode false (fun () -> list_stmts xs)
+  Hook.with_hook_set Flag_parsing.sgrep_mode false (fun () -> list_stmts xs)
 
 let any x =
   (* We need this sgrep_mode flag because we want some branching behavior
@@ -946,7 +949,7 @@ let any x =
      In particular, this comes into play when translating a single name on its
      own line, which may be a call in a target.
   *)
-  Common.save_excursion Flag_parsing.sgrep_mode true (fun () ->
+  Hook.with_hook_set Flag_parsing.sgrep_mode true (fun () ->
       match x with
       (* coupling: match pattern
          This is what a standalone pattern looks like in Ruby.

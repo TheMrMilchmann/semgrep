@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Wrapper around Printexc to ensure or at least encourage uniform
    exception tracing.
 
@@ -131,3 +143,28 @@ val get_trace : t -> Printexc.raw_backtrace
    'Printexc.register_printer'.
 *)
 val to_string : t -> string
+
+(* A timeout exception with accompanying debug information:
+   - a descriptive name
+   - the time limit that was /set/
+*)
+type timeout_info = { name : string; max_duration : float }
+
+(* After a timeout runs, we record:
+    - the actual duration that we spent in the time limit. E.g. if the time
+      limit was 10s and we timed out at 10.5s, this would be 10.5. this can happen
+      sometimes since the points at which we check the timer are not exact.
+
+    - whether we actually exceeded the time limit or not. We record the actual
+      duration a little before/after a time limit starts and finishes, so we
+      record this as boolean instead of calculating it, so we don't have to worry
+      some inaccuracy in timing not matching up with reality
+ *)
+type timeout_result_info = { actual_duration : float; exceeded : bool }
+
+(*
+   If ever caught, this exception must be re-raised immediately so as
+   to not interfere with the timeout handler. See function 'set_timeout'.
+*)
+
+exception Timeout of (timeout_info * timeout_result_info)

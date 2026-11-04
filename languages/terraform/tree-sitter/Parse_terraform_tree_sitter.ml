@@ -14,6 +14,7 @@
  *)
 open Common
 open Either_
+open Fpath_.Operators
 module CST = Tree_sitter_hcl.CST
 module H = Parse_tree_sitter_helpers
 open AST_terraform
@@ -49,13 +50,14 @@ let pattern_of_ids ids =
   | [ id ] -> G.PatId (id, G.empty_id_info ()) |> G.p
   | _ ->
       let xs =
-        ids |> List_.map (fun id -> G.PatId (id, G.empty_id_info ()) |> G.p)
+        ids |> List.map (fun id -> G.PatId (id, G.empty_id_info ()) |> G.p)
       in
       G.PatTuple (fb xs) |> G.p
 
 (* val parse_number_literal : string * Parse_info.t -> AST_generic.literal *)
 let parse_number_literal (s, t) =
-  match Parsed_int.parse_c_octal (s, t) with
+  (* HCL/Terraform has no C-style octal: a leading zero is decimal. *)
+  match Parsed_int.parse (s, t) with
   | (Some _, _) as pi -> G.Int pi
   | pi -> (
       match float_of_string_opt s with
@@ -131,6 +133,52 @@ let map_template_literal (env : env) (xs : CST.template_literal) :
       let tok = Tok.rewrap_str str (token env x) in
       Some (str, tok)
 
+let end_linecol tok =
+  let loc = Tok.unsafe_loc_of_tok tok in
+  String.fold_left
+    (fun (line, col) c ->
+      if c =$= '\n' then (line + 1, loc.pos.column) else (line, col + 1))
+    (loc.pos.line, loc.pos.column)
+    loc.str
+
+let ws_gap (l1, c1) (l2, c2) =
+  if l2 > l1 then String.make (l2 - l1) '\n' ^ String.make c2 ' '
+  else String.make (max 0 (c2 - c1)) ' '
+
+let pad ?(strip_l = false) ?(strip_r = false) l r (s, t) =
+  let lead =
+    if strip_l then ""
+    else ws_gap (end_linecol l) (Tok.line_of_tok t, Tok.col_of_tok t)
+  in
+  let trail =
+    if strip_r then ""
+    else ws_gap (end_linecol t) (Tok.line_of_tok r, Tok.col_of_tok r)
+  in
+  let s = lead ^ s ^ trail in
+  let t = if String.equal lead "" then t else Tok.empty_tok_after l in
+  (s, Tok.rewrap_str s t)
+
+let ws_between l r =
+  match ws_gap (end_linecol l) (Tok.line_of_tok r, Tok.col_of_tok r) with
+  | "" -> None
+  | s -> Some (s, Tok.rewrap_str s (Tok.empty_tok_after l))
+
+let retain_boundary_ws ?(strip_l = false) ?(strip_r = false) l r parts =
+  match parts with
+  | [] when strip_l || strip_r -> []
+  | [] -> ws_between l r |> Option.to_list |> List.map (fun x -> Left3 x)
+  | [ Left3 x ] -> [ Left3 (pad ~strip_l ~strip_r l r x) ]
+  | _ -> (
+      let parts =
+        match parts with
+        | Left3 x :: rest -> Left3 (pad ~strip_l ~strip_r:true l r x) :: rest
+        | _ -> parts
+      in
+      match List.rev parts with
+      | Left3 x :: rev_rest ->
+          List.rev (Left3 (pad ~strip_l:true ~strip_r l r x) :: rev_rest)
+      | _ -> parts)
+
 let map_identifier (env : env) (x : CST.identifier) : ident =
   match x with
   | `Tok_choice_pat_3e8fcfc_rep_choice_pat_71519dc tok ->
@@ -140,9 +188,13 @@ let map_identifier (env : env) (x : CST.identifier) : ident =
 let map_string_lit (env : env) ((v1, v2, v3) : CST.string_lit) :
     string wrap bracket =
   let l = (* quoted_template_start *) token env v1 in
-  let xs = map_template_literal env v2 |> Option.to_list in
   let r = (* quoted_template_end *) token env v3 in
-  G.string_ (l, xs, r)
+  let x =
+    match Option.bind v2 (map_template_literal env) with
+    | Some x -> Some (pad l r x)
+    | None -> ws_between l r
+  in
+  G.string_ (l, Option.to_list x, r)
 
 let map_variable_expr (env : env) (x : CST.variable_expr) = map_identifier env x
 
@@ -166,12 +218,12 @@ let rec map_anon_choice_get_attr_7bbf24f (env : env)
   | `Get_attr x -> map_get_attr env x
   | `Index x -> map_index env x
 
-and map_anon_choice_temp_lit_c764a73 (env : env)
-    (x : CST.anon_choice_temp_lit_0082c06) =
+and map_template_part (env : env) x =
   match x with
   | `Temp_lit x ->
       let sopt = map_template_literal env x in
-      sopt |> Option.to_list |> List_.map (fun s -> Left3 s)
+      sopt |> Option.to_list |> List.map (fun s -> Left3 s)
+  | `Temp_dire x -> [ Middle3 (map_template_directive env x) ]
   | `Temp_interp (v1, v2, v3, v4, v5) ->
       let v1 = (* template_interpolation_start *) token env v1 in
       (* TODO: what is this ~? *)
@@ -192,6 +244,76 @@ and map_anon_choice_temp_lit_c764a73 (env : env)
       in
       let v5 = (* template_interpolation_end *) token env v5 in
       [ Right3 (v1, v3, v5) ]
+
+and map_template_body ?(strip_l = false) ?(strip_r = false) env l body r =
+  let parts =
+    match body with
+    | None -> []
+    | Some xs -> List.concat_map (map_template_part env) xs
+  in
+  match retain_boundary_ws ~strip_l ~strip_r l r parts with
+  | [] -> G.OtherExpr (("EmptyTemplateBody", l), []) |> G.e
+  | parts -> G.interpolated (l, parts, r)
+
+(* Directives contribute conditional strings or repeated strings to the outer
+   concatenation. Strip markers, like interpolation strip markers, are
+   formatting rather than separate expressions. *)
+and map_template_directive env (x : CST.template_directive) =
+  match x with
+  | `Temp_if
+      ( (_start, _, _, cond, if_strip, close),
+        yes,
+        otherwise,
+        (finish, endif_strip, _, _, _end) ) ->
+      (* Absent else → OtherExpr (not matchable ""); else body is after `%{ else }`. *)
+      let yes_r, yes_strip_r, no =
+        match otherwise with
+        | None ->
+            ( token env finish,
+              Option.is_some endif_strip,
+              G.OtherExpr (("AbsentTemplateElse", token env close), []) |> G.e
+            )
+        | Some ((l, else_strip_l, _, else_strip_r, r), body) ->
+            ( token env l,
+              Option.is_some else_strip_l,
+              map_template_body
+                ~strip_l:(Option.is_some else_strip_r)
+                ~strip_r:(Option.is_some endif_strip)
+                env (token env r) body (token env finish) )
+      in
+      let yes =
+        map_template_body ~strip_l:(Option.is_some if_strip)
+          ~strip_r:yes_strip_r env (token env close) yes yes_r
+      in
+      G.Conditional (map_expression env cond, yes, no) |> G.e
+  | `Temp_for
+      ( (start, _, for_, first, second, in_, source, for_strip, close),
+        body,
+        (finish, endfor_strip, _, _, end_) ) ->
+      let ids =
+        map_variable_expr env first
+        ::
+        (match second with
+        | None -> []
+        | Some (_, id) -> [ map_variable_expr env id ])
+      in
+      let pats = List.map (fun id -> G.PatId (id, G.empty_id_info ())) ids in
+      let pat =
+        match pats with
+        | [ p ] -> p
+        | _ -> G.PatTuple (Tok.unsafe_fake_bracket pats)
+      in
+      let body =
+        map_template_body ~strip_l:(Option.is_some for_strip)
+          ~strip_r:(Option.is_some endfor_strip)
+          env (token env close) body (token env finish)
+      in
+      let comp =
+        G.CompFor (token env for_, pat, token env in_, map_expression env source)
+      in
+      G.Comprehension
+        (G.Tuple, (token env start, (body, [ comp ]), token env end_))
+      |> G.e
 
 and map_binary_operation (env : env) (x : CST.binary_operation) =
   match x with
@@ -234,20 +356,14 @@ and map_binary_operation (env : env) (x : CST.binary_operation) =
       in
       let v3 = map_expr_term env v3 in
       (v1, v2, v3)
-  | `Expr_term_choice_AMPAMP_expr_term (v1, v2, v3) ->
+  | `Expr_term_AMPAMP_expr_term (v1, v2, v3) ->
       let v1 = map_expr_term env v1 in
-      let v2 =
-        match v2 with
-        | `AMPAMP tok -> (* "&&" *) (G.And, token env tok)
-      in
+      let v2 = (G.And, token env v2) in
       let v3 = map_expr_term env v3 in
       (v1, v2, v3)
-  | `Expr_term_choice_BARBAR_expr_term (v1, v2, v3) ->
+  | `Expr_term_BARBAR_expr_term (v1, v2, v3) ->
       let v1 = map_expr_term env v1 in
-      let v2 =
-        match v2 with
-        | `BARBAR tok -> (* "||" *) (G.Or, token env tok)
-      in
+      let v2 = (G.Or, token env v2) in
       let v3 = map_expr_term env v3 in
       (v1, v2, v3)
 
@@ -388,7 +504,7 @@ and map_function_arguments (env : env) ((v1, v2, v3) : CST.function_arguments) :
     G.argument list =
   let v1 = map_expression env v1 in
   let v2 =
-    List_.map
+    List.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = map_expression env v2 in
@@ -399,7 +515,7 @@ and map_function_arguments (env : env) ((v1, v2, v3) : CST.function_arguments) :
     match v3 with
     | Some x -> (
         match x with
-        | `COMMA tok ->
+        | `Comma tok ->
             (* "," *)
             let _t = token env tok in
             []
@@ -449,8 +565,8 @@ and map_object_elem (env : env) (x : CST.object_elem) : G.field =
         | N n -> G.EN n
         | _ -> G.EDynamic v1
       in
-      let ent = { G.name = n_or_dyn; attrs = []; tparams = [] } in
-      let vdef = { G.vinit = Some v3; vtype = None } in
+      let ent = { G.name = n_or_dyn; attrs = []; tparams = None } in
+      let vdef = { G.vinit = Some v3; vtype = None; vtok = G.no_sc } in
       let def =
         match v2 with
         | Left _teq -> G.VarDef vdef
@@ -459,12 +575,12 @@ and map_object_elem (env : env) (x : CST.object_elem) : G.field =
       (ent, def) |> G.fld
   | `Semg_ellips v1 ->
       let v1 = token env v1 in
-      G.fieldEllipsis v1
+      G.field_ellipsis v1
 
 and map_object_elems (env : env) ((v1, v2, v3) : CST.object_elems) =
   let v1 = map_object_elem env v1 in
   let v2 =
-    List_.map
+    List.map
       (fun (v1, v2) ->
         let _v1 =
           match v1 with
@@ -501,18 +617,18 @@ and map_splat (env : env) (x : CST.splat) =
   | `Attr_splat (v1, v2) ->
       let v1 = (* ".*" *) token env v1 in
       let f1 e =
-        let access = G.FDynamic (G.IdSpecial (G.HashSplat, v1) |> G.e) in
+        let access = G.FDynamic (G.Special (G.HashSplat, v1) |> G.e) in
         G.DotAccess (e, v1, access) |> G.e
       in
-      let v2 = List_.map (map_anon_choice_get_attr_7bbf24f env) v2 in
+      let v2 = List.map (map_anon_choice_get_attr_7bbf24f env) v2 in
       fun e -> v2 |> List.fold_left (fun acc f -> f acc) (f1 e)
   | `Full_splat (v1, v2) ->
       let v1 = (* "[*]" *) token env v1 in
       let f1 e =
-        let access = G.IdSpecial (G.HashSplat, v1) |> G.e in
+        let access = G.Special (G.HashSplat, v1) |> G.e in
         G.ArrayAccess (e, (v1, access, v1)) |> G.e
       in
-      let v2 = List_.map (map_anon_choice_get_attr_7bbf24f env) v2 in
+      let v2 = List.map (map_anon_choice_get_attr_7bbf24f env) v2 in
       fun e -> v2 |> List.fold_left (fun acc f -> f acc) (f1 e)
 
 and map_template_expr (env : env) (x : CST.template_expr) =
@@ -521,7 +637,7 @@ and map_template_expr (env : env) (x : CST.template_expr) =
       let v1 = (* quoted_template_start *) token env v1 in
       let v2 =
         match v2 with
-        | Some xs -> List.concat_map (map_anon_choice_temp_lit_c764a73 env) xs
+        | Some xs -> List.concat_map (map_template_part env) xs
         | None -> []
       in
       let v3 = (* quoted_template_end *) token env v3 in
@@ -531,7 +647,7 @@ and map_template_expr (env : env) (x : CST.template_expr) =
       let v2 = (* heredoc_identifier *) token env v2 in
       let v3 =
         match v3 with
-        | Some xs -> List.concat_map (map_anon_choice_temp_lit_c764a73 env) xs
+        | Some xs -> List.concat_map (map_template_part env) xs
         | None -> []
       in
       let v4 = (* heredoc_identifier *) token env v4 in
@@ -541,7 +657,7 @@ and map_template_expr (env : env) (x : CST.template_expr) =
 and map_tuple_elems (env : env) ((v1, v2, v3) : CST.tuple_elems) : expr list =
   let v1 = map_expression env v1 in
   let v2 =
-    List_.map
+    List.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = map_expression env v2 in
@@ -568,7 +684,7 @@ let map_block_type env v1 : block_type wrap =
 let rec map_block (env : env) ((v1, v2, v3, v4, v5) : CST.block) : block =
   let btype = (* identifier *) map_block_type env v1 in
   let blabels =
-    List_.map
+    List.map
       (fun x ->
         match x with
         | `Str_lit x ->
@@ -589,7 +705,7 @@ let rec map_block (env : env) ((v1, v2, v3, v4, v5) : CST.block) : block =
   { btype; blabels; bbody = (lb, body, rb) }
 
 and map_body (env : env) (xs : CST.body) : block_body_element list =
-  List_.map
+  List.map
     (fun x ->
       match x with
       | `Attr x ->
@@ -630,8 +746,8 @@ let map_config_file (env : env) (x : CST.config_file) : any =
 (*****************************************************************************)
 let parse file =
   H.wrap_parser
-    (fun () -> Tree_sitter_hcl.Parse.file file)
-    (fun cst ->
+    (fun () -> Tree_sitter_hcl.Parse.file !!file)
+    (fun cst _extras ->
       let env = { H.file; conv = H.line_col_to_pos file; extra = () } in
       match map_config_file env cst with
       | Pr xs -> xs
@@ -649,7 +765,7 @@ let parse_expression_or_source_file str =
 let parse_pattern str =
   H.wrap_parser
     (fun () -> parse_expression_or_source_file str)
-    (fun cst ->
-      let file = "<pattern>" in
-      let env = { H.file; conv = Hashtbl.create 0; extra = () } in
+    (fun cst _extras ->
+      let file = Fpath.v "<pattern>" in
+      let env = { H.file; conv = H.line_col_to_pos_pattern str; extra = () } in
       map_config_file env cst)

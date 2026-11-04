@@ -1,20 +1,22 @@
 (*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Details about the Semgrep version for this build.
 
    The Semgrep version string comes from a generated file.
+
+   TODO: merge with Version.ml instead?
 *)
-
-type t = Semver.t
-
-(* we don't have access to Semver code so can't add the deriving there
- * so we need to roll our own boilerplate imitating what
- * a simple [@@deriving show, ord] would do above.
- *)
-let pp fmt x = Format.pp_print_string fmt (Semver.to_string x)
-let compare = Semver.compare
-let show = Semver.to_string
-let to_string = Semver.to_string
-let of_string = Semver.of_string
 
 let version =
   match Semver.of_string Version.version with

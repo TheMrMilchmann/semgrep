@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2023-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 """
 This module provides an object for printing stuff nicely with rich's
 formatting features.
@@ -9,6 +21,8 @@ See also the semgrep.terminal module which is an earlier attempt to
 standardize some output configuration, but is more low level and
 doesn't really offload logic to other libraries.
 """
+import os
+from shutil import get_terminal_size
 from typing import Any
 from typing import Optional
 
@@ -97,7 +111,16 @@ class AutoIndentingConsole(Console):
         super().print(Padding.indent(Group(*args), indent), **kwargs)
 
 
-MAX_WIDTH = 160
-
-console = AutoIndentingConsole(highlighter=None)
-console.width = min(console.width, MAX_WIDTH)
+MAX_WIDTH = 120
+MIN_WIDTH = 40
+terminal_width = get_terminal_size((MAX_WIDTH, 1))[0]
+# We only want to set the dynamic width for real CLI invocations.
+# If we're in our CI tests, "PYTEST_CURRENT_TEST" is set. In which case, let's not care.
+# nosemgrep: no-env-vars-on-top-level
+if "PYTEST_CURRENT_TEST" in os.environ:
+    safe_width = 120
+else:
+    safe_width = (
+        min(MAX_WIDTH, terminal_width) if terminal_width > MIN_WIDTH else MIN_WIDTH
+    )
+console = AutoIndentingConsole(highlighter=None, width=safe_width)

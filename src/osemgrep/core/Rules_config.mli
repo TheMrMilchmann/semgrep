@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* ex: "p/python" *)
 type config_string = string [@@deriving show]
 
@@ -30,6 +42,7 @@ and app_config_kind =
   (* this requires also SEMGREP_REPO_NAME to be set *)
   | Policy
   | SupplyChain
+  | Hooks
 [@@deriving show]
 
 (* the in_docker parameter is useful just for better error reporting *)

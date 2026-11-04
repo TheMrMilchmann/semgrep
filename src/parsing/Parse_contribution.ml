@@ -1,12 +1,41 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+module Out = Semgrep_output_v1_j
+
 (** Collect information about the project contributions from git log. *)
 
+let contrib_to_contrib (contrib : Git_wrapper.contribution) : Out.contribution =
+  let Git_wrapper.
+        {
+          commit_hash;
+          commit_timestamp;
+          commit_author_name;
+          commit_author_email;
+        } =
+    contrib
+  in
+  Out.
+    {
+      commit_hash;
+      commit_timestamp = ATD_string_wrap.Datetime.wrap commit_timestamp;
+      contributor = { commit_author_name; commit_author_email };
+    }
+
 let get_contributions () : Semgrep_output_v1_j.contribution list =
-  (* ugly: this works because get_git_logs() uses a special format string
-   * to output the git log in a JSON format that matches
-   * the definition in semgrep_output_v1.atd contribution type.
-   * We use ~since:"last 30 days" because of our usage policy.
+  (* We use ~since:"last 90 days" because of our usage policy.
    * See https://semgrep.dev/docs/usage-limits
    *)
-  let last_30_days = Common2.today () |> Common2.month_before in
-  Git_wrapper.get_git_logs ~since:(Some last_30_days) ()
-  |> List_.map Semgrep_output_v1_j.contribution_of_string
+  let ninety_days_ago =
+    Datetime_.time_n_days_ago ~days:90 ~time:(Datetime_.now ())
+  in
+  Git_wrapper.logs ~since:ninety_days_ago () |> List.map contrib_to_contrib

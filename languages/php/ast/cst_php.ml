@@ -1,7 +1,7 @@
 (* Yoann Padioleau
  *
  * Copyright (C) 2009-2013 Facebook
- * Copyright (C) 2020 R2C
+ * Copyright (C) 2020 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -852,7 +852,7 @@ type any =
 (* Some constructors *)
 (*****************************************************************************)
 (* TODO: reuse Tok.fake_tok ? *)
-let fakeInfo ?(next_to = None) str = Tok.FakeTok (str, next_to)
+let fakeInfo ?next_to str = Tok.FakeTok (str, next_to)
 
 (*****************************************************************************)
 (* Wrappers *)
@@ -861,14 +861,14 @@ let fakeInfo ?(next_to = None) str = Tok.FakeTok (str, next_to)
 let unwrap = fst
 
 let uncomma xs =
-  List_.map_filter
+  List.filter_map
     (function
       | Either.Left e -> Some e
       | Either.Right _info -> None)
     xs
 
 let uncomma_dots xs =
-  List_.map_filter
+  List.filter_map
     (function
       | Either_.Left3 e -> Some e
       | Either_.Right3 _info
@@ -885,12 +885,12 @@ let unarg arg =
 
 let unargs xs =
   uncomma xs
-  |> Either_.partition_either (function
-       | Arg e -> Left e
-       | ArgRef (_, e)
-       | ArgUnpack (_, e)
-       | ArgLabel (_, _, e) ->
-           Right e)
+  |> Either_.partition (function
+    | Arg e -> Left e
+    | ArgRef (_, e)
+    | ArgUnpack (_, e)
+    | ArgLabel (_, _, e) ->
+        Right e)
 
 let unmodifiers class_vars =
   match class_vars with
@@ -981,8 +981,8 @@ let str_of_name_namespace x =
   | XName xs ->
       xs
       |> List.map (function
-           | QITok _ -> "\\"
-           | QI id -> str_of_ident id)
+        | QITok _ -> "\\"
+        | QI id -> str_of_ident id)
       |> String.concat ""
 
 let name_of_class_name x =

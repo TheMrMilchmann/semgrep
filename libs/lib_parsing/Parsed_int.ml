@@ -35,7 +35,8 @@ open Sexplib.Std
 (* could save consumers of the API from dealing with whether the parsed int
    is representable or not
 *)
-type t = Int64_.t option * Tok.t_always_equal [@@deriving hash, show, eq, sexp]
+type t = Int64_.t option * Tok.t_always_equal
+[@@deriving hash, show, eq, ord, sexp]
 
 (*****************************************************************************)
 (* Helpers *)
@@ -48,12 +49,72 @@ let map f (opt, t) =
   | None -> (opt, t)
   | Some i64 -> (Some (f i64), t)
 
+let is_octal_digit_or_sep = function
+  | '0' .. '7'
+  | '_' ->
+      true
+  | _ -> false
+
+(* OCaml's Int64.of_string_opt accepts underscores between digits (PEP 515 /
+ * Rust style) but not immediately after a radix prefix (e.g. 0x_dead_beef). *)
+let int64_of_literal s =
+  match Int64.of_string_opt s with
+  | Some _ as ok -> ok
+  | None -> (
+      let len = String.length s in
+      if len < 3 || s.[0] <> '0' then None
+      else
+        match s.[1] with
+        | 'x'
+        | 'X'
+        | 'o'
+        | 'O'
+        | 'b'
+        | 'B'
+          when s.[2] = '_' ->
+            let rec skip i =
+              if i < len && Char.equal s.[i] '_' then skip (i + 1) else i
+            in
+            let i = skip 2 in
+            Int64.of_string_opt (Str.first_chars s 2 ^ Str.string_after s i)
+        | _ -> None)
+
 (*****************************************************************************)
 (* Creators *)
 (*****************************************************************************)
 
-let parse (s, t) = (Common2.int64_of_string_opt s, t)
-let parse_c_octal (s, t) = (Common2.int64_of_string_c_octal_opt s, t)
+(* Attempt to parse a possible C octal number i.e 0[0-7]+, otherwise
+ * attempt to parse the num as a non octal.
+ *
+ * An explicit prefix ([0x], [0X], [0b], [0B], [0o], [0O]) is delegated
+ * straight to [int64_of_literal]. Leading-zero-only literals must have an
+ * all-octal (or underscore-separated) tail — anything else, like [078] or
+ * [0.5], returns [None] rather than falling through to the decimal parser.
+ *)
+let c_octal_opt s =
+  let len = String.length s in
+  let has_explicit_prefix =
+    len >= 2
+    && s.[0] = '0'
+    &&
+    match s.[1] with
+    | 'x'
+    | 'X'
+    | 'b'
+    | 'B'
+    | 'o'
+    | 'O' ->
+        true
+    | _ -> false
+  in
+  if has_explicit_prefix then int64_of_literal s
+  else if len > 1 && s.[0] = '0' then
+    if String.for_all is_octal_digit_or_sep s then int64_of_literal ("0o" ^ s)
+    else None
+  else int64_of_literal s
+
+let parse (s, t) = (int64_of_literal s, t)
+let parse_c_octal (s, t) = (c_octal_opt s, t)
 
 let of_float f =
   let iopt =
@@ -66,7 +127,7 @@ let of_int i = Some (Int64.of_int i) |> promote
 let of_int64 i64 = Some i64 |> promote
 
 let of_string_opt s =
-  match Common2.int64_of_string_opt s with
+  match int64_of_literal s with
   | None -> None
   | Some i64 -> Some (Some i64 |> promote)
 

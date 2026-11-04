@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2020 r2c
+ * Copyright (C) 2020 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -13,10 +13,23 @@
  * LICENSE for more details.
  *)
 open Common
-open Ast_json
+open AST_json
 module G = AST_generic
 
+(*****************************************************************************)
+(* Prelude *)
+(*****************************************************************************)
+(* Conversions from JSON ASTs to the generic AST *)
+
+(*****************************************************************************)
+(* Helpers *)
+(*****************************************************************************)
+
 let fb = Tok.unsafe_fake_bracket
+
+(*****************************************************************************)
+(* AST_json.program (= AST_js.expr) -> AST_generic  *)
+(*****************************************************************************)
 
 let parse_json_string json =
   try
@@ -45,35 +58,35 @@ let expr ?(unescape_strings = false) x =
         | Record (lp, xs, rp) ->
             let ys =
               xs
-              |> List_.map (function
-                   | G.F
-                       {
-                         s =
-                           G.DefStmt
-                             ( { G.name = G.EN (G.Id (id, _)); _ },
-                               FieldDefColon { vinit = Some e; _ } );
-                         _;
-                       } ->
-                       Either.Left (id, e)
-                   | G.F { s = ExprStmt ({ e = Ellipsis t; _ }, _); _ } ->
-                       Either.Right t
-                   | x -> failwith (spf "not a JSON field: %s" (G.show_field x)))
+              |> List.map (function
+                | G.F
+                    {
+                      s =
+                        G.DefStmt
+                          ( { G.name = G.EN (G.Id (id, _)); _ },
+                            FieldDefColon { vinit = Some e; _ } );
+                      _;
+                    } ->
+                    Either.Left (id, e)
+                | G.F { s = ExprStmt ({ e = Ellipsis t; _ }, _); _ } ->
+                    Either.Right t
+                | x -> failwith (spf "not a JSON field: %s" (G.show_field x)))
             in
             let zs =
               ys
-              |> List_.map (function
-                   | Either.Left (id, e) ->
-                       let key =
-                         (* we don't want $FLD: 1 to be transformed
-                          * in "$FLD" : 1, which currently would not match
-                          * anything in Semgrep (this may change though) *)
-                         if AST_generic.is_metavar_name (fst id) then
-                           G.N (G.Id (id, G.empty_id_info ())) |> G.e
-                         else G.L (G.String (fb id)) |> G.e
-                       in
-                       G.Container (G.Tuple, Tok.unsafe_fake_bracket [ key; e ])
-                       |> G.e
-                   | Either.Right t -> G.Ellipsis t |> G.e)
+              |> List.map (function
+                | Either.Left (id, e) ->
+                    let key =
+                      (* we don't want $FLD: 1 to be transformed
+                       * in "$FLD" : 1, which currently would not match
+                       * anything in Semgrep (this may change though) *)
+                      if AST_generic.is_metavar_name (fst id) then
+                        G.N (G.Id (id, G.empty_id_info ())) |> G.e
+                      else G.L (G.String (fb id)) |> G.e
+                    in
+                    G.Container (G.Tuple, Tok.unsafe_fake_bracket [ key; e ])
+                    |> G.e
+                | Either.Right t -> G.Ellipsis t |> G.e)
             in
             G.Container (G.Dict, (lp, zs, rp)) |> G.e
         | G.L (G.String (_, (escaped, t), _)) when unescape_strings ->
@@ -111,3 +124,27 @@ let any x =
       in
       G.E
         (G.Container (G.Tuple, Tok.unsafe_fake_bracket [ key; expr v3 ]) |> G.e)
+
+(*****************************************************************************)
+(* AST_json.value  -> AST_generic.expr  *)
+(*****************************************************************************)
+
+let rec value_to_generic (x : value) : G.expr =
+  match x with
+  | Null tok -> G.L (G.Null tok) |> G.e
+  | Bool (b, tok) -> G.L (G.Bool (b, tok)) |> G.e
+  | Number (fopt, tok) -> G.L (G.Float (fopt, tok)) |> G.e
+  (* TODO? apply also the special string treatment above ? *)
+  | String (s, tok) -> G.L (G.String (fb (s, tok))) |> G.e
+  | Array (l, xs, r) ->
+      G.Container (G.Array, (l, List.map value_to_generic xs, r)) |> G.e
+  | Object (l, kvs, r) ->
+      let kvs' =
+        List.map
+          (fun ((k, tok), v) ->
+            let key = G.L (G.String (fb (k, tok))) |> G.e in
+            let value = value_to_generic v in
+            G.Container (G.Tuple, fb [ key; value ]) |> G.e)
+          kvs
+      in
+      G.Container (G.Dict, (l, kvs', r)) |> G.e

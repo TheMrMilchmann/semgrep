@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 """
 Manages system settings for Semgrep
 
@@ -14,6 +26,7 @@ callers should handle this gracefully.
 import os
 import uuid
 from pathlib import Path
+from tempfile import mkstemp
 from typing import Any
 from typing import cast
 from typing import Mapping
@@ -52,20 +65,14 @@ def generate_anonymous_user_id(api_token: Optional[str]) -> str:
     )
 
 
-def generate_default_settings(api_token: Optional[str] = None) -> SettingsSchema:
-    anonymous_user_id = generate_anonymous_user_id(api_token)
-    logged_out_settings: SettingsSchema = {
+def generate_default_settings(env_api_token: Optional[str] = None) -> SettingsSchema:
+    # If the API token is set via an envvar, we still use it to generate the
+    # anonymous user ID, but we do not persist it on disk (so
+    # `SettingsSchema.api_token` remains unset here.)
+    return {
         "has_shown_metrics_notification": False,
-        "anonymous_user_id": anonymous_user_id,
+        "anonymous_user_id": generate_anonymous_user_id(env_api_token),
     }
-    return (
-        {
-            **logged_out_settings,
-            "api_token": api_token,
-        }
-        if api_token is not None
-        else logged_out_settings
-    )
 
 
 @define
@@ -106,13 +113,25 @@ class Settings:
     def __attrs_post_init__(self) -> None:
         self.save()  # in case we retrieved default contents
 
+    # coupling: src/osemgrep/configuring/Semgrep_setting.ml save
     def save(self) -> None:
         try:
             if not self.path.parent.exists():
                 self.path.parent.mkdir(parents=True, exist_ok=True)
 
-            with self.path.open("w") as fd:
-                yaml.dump(self._contents, fd)
+            dir = str(self.path.parent)
+            fd, tmp_path = mkstemp(suffix=".yml", prefix="settings", dir=dir, text=True)
+            with os.fdopen(fd, "w") as f:
+                yaml.dump(self._contents, f)
+
+            # By writing to a guarenteed unique file and then renaming
+            # that file.  The written contents are guarenteed to be
+            # valid. If we write directly to the file, there is a
+            # chance that concurrent instances of the program be
+            # writing to the file at the same time an get race
+            # conditions.
+            os.replace(tmp_path, self.path)
+
         except PermissionError:
             logger.verbose("Could not write settings file at %s", self.path)
 

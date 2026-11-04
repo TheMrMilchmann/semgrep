@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 module Out = Semgrep_output_v1_t
 module Arg = Cmdliner.Arg
 module Cmd = Cmdliner.Cmd
@@ -17,7 +29,16 @@ module H = Cmdliner_
 (* Types and constants *)
 (*****************************************************************************)
 
-type conf = { custom_binary : string option } [@@deriving show]
+type conf = {
+  common : CLI_common.conf;
+  custom_binary : string option;
+  (* the OCaml implementation does not send metrics itself; this is parsed
+   * only so the flag reaches pysemgrep via Pysemgrep.Fallback (see
+   * Install_semgrep_pro_subcommand.ml)
+   *)
+  metrics : Metrics_.config;
+}
+[@@deriving show]
 
 (*************************************************************************)
 (* Command-line flags *)
@@ -31,13 +52,30 @@ let o_custom_binary : string option Term.t =
   in
   Arg.value (Arg.opt Arg.(some string) None info)
 
+let o_metrics : Metrics_.config Term.t =
+  let info =
+    Arg.info [ "metrics" ]
+      ~env:(Cmd.Env.info "SEMGREP_SEND_METRICS")
+      ~doc:
+        {|Configures how usage metrics are sent to the Semgrep server. If
+'auto', metrics are sent only if the user is logged in, which this
+command requires anyway. If 'on', metrics are always sent. If 'off',
+metrics are disabled altogether and not sent. If absent, the
+SEMGREP_SEND_METRICS environment variable value will be used. If no
+environment variable, defaults to 'auto'.
+|}
+  in
+  Arg.value (Arg.opt Metrics_.converter Metrics_.Auto info)
+
 (*************************************************************************)
 (* Turn argv into conf *)
 (*************************************************************************)
 
 let cmdline_term : conf Term.t =
-  let combine _common custom_binary = { custom_binary } in
-  Term.(const combine $ CLI_common.o_common $ o_custom_binary)
+  let combine common custom_binary metrics =
+    { common; custom_binary; metrics }
+  in
+  Term.(const combine $ CLI_common.o_common $ o_custom_binary $ o_metrics)
 
 let doc = "Install the Semgrep Pro Engine"
 
@@ -48,8 +86,8 @@ let man : Cmdliner.Manpage.block list =
       "The binary is installed in the same directory that semgrep-core is \
        installed in.";
     `P
-      {|Must be logged in and have access to Semgrep Pro Engine beta
-Visit https://semgrep.dev/deep-semgrep-beta for more information
+      {|Must be logged in and have access to Semgrep Pro Engine
+Visit https://semgrep.dev/products/pro-engine/ for more information
 |};
   ]
   @ CLI_common.help_page_bottom

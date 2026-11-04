@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2020-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import json
 from pathlib import Path
 from typing import Collection
@@ -10,7 +22,7 @@ from uuid import uuid4
 from attrs import frozen
 
 from semgrep.error import UnknownLanguageError
-from semgrep.rule_lang import Span
+from semgrep.error_location import Span
 from semgrep.types import JsonObject
 
 Mode = NewType("Mode", str)

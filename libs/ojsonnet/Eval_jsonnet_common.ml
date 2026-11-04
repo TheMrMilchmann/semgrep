@@ -16,6 +16,11 @@ open Common
 open Core_jsonnet
 module A = AST_jsonnet
 module V = Value_jsonnet
+module Local_id_map = Value_jsonnet.Local_id_map
+
+let src = Logs.Src.create "ojsonnet.eval"
+
+module Log = (val Logs.src_log src : Logs.LOG)
 
 (*****************************************************************************)
 (* Prelude *)
@@ -56,6 +61,17 @@ let int_to_cmp = function
 let error tk s =
   (* TODO? if Parse_info.is_fake tk ... *)
   raise (Error (s, tk))
+
+(* limit recursion depth so a rule can't hang the evaluator with deep recursion.
+   500 matches upstream Google jsonnet's default --max-stack value.
+ *)
+let max_eval_depth = 500
+
+let check_eval_depth tk depth =
+  if depth > max_eval_depth then
+    error tk
+      (spf "max recursion depth exceeded (%d); jsonnet eval aborted"
+         max_eval_depth)
 
 let fk = Tok.unsafe_fake_tok ""
 
@@ -104,40 +120,41 @@ let short_string_of_value (v : V.t) : string =
 
 let debug_call (env : V.env) (e0 : expr) (l, args, _r) : unit =
   if not env.in_debug_call then
-    Logs.debug (fun m ->
-        let env = { env with in_debug_call = true } in
-        let fstr = str_of_caller e0 in
-        m "%s> %s(%s) at %s"
-          (Common2.repeat "-" env.depth |> String.concat "")
-          fstr
-          (args
-          |> List_.map (fun arg ->
-                 try
-                   match arg with
-                   | Arg e ->
-                       let v = env.eval_expr env e in
-                       short_string_of_value v
-                   | NamedArg (id, _tk, e) ->
-                       let v = env.eval_expr env e in
-                       spf "%s=%s" (fst id) (short_string_of_value v)
-                   (* in theory arguments are evaluated lazily, see
-                    * pass/short_circuit_func.jsonnet, so turning debug
-                    * on which forces the evaluation of all arguments can
-                    * trigger more Error
-                    *)
-                 with
-                 | Error _ -> "<error>")
-          |> String.concat ", ")
-          (Tok.stringpos_of_tok l))
+    let env = { env with in_debug_call = true } in
+
+    let dashes = Common2.repeat "-" env.depth |> String.concat "" in
+    let fstr = str_of_caller e0 in
+    let args =
+      args
+      |> List.map (fun arg ->
+          try
+            match arg with
+            | Arg e ->
+                let v = env.eval_expr env e in
+                short_string_of_value v
+            | NamedArg (id, _tk, e) ->
+                let v = env.eval_expr env e in
+                spf "%s=%s" (fst id) (short_string_of_value v)
+            (* in theory arguments are evaluated lazily, see
+             * pass/short_circuit_func.jsonnet, so turning debug
+             * on which forces the evaluation of all arguments can
+             * trigger more Error
+             *)
+          with
+          | Error _ -> "<error>")
+      |> String.concat ", "
+    in
+    let pos = Tok.stringpos_of_tok l in
+
+    Log.debug (fun m -> m "%s> %s(%s) at %s" dashes fstr args pos)
 
 let debug_ret (env : V.env) (e0 : expr) (_l, _args, _r) (retv : V.t) : unit =
   if not env.in_debug_call then
-    Logs.debug (fun m ->
-        let fstr = str_of_caller e0 in
-        m "%s< %s(...) = %s"
-          (Common2.repeat "-" env.depth |> String.concat "")
-          fstr
-          (short_string_of_value retv))
+    let dashes = Common2.repeat "-" env.depth |> String.concat "" in
+    let fstr = str_of_caller e0 in
+    let v = short_string_of_value retv in
+
+    Log.debug (fun m -> m "%s< %s(...) = %s" dashes fstr v)
 
 (*****************************************************************************)
 (* Call *)
@@ -150,30 +167,33 @@ let eval_call_ (env : V.env) (e0 : expr) (largs, args, _rargs) =
       (* the named_args are supposed to be the last one *)
       let basic_args, named_args =
         args
-        |> Either_.partition_either (function
-             | Arg ei -> Left ei
-             | NamedArg (id, _tk, ei) -> Right (fst id, ei))
+        |> Either_.partition (function
+          | Arg ei -> Left ei
+          | NamedArg (id, _tk, ei) -> Right (fst id, ei))
       in
       (* opti? use a hashtbl? but for < 5 elts, probably worse? *)
-      let hnamed_args = Hashtbl_.hash_of_list named_args in
+      let hnamed_args = Hashtbl_.Base.hash_of_list named_args in
       let basic_args = Array.of_list basic_args in
       let m = Array.length basic_args in
       let binds =
         params
-        |> List_.mapi (fun i (P (id, teq, ei')) ->
-               let ei'' =
-                 match i with
-                 | _ when i < m -> basic_args.(i) (* ei *)
-                 | _ when Hashtbl.mem hnamed_args (fst id) ->
-                     Hashtbl.find hnamed_args (fst id)
-                 | _else_ -> ei'
-               in
-               B (id, teq, ei''))
+        |> List.mapi (fun i (P (id, teq, ei')) ->
+            let ei'' =
+              match i with
+              | _ when i < m -> basic_args.(i) (* ei *)
+              | _ when Base.Hashtbl.mem hnamed_args (fst id) ->
+                  Hashtbl_.Base.find hnamed_args (fst id)
+              | _else_ -> ei'
+            in
+            B (id, teq, ei''))
       in
       let start = env.locals in
-      let locals = Map_.fold (fun k v acc -> Map_.add k v acc) locals start in
-      env.eval_expr
-        { env with depth = env.depth + 1; locals }
+      let locals =
+        Local_id_map.fold (fun k v acc -> Local_id_map.add k v acc) locals start
+      in
+      let depth = env.depth + 1 in
+      check_eval_depth largs depth;
+      env.eval_expr { env with depth; locals }
         (Local (lparams, binds, rparams, eb))
   | v -> error largs (spf "not a function: %s" (sv v))
 
@@ -328,15 +348,15 @@ let eval_std_method_ (env : V.env) (e0 : expr) (method_str, tk) (l, args, r) =
             (* TODO? use Array.to_seqi instead? *)
             eis |> Array.to_list |> List_.index_list
             |> List.filter_map (fun (ei, ji) ->
-                   match
-                     env.eval_std_filter_element { env with locals } tk f ei
-                   with
-                   | Primitive (Bool (false, _)), _ -> None
-                   | Primitive (Bool (true, _)), _ -> Some ji
-                   | v ->
-                       error tk
-                         (spf "filter function must return boolean, got: %s"
-                            (sv (fst v))))
+                match
+                  env.eval_std_filter_element { env with locals } tk f ei
+                with
+                | Primitive (Bool (false, _)), _ -> None
+                | Primitive (Bool (true, _)), _ -> Some ji
+                | v ->
+                    error tk
+                      (spf "filter function must return boolean, got: %s"
+                         (sv (fst v))))
             |> Array.of_list
             |> Array.map (fun idx -> eis.(idx))
           in

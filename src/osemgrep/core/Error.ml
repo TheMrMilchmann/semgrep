@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 module OutJ = Semgrep_output_v1_j
 
 (*****************************************************************************)
@@ -22,7 +34,7 @@ module OutJ = Semgrep_output_v1_j
    See CLI.safe_run()
 *)
 exception Semgrep_error of string * Exit_code.t option
-exception Exit of Exit_code.t
+exception Exit_code of Exit_code.t
 
 (* TOPORT?
    (*
@@ -69,7 +81,7 @@ exception Exit of Exit_code.t
 (*****************************************************************************)
 
 let abort msg = raise (Semgrep_error (msg, None))
-let exit code = raise (Exit code)
+let exit_code_exn code = raise (Exit_code code)
 
 (*****************************************************************************)
 (* string of/registering exns *)
@@ -83,14 +95,12 @@ let () =
           (match opt_exit_code with
           | None -> base_msg
           | Some exit_code ->
-              Printf.sprintf "%s\nExit code %i: %s" base_msg
-                (Exit_code.to_int exit_code)
-                (Exit_code.to_message exit_code))
-    | Exit exit_code ->
+              Printf.sprintf "%s\nExit code %i: %s" base_msg exit_code.code
+                exit_code.description)
+    | Exit_code exit_code ->
         Some
-          (Printf.sprintf "Exit code %i: %s"
-             (Exit_code.to_int exit_code)
-             (Exit_code.to_message exit_code))
+          (Printf.sprintf "Exit code %i: %s" exit_code.code
+             exit_code.description)
     | _ -> None)
 
 (*****************************************************************************)
@@ -112,6 +122,7 @@ let rec string_of_error_type (error_type : OutJ.error_type) : string =
   (* other constructors with arguments *)
   | PatternParseError _ -> string_of_error_type PatternParseError0
   | IncompatibleRule _ -> string_of_error_type IncompatibleRule0
+  | DependencyResolutionError _ -> "Dependency resolution error"
   (* All the other cases don't have arguments in Semgrep_output_v1.atd
    * and have some <json name="..."> annotations to generate the right string
    * so we can mostly just call Out.string_of_error_type (and remove the
@@ -135,7 +146,9 @@ let rec string_of_error_type (error_type : OutJ.error_type) : string =
   | TooManyMatches
   | FatalError
   | Timeout
+  | FixpointTimeout
   | OutOfMemory
+  | StackOverflow
   | TimeoutDuringInterfile
   | OutOfMemoryDuringInterfile ->
       OutJ.string_of_error_type error_type

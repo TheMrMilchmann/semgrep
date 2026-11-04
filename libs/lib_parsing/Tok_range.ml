@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Representation of the location of a piece of code by a pair of tokens.
 
    This is used so far in intermediate, language-specific ASTs.
@@ -81,7 +93,7 @@ let union loc_a (start, end_) =
   extend loc end_
 
 let of_locs locs = List.fold_left union unsafe_fake_loc locs
-let of_list get_loc xs = List_.map get_loc xs |> of_locs
+let of_list get_loc xs = List.map get_loc xs |> of_locs
 
 (* TODO: we should filter with is_origintok() first, to avoid having
  * the caller to do it.

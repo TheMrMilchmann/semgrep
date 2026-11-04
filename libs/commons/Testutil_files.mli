@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Utilities for creating, scanning, and deleting a hierarchy
    of test files.
 
@@ -9,9 +21,10 @@
    of git repositories without interfering with our project's real
    repository (e.g. the tests can create a '.git' folder and '.gitignore'
    files without restrictions). During the execution of a test with
-   'with_tempfiles', the file hierarchy is created in a temporary folder.
+   'with_tempfiles' below, the file hierarchy is created in a temporary folder.
 
    See Unit_gitignore.ml for sample usage.
+   See also Testutil_git.ml in the git_wrapper library.
 *)
 
 (*
@@ -47,7 +60,7 @@ type t =
 
 (* if you prefer a curried syntax to build the tree *)
 
-val file : string (* filename *) -> t
+val file : ?contents:string -> string (* filename *) -> t
 val dir : string (* name *) -> t list -> t
 val symlink : string (* name *) -> string (* dest *) -> t
 
@@ -57,31 +70,66 @@ val symlink : string (* name *) -> string (* dest *) -> t
 val sort : t list -> t list
 
 (*
+   Create files under a temporary root and execute a function in this
+   context. See 'with_tempdir' for the meaning of the options.
+
+   'verbose' prints the list of files.
+*)
+val with_tempfiles :
+  ?chdir:bool ->
+  ?persist:bool ->
+  ?verbose:bool ->
+  t list ->
+  (Fpath.t -> 'a) ->
+  'a
+
+(* Debugging function which can be used inside an alcotest *)
+val print_files : t list -> unit
+
+(*
    Return one path per file or symlink the tree.
    'include_dirs=true' will return the path to the folders as well.
 *)
 val flatten : ?root:Fpath.t -> ?include_dirs:bool -> t list -> Fpath.t list
 
-(*
-   Read the file tree starting from a root folder. Don't follow symlinks.
+val read : Fpath.t -> t
+(**
+   Read the file tree. Don't follow symlinks.
    Fail with an exception if we can't read the files or if they're of an
    exotic kind.
 *)
-val read : Fpath.t -> t list
 
-(*
-   Write a file hierarchy into the given root folder,
+val read_dir : Fpath.t -> t list
+(**
+   Read the file tree starting from a root folder. The result is the list
+   of entries in that folder.
+
+   Don't follow symlinks. Fail with an exception if we can't read the
+   files or if they're of an exotic kind.
+*)
+
+val write : Fpath.t -> t -> unit
+(** Write a file hierarchy into the given root folder, which must
+    already exist. *)
+
+val write_dir : Fpath.t -> t list -> unit
+(**
+   Write a list of files or folders into the given root folder,
    which must already exist.
 *)
-val write : Fpath.t -> t list -> unit
 
-(* Recursive removal (rm -r) *)
-val remove : Fpath.t -> unit
+(* Other utilities independent of 't' but useful in tests working on
+ * file trees.
+ * TODO: move to UFile.mli
+ *)
 
 (* file type predicates *)
 val is_dir : Fpath.t -> bool
 val is_file : Fpath.t -> bool
 val is_symlink : Fpath.t -> bool
+
+(* Recursive removal (rm -r) *)
+val remove : Fpath.t -> unit
 
 (*
    Create a folder specified as a string. This path is parsed. If relative,
@@ -93,29 +141,37 @@ val is_symlink : Fpath.t -> bool
 *)
 val mkdir : ?root:Fpath.t -> Fpath.t -> unit
 
-(* Run a function in a directory, then return to the original directory. *)
-val with_chdir : Fpath.t -> (unit -> 'a) -> 'a
-
-(*
+val with_tempdir : ?persist:bool -> ?chdir:bool -> (Fpath.t -> 'a) -> 'a
+(**
    Create a temporary directory and pass its path to the function to call.
    The folder is automatically deleted upon exit unless 'persist'
-   is true. If 'chdir' is set to true, the current directory is
+   is true. If [chdir] is set to true, the current directory is
    set temporarily to the temporary directory.
  *)
-val with_tempdir : ?persist:bool -> ?chdir:bool -> (Fpath.t -> 'a) -> 'a
 
-(*
-   Create files under a temporary root and execute a function in this
-   context. See 'with_tempdir' for the meaning of the options.
+val with_chdir : Fpath.t -> (unit -> 'a) -> 'a
+(** Run a function in a directory, then return to the original directory. *)
+
+val copy : src:Fpath.t -> dst:Fpath.t -> unit
+(** Copy folders and files recursively.
+    Symbolic links are dereferenced.
+    Files of other types are ignored silently.
+
+    Raise an exception if [dst] already exists or if anything goes wrong.
+
+    TODO: move to Testo
 *)
-val with_tempfiles :
-  ?persist:bool -> ?chdir:bool -> t list -> (Fpath.t -> 'a) -> 'a
 
-(* Debugging function which can be used inside an alcotest *)
-val print_files : t list -> unit
+val with_temp_copy : src:Fpath.t -> (dst:Fpath.t -> 'a) -> 'a
+(** Create a temporary workspace containing a copy of the given folder
+    or file.
+    Files other than regular files, folders, and symlinks are not copied.
+    Symbolic links are dereferenced.
 
-(* Similar to with_tempfiles but internally use print_files
-   and show the output of the 'tree' command for a more
-   output
+    [src] is the source folder or file to copy.
+    The temporary folder will contain a copy of [src] with the same basename.
+    The argument passed to the handler is [dst], the path to the copied
+    folder or file.
+
+    TODO: move to Testo
 *)
-val with_tempfiles_verbose : t list -> (Fpath.t -> 'a) -> 'a

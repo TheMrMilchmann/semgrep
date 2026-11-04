@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2022-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import os
 from dataclasses import dataclass
 from typing import Dict
@@ -33,12 +45,12 @@ class ParsingData:
         for task in plan.target_mappings:
             if not task.analyzer.definition.is_target_language:
                 continue
-            self._file_info[task.path] = (task.analyzer, True)
+            self._file_info[task.path.original.fpath.value] = (task.analyzer, True)
             entry = self._parse_errors_by_lang.get(
                 task.analyzer, LanguageParseData(0, 0, 0, 0)
             )
             try:
-                entry.num_bytes += os.path.getsize(task.path)
+                entry.num_bytes += os.path.getsize(task.path.fpath)
                 entry.num_targets += 1
             except OSError:
                 # Don't count the target if the path doesn't exist
@@ -51,6 +63,8 @@ class ParsingData:
         given error. The file the error originated from should have been
         registered from the original plan with `add_targets`.
         """
+        if not err.location:
+            return
         path = err.location.path.value
         try:
             (lang, no_error_yet) = self._file_info[path]

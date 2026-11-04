@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019, 2020 r2c
+ * Copyright (C) 2019, 2020, 2024 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -30,7 +30,7 @@ module H = AST_generic_helpers
 (*****************************************************************************)
 let id x = x
 let option = Option.map
-let list = List_.map
+let list = List.map
 let string = id
 let bool = id
 
@@ -51,12 +51,15 @@ let mk_var_or_func tlet params tret body =
   | [], G.OtherStmt (G.OS_ExprStmt2, [ G.E { e = G.Lambda def; _ } ]) ->
       G.FuncDef def
   | [], G.OtherStmt (G.OS_ExprStmt2, [ G.E e ]) ->
-      G.VarDef { G.vinit = Some e; vtype = tret }
+      G.VarDef { G.vinit = Some e; vtype = tret; vtok = G.no_sc }
   (* this is useful only for Ellipsis and DeepEllipsis for now, but
    * it could handle more later.
    *)
-  | [], G.ExprStmt (x, _sc) -> G.VarDef { G.vinit = Some x; vtype = tret }
-  | [], _st -> G.VarDef { G.vinit = Some (G.stmt_to_expr body); vtype = tret }
+  | [], G.ExprStmt (x, sc) ->
+      G.VarDef { G.vinit = Some x; vtype = tret; vtok = Some sc }
+  | [], _st ->
+      G.VarDef
+        { G.vinit = Some (G.stmt_to_expr body); vtype = tret; vtok = G.no_sc }
   | _ :: _, _body ->
       G.FuncDef
         {
@@ -70,13 +73,13 @@ let mk_var_or_func tlet params tret body =
 let defs_of_bindings tlet attrs xs =
   xs
   |> list (function
-       | Either.Left (ent, params, tret, body, lattrs) ->
-           let ent = add_attrs ent (attrs @ lattrs) in
-           G.DefStmt (ent, mk_var_or_func tlet params tret body) |> G.s
-       | Either.Right (pat, e) ->
-           (* TODO no attrs *)
-           let exp = G.LetPattern (pat, e) |> G.e in
-           G.exprstmt exp)
+    | Either.Left (ent, params, tret, body, lattrs) ->
+        let ent = add_attrs ent (attrs @ lattrs) in
+        G.DefStmt (ent, mk_var_or_func tlet params tret body) |> G.s
+    | Either.Right (pat, e) ->
+        (* TODO no attrs *)
+        let exp = G.LetPattern (pat, e) |> G.e in
+        G.exprstmt exp)
 
 (*****************************************************************************)
 (* Entry point *)
@@ -130,8 +133,8 @@ and type_kind = function
       let v1 = type_ v1 and v2 = type_ v2 in
       G.TyFun ([ G.Param (G.param_of_type v1) ], v2)
   | TyApp (v1, v2) ->
-      let v1 = list type_ v1 and v2 = name v2 in
-      G.TyApply (G.TyN v2 |> G.t, fb (v1 |> list (fun t -> G.TA t)))
+      let l, v1, r = bracket (list type_) v1 and v2 = name v2 in
+      G.TyApply (G.TyN v2 |> G.t, (l, v1 |> list (fun t -> G.TA t), r))
   | TyTuple v1 ->
       let v1 = list type_ v1 in
       G.TyTuple (fb v1)
@@ -164,7 +167,7 @@ and stmt e : G.stmt =
       let catches =
         v2
         |> list (fun (pat, e) ->
-               (fake "catch", G.CatchPattern pat, G.exprstmt e))
+            (fake "catch", G.CatchPattern pat, G.exprstmt e))
       in
       G.Try (t, v1, catches, None, None) |> G.s
   | While (t, v1, v2) ->
@@ -177,13 +180,13 @@ and stmt e : G.stmt =
       and v4 = expr v4
       and v5 = stmt v5 in
       let ent = G.basic_entity v1 in
-      let var = { G.vinit = Some v2; vtype = None } in
+      let var = { G.vinit = Some v2; vtype = None; vtok = G.no_sc } in
       let n = G.N (G.Id (v1, G.empty_id_info ())) |> G.e in
       let next =
         G.AssignOp (n, (nextop, tok), G.L (G.Int (Some 1L, tok)) |> G.e) |> G.e
       in
       let cond =
-        G.Call (G.IdSpecial (G.Op condop, tok) |> G.e, fb [ G.Arg n; G.Arg v4 ])
+        G.Call (G.Special (G.Op condop, tok) |> G.e, fb [ G.Arg n; G.Arg v4 ])
         |> G.e
       in
       let header =
@@ -199,14 +202,14 @@ and stmt e : G.stmt =
       (* bugfix: I was using 'G.exprstmt e' before, but then a pattern
        * like useless-else as 'if $E then $E1 else ()' will actually
        * match code like 'if foo then 1 else fail ()' because of
-       * the special code in Generic_vs_generic around ExprStmt where
+       * the special code in Pattern_vs_code around ExprStmt where
        * we use m_expr_deep to look deep for (), which in this case
        * will also match 'fail ()'. So better not use ExprStmt and
        * use a separate construct for now.
-       * alt: disable ExprStmt magic for OCaml in Generic_vs_generic.
+       * alt: disable ExprStmt magic for OCaml in Pattern_vs_code.
        *
        * update: there are cases though where we want to generate an
-       * ExprStmt for Ellipsis otherwise Generic_vs_generic will not work.
+       * ExprStmt for Ellipsis otherwise Pattern_vs_code will not work.
        *)
       match e.G.e with
       | G.Ellipsis _
@@ -230,6 +233,14 @@ and option_expr_to_ctor_arguments v =
 
 and expr e =
   match e with
+  | LetOpen (tlet, n, _tin, e) ->
+      let dotted = module_name n in
+      let e = expr e in
+      G.LocalImportAll (G.DottedName dotted, tlet, e) |> G.e
+  | LocalOpen (n, tdot, e) ->
+      let dotted = module_name n in
+      let e = expr e in
+      G.LocalImportAll (G.DottedName dotted, tdot, e) |> G.e
   | Obj { o_tok; o_body } ->
       let cdef =
         G.
@@ -296,7 +307,7 @@ and expr e =
       let v1 = wrap string v1 and v2 = expr v2 in
       G.Call (G.N (G.Id (v1, G.empty_id_info ())) |> G.e, fb [ G.Arg v2 ])
       |> G.e
-  (* todo? convert some v2 in IdSpecial Op? *)
+  (* todo? convert some v2 in Special Op? *)
   | Infix (v1, v2, v3) ->
       let v1 = expr v1 and v3 = expr v3 in
       G.Call
@@ -334,8 +345,11 @@ and expr e =
                    G.basic_field id (Some v2) None
                | _ ->
                    let n = name v1 in
-                   let ent = { G.name = G.EN n; attrs = []; tparams = [] } in
-                   let def = G.VarDef { G.vinit = Some v2; vtype = None } in
+                   let ent = { G.name = G.EN n; attrs = []; tparams = None } in
+                   let def =
+                     G.VarDef
+                       { G.vinit = Some v2; vtype = None; vtok = G.no_sc }
+                   in
                    G.fld (ent, def)))
           v2
       in
@@ -356,6 +370,10 @@ and expr e =
       let v3 = expr v3 in
       let defs = defs_of_bindings tlet [] v2 in
       let st = G.Block (fb (defs @ [ G.exprstmt v3 ])) |> G.s in
+      (* Fix: explicitly set the range on the Block statement to include the
+       * 'let' token and the body expression. Without this, the range starts
+       * from the first binding (missing "let "), which breaks autofix. *)
+      H.set_s_range_with_anys [ G.Tk tlet; G.E v3 ] st;
       let x = G.stmt_to_expr st in
       x.G.e |> G.e
   | Fun (t, v1, v2) ->
@@ -430,6 +448,9 @@ and argument = function
   | ArgQuestion (v1, v2) ->
       let v1 = ident v1 and v2 = expr v2 in
       G.OtherArg (("ArgQuestion", snd v1), [ G.I v1; G.E v2 ])
+  | ArgTodo t ->
+      let t = todo_category t in
+      G.OtherArg (t, [])
 
 and match_case (v1, (v3, _t, v2)) : G.pattern * G.expr =
   let v1 = pattern v1 and v2 = expr v2 and v3 = option expr v3 in
@@ -481,7 +502,7 @@ and pattern = function
       G.PatList v1
   | PatUnderscore v1 ->
       let v1 = tok v1 in
-      G.PatUnderscore v1
+      G.PatWildcard v1
   | PatRecord v1 ->
       let v1 =
         bracket
@@ -567,7 +588,7 @@ and class_field (fld : class_field) : G.field =
       let ent = G.basic_entity id in
       let vinit = option expr inst_expr in
       let vtype = option type_ inst_type in
-      let def = G.{ vinit; vtype } in
+      let def = G.{ vinit; vtype; vtok = G.no_sc } in
       G.fld (ent, G.VarDef def)
   | CfldTodo todok ->
       let st = G.OtherStmt (G.OS_Todo, [ G.TodoK todok ]) |> G.s in
@@ -576,11 +597,11 @@ and class_field (fld : class_field) : G.field =
 and type_declaration x =
   match x with
   | TyDecl { tname; tparams; tbody } ->
-      let v1 = ident tname in
-      let v2 = list type_parameter tparams in
-      let v3 = type_def_kind tbody in
-      let entity = { (G.basic_entity v1) with G.tparams = v2 } in
-      let def = { G.tbody = v3 } in
+      let id = ident tname in
+      let tparams = option (bracket (list type_parameter)) tparams in
+      let tbody = type_def_kind tbody in
+      let entity = { (G.basic_entity id) with G.tparams } in
+      let def = { G.tbody } in
       Either.Left (entity, def)
   | TyDeclTodo categ -> Either.Right categ
 
@@ -607,16 +628,21 @@ and type_def_kind = function
   | RecordType v1 ->
       let v1 =
         bracket
-          (list (fun (v1, v2, v3) ->
-               let v1 = ident v1 and v2 = type_ v2 and v3 = option tok v3 in
+          (list (fun (id, ty, mut_opt) ->
+               let id = ident id
+               and ty = type_ ty
+               and mut_opt = option tok mut_opt in
                let ent =
-                 G.basic_entity v1
+                 G.basic_entity id
                    ~attrs:
-                     (match v3 with
+                     (match mut_opt with
                      | Some tok -> [ G.attr G.Mutable tok ]
                      | None -> [])
                in
-               G.fld (ent, G.FieldDefColon { G.vinit = None; vtype = Some v2 })))
+               G.fld
+                 ( ent,
+                   G.FieldDefColon
+                     { G.vinit = None; vtype = Some ty; vtok = G.no_sc } )))
           v1
       in
       G.AndType v1
@@ -631,7 +657,7 @@ and module_expr = function
       let v1 = dotted_ident_of_name v1 in
       G.ModuleAlias v1
   | ModuleStruct v1 ->
-      let v1 = list item v1 |> List.flatten in
+      let v1 = list item v1 |> List_.flatten in
       G.ModuleStruct (None, v1)
   | ModuleTodo (t, xs) ->
       let t = todo_category t in
@@ -645,11 +671,11 @@ and attribute x =
   | NamedAttr (t1, (dotted, xs), t2) ->
       let args =
         xs
-        |> List_.map_filter (function
-             | { i = TopExpr e; iattrs = [] } ->
-                 let e = expr e in
-                 Some (G.Arg e)
-             | _ -> None)
+        |> List.filter_map (function
+          | { i = TopExpr e; iattrs = [] } ->
+              let e = expr e in
+              Some (G.Arg e)
+          | _ -> None)
       in
       let name = H.name_of_ids dotted in
       G.NamedAttr (t1, name, (t2, args, t2))
@@ -657,8 +683,8 @@ and attribute x =
 and class_binding (c_tok : Tok.t) (binding : class_binding) : G.definition =
   let { c_name; c_tparams; c_params; c_body } = binding in
   let id = ident c_name in
-  let tparams = list type_parameter c_tparams in
-  let ent = G.basic_entity ~tparams id in
+  let tparams = option (bracket (list type_parameter)) c_tparams in
+  let ent = G.basic_entity ?tparams id in
   let cparams = fb (list parameter c_params) in
   let cbody =
     match c_body with
@@ -691,31 +717,31 @@ and item { i; iattrs } =
   | Class (c_tok, xs) ->
       xs
       |> list (fun x ->
-             let def = class_binding c_tok x in
-             G.DefStmt def |> G.s)
+          let def = class_binding c_tok x in
+          G.DefStmt def |> G.s)
   | TopExpr e ->
       let e = expr e in
       [ G.exprstmt e ]
   | Type (_t, v1) ->
       let xs = list type_declaration v1 in
       xs
-      |> List_.map (function
-           | Either.Left (ent, def) ->
-               (* add attrs to all mutual type decls *)
-               let ent = add_attrs ent attrs in
-               G.DefStmt (ent, G.TypeDef def) |> G.s
-           | Either.Right categ ->
-               G.OtherStmt (G.OS_Todo, [ G.TodoK categ ]) |> G.s)
+      |> List.map (function
+        | Either.Left (ent, def) ->
+            (* add attrs to all mutual type decls *)
+            let ent = add_attrs ent attrs in
+            G.DefStmt (ent, G.TypeDef def) |> G.s
+        | Either.Right categ ->
+            G.OtherStmt (G.OS_Todo, [ G.TodoK categ ]) |> G.s)
   | Exception (_t, v1, v2) ->
       let v1 = ident v1 and v2 = list type_ v2 in
       let ent = G.basic_entity v1 ~attrs in
       let def = G.Exception (v1, v2) in
       [ G.DefStmt (ent, G.TypeDef { G.tbody = def }) |> G.s ]
-  | External (t, v1, v2, v3) ->
-      let v1 = ident v1 and v2 = type_ v2 and _v3 = list (wrap string) v3 in
-      let attrs = [ G.KeywordAttr (G.Extern, t) ] @ attrs in
-      let ent = G.basic_entity v1 ~attrs in
-      let def = G.Signature v2 in
+  | External (texternal, v1, v2, v3) ->
+      let id = ident v1 and ty = type_ v2 and _strs = list (wrap string) v3 in
+      let attrs = [ G.KeywordAttr (G.Extern, texternal) ] @ attrs in
+      let ent = G.basic_entity id ~attrs in
+      let def = G.Signature { sig_tok = texternal; sig_type = ty } in
       [ G.DefStmt (ent, def) |> G.s ]
   | Open (t, v1) ->
       let v1 = module_name v1 in
@@ -723,10 +749,10 @@ and item { i; iattrs } =
         { G.d = G.ImportAll (t, G.DottedName v1, fake "*"); d_attrs = attrs }
       in
       [ G.DirectiveStmt dir |> G.s ]
-  | Val (_t, v1, v2) ->
-      let v1 = ident v1 and v2 = type_ v2 in
-      let ent = G.basic_entity v1 ~attrs in
-      let def = G.Signature v2 in
+  | Val (tval, v1, v2) ->
+      let id = ident v1 and ty = type_ v2 in
+      let ent = G.basic_entity id ~attrs in
+      let def = G.Signature { sig_tok = tval; sig_type = ty } in
       [ G.DefStmt (ent, def) |> G.s ]
   | Let (tlet, v1, v2) ->
       let _v1 = rec_opt v1 and v2 = list let_binding v2 in
@@ -738,13 +764,13 @@ and item { i; iattrs } =
       [ G.DefStmt (ent, G.ModuleDef def) |> G.s ]
   | ItemTodo (t, xs) ->
       let t = todo_category t in
-      let xs = list item xs |> List.flatten in
+      let xs = list item xs |> List_.flatten in
       [
         G.OtherStmt
           ( G.OS_Todo,
             [ G.TodoK t ]
-            @ List_.map (fun x -> G.S x) xs
-            @ List_.map (fun x -> G.At x) attrs )
+            @ List.map (fun x -> G.S x) xs
+            @ List.map (fun x -> G.At x) attrs )
         |> G.s;
       ]
 

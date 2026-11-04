@@ -1,6 +1,6 @@
 (* Nat Mote
  *
- * Copyright (C) 2019-2022 r2c
+ * Copyright (C) 2019-2022 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -12,12 +12,9 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
-
 open Common
 open AST_generic
 module MV = Metavariable
-
-let ( let/ ) = Result.bind
 
 (*****************************************************************************)
 (* Prelude *)
@@ -41,10 +38,10 @@ let ( let/ ) = Result.bind
 (* This lets us avoid the polymorphic hash function and polymorphic equality,
  * which will take into account extraneous information such as e_range, leading
  * to failed lookups. *)
-module ASTTable = Hashtbl.Make (struct
+module ASTTable = Stdlib.Hashtbl.Make (struct
   type t = AST_generic.any
 
-  let equal = AST_generic_equals.with_structural_equal AST_generic.equal_any
+  let equal = AST_generic.equal_any
   let hash = AST_generic.hash_any
 end)
 
@@ -68,6 +65,10 @@ module JsTsPrinter = Hybrid_print.Make (struct
   class printer = Ugly_print_AST.jsts_printer
 end)
 
+module OCamlPrinter = Hybrid_print.Make (struct
+  class printer = Ugly_print_AST.ocaml_printer
+end)
+
 let get_printer lang external_printer :
     (Ugly_print_AST.printer_t, string) result =
   match lang with
@@ -78,12 +79,13 @@ let get_printer lang external_printer :
   | Lang.Js
   | Lang.Ts ->
       Ok (new JsTsPrinter.printer external_printer)
+  | Lang.Ocaml -> Ok (new OCamlPrinter.printer external_printer)
   | __else__ -> Error (spf "No printer available for %s" (Lang.to_string lang))
 
 let original_source_of_ast source any =
   let* start, end_ = AST_generic_helpers.range_of_any_opt any in
-  let starti = start.Tok.pos.bytepos in
-  let _, _, endi = Tok.end_pos_of_loc end_ in
+  let starti = start.Loc.pos.bytepos in
+  let _, _, endi = Loc.end_pos end_ in
   let len = endi - starti in
   let str = String.sub source starti len in
   Some str
@@ -96,7 +98,7 @@ let mvalue_to_any = function
    * something else, it gets missed.
    *
    * Concretely, in the pattern `foo.$F()`, `$F` is not its own expression.
-   * *)
+   *)
   | MV.Id (id, _) -> I id
   | other -> MV.mvalue_to_any other
 
@@ -120,7 +122,7 @@ let add_metavars (tbl : ast_node_table) metavars =
        * We don't need to recurse any deeper, because individual list items are
        * the smallest components of a metavariable value that will be lifted
        * into the resulting AST.
-       * *)
+       *)
       match mval with
       | MV.Args args ->
           List.iter (fun arg -> ASTTable.replace tbl (Ar arg) Target) args
@@ -136,7 +138,8 @@ let add_metavars (tbl : ast_node_table) metavars =
       | Ss _
       | Params _
       | Xmls _
-      | Text _ ->
+      | Text _
+      | Any _ ->
           ())
     metavars
 
@@ -150,23 +153,23 @@ let add_metavars (tbl : ast_node_table) metavars =
  * will not be equal to the original node when we look it up during printing,
  * and therefore we won't get a hashtbl hit, and so we won't use the text for
  * the original node.
- * *)
-let add_fix_pattern_ast_nodes (tbl : ast_node_table) ast =
+ *)
+let add_fix_pattern_ast_nodes =
   let visitor =
     object
       inherit [_] AST_generic.iter_no_id_info as super
 
-      method! visit_argument env arg =
+      method! visit_argument tbl arg =
         ASTTable.replace tbl (Ar arg) FixPattern;
-        super#visit_argument env arg
+        super#visit_argument tbl arg
 
-      method! visit_expr env e =
+      method! visit_expr tbl e =
         ASTTable.replace tbl (E e) FixPattern;
-        super#visit_expr env e
+        super#visit_expr tbl e
       (* TODO visit every node that is part of AST_generic.any *)
     end
   in
-  visitor#visit_any () ast
+  fun (tbl : ast_node_table) ast -> visitor#visit_any tbl ast
 
 let make_external_printer ~metavars ~target_contents ~fix_pattern_ast
     ~fix_pattern : AST_generic.any -> (Immutable_buffer.t, string) result =
@@ -182,8 +185,8 @@ let make_external_printer ~metavars ~target_contents ~fix_pattern_ast
     in
     let/ str =
       (match node with
-      | Target -> original_source_of_ast (Lazy.force target_contents) any
-      | FixPattern -> original_source_of_ast fix_pattern any)
+        | Target -> original_source_of_ast (Lazy_safe.force target_contents) any
+        | FixPattern -> original_source_of_ast fix_pattern any)
       |> Option.to_result
            ~none:"Failed to extract original text for AST node during printing"
     in

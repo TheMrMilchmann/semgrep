@@ -1,6 +1,18 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 open Common
 open Fpath_.Operators
-module OutJ = Semgrep_output_v1_j
+module Out = Semgrep_output_v1_j
 
 (*****************************************************************************)
 (* Prelude *)
@@ -28,7 +40,7 @@ module OutJ = Semgrep_output_v1_j
 (*****************************************************************************)
 (* LATER: we should get rid of those intermediate Out.core_xxx *)
 
-let core_location_to_error_span (loc : OutJ.location) : OutJ.error_span =
+let core_location_to_error_span (loc : Out.location) : Out.error_span =
   {
     file = loc.path;
     start = loc.start;
@@ -42,9 +54,8 @@ let core_location_to_error_span (loc : OutJ.location) : OutJ.error_span =
   }
 
 (* Generate error message exposed to user *)
-let error_message ~rule_id ~(location : OutJ.location)
-    ~(error_type : OutJ.error_type) ~core_message : string =
-  let path = location.path in
+let error_message ~rule_id ~(location : Out.location option)
+    ~(error_type : Out.error_type) ~core_message : string =
   let rule_id_str_opt = Option.map Rule_ID.to_string rule_id in
   let error_context =
     match (rule_id_str_opt, error_type) with
@@ -56,16 +67,29 @@ let error_message ~rule_id ~(location : OutJ.location)
         | InvalidYaml | MatchingError | SemgrepMatchFound | TooManyMatches
         | FatalError | Timeout | OutOfMemory | TimeoutDuringInterfile
         | OutOfMemoryDuringInterfile ) ) ->
-        spf "when running %s on %s" id !!path
+        let suffix =
+          match location with
+          | None -> ""
+          | Some loc -> spf " on %s" !!(loc.path)
+        in
+        spf "when running %s%s" id suffix
     | Some id, IncompatibleRule _ -> id
     | Some id, MissingPlugin -> spf "for rule %s" id
-    | _ -> spf "at line %s:%d" !!path location.start.line
+    | _ -> (
+        match location with
+        | None -> ""
+        | Some loc -> spf "at line %s:%d" !!(loc.path) loc.start.line)
   in
+  (* TODO: this error message can be ugly. It shouldn't contain special
+     formatting such as significant newlines and indentation. It should
+     also not print the JSON constructor because most of them are not
+     English text. Revise this once all the CLI text output is migrated
+     to OCaml. *)
   spf "%s %s:\n %s"
     (Error.string_of_error_type error_type)
     error_context core_message
 
-let error_spans ~(error_type : OutJ.error_type) ~(location : OutJ.location) =
+let error_spans ~(error_type : Out.error_type) ~(location : Out.location) =
   match error_type with
   | PatternParseError _yaml_pathTODO ->
       (* TOPORT
@@ -89,48 +113,52 @@ let error_spans ~(error_type : OutJ.error_type) ~(location : OutJ.location) =
         }
       in
       Some [ span ]
-  | PartialParsing locs -> Some (locs |> List_.map core_location_to_error_span)
+  | PartialParsing locs -> Some (locs |> List.map core_location_to_error_span)
   | _else_ -> None
 
 (* # TODO benchmarking code relies on error code value right now
-   * # See https://semgrep.dev/docs/cli-usage/ for meaning of codes
-*)
-let exit_code_of_error_type (error_type : OutJ.error_type) : Exit_code.t =
+ * # See https://semgrep.dev/docs/cli-usage/ for meaning of codes
+ *)
+let exit_code_of_error_type (error_type : Out.error_type) : Exit_code.t =
   match error_type with
   | ParseError
   | LexicalError
   | PartialParsing _ ->
-      Exit_code.invalid_code
+      Exit_code.invalid_code ~__LOC__
+  (* rule errors lead to `missing_config` *)
+  | InvalidYaml -> Exit_code.missing_config ~__LOC__
   | OtherParseError
   | AstBuilderError
   | RuleParseError
   | PatternParseError _
   | PatternParseError0
-  | InvalidYaml
   | MatchingError
   | SemgrepMatchFound
   | TooManyMatches
   | FatalError
   | Timeout
+  | FixpointTimeout
   | OutOfMemory
+  | StackOverflow
   | TimeoutDuringInterfile
   | OutOfMemoryDuringInterfile
   (* TODO? really? fatal for SemgrepWarning? *)
   | SemgrepWarning
   | SemgrepError ->
-      Exit_code.fatal
-  | InvalidRuleSchemaError -> Exit_code.invalid_pattern
-  | UnknownLanguageError -> Exit_code.invalid_language
+      Exit_code.fatal ~__LOC__
+  | InvalidRuleSchemaError -> Exit_code.invalid_pattern ~__LOC__
+  | UnknownLanguageError -> Exit_code.invalid_language ~__LOC__
   | IncompatibleRule _
   | IncompatibleRule0
-  | MissingPlugin ->
-      Exit_code.ok
+  | MissingPlugin
+  | DependencyResolutionError _ ->
+      Exit_code.ok ~__LOC__
 
 (* Skipping the intermediate python SemgrepCoreError for now.
  * TODO: should we return an Error.Semgrep_core_error instead? like we
  * do in python? and then generate an Out.cli_error out of it?
  *)
-let cli_error_of_core_error (x : OutJ.core_error) : OutJ.cli_error =
+let cli_error_of_core_error (x : Out.core_error) : Out.cli_error =
   match x with
   | {
    error_type;
@@ -163,12 +191,15 @@ let cli_error_of_core_error (x : OutJ.core_error) : OutJ.cli_error =
         | TooManyMatches
         | FatalError
         | Timeout
+        | FixpointTimeout
         | OutOfMemory
+        | StackOverflow
         | TimeoutDuringInterfile
         | OutOfMemoryDuringInterfile
         | IncompatibleRule _
         | IncompatibleRule0
-        | MissingPlugin ->
+        | MissingPlugin
+        | DependencyResolutionError _ ->
             rule_id
       in
       let path =
@@ -191,20 +222,26 @@ let cli_error_of_core_error (x : OutJ.core_error) : OutJ.cli_error =
         | TooManyMatches
         | FatalError
         | Timeout
+        | FixpointTimeout
         | OutOfMemory
+        | StackOverflow
         | TimeoutDuringInterfile
         | OutOfMemoryDuringInterfile
         | SemgrepWarning
         | SemgrepError
         | IncompatibleRule _
         | IncompatibleRule0
-        | MissingPlugin ->
-            Some location.path
+        | MissingPlugin
+        | DependencyResolutionError _ ->
+            location |> Option.map (fun (x : Out.location) -> x.path)
       in
       let message =
         Some (error_message ~rule_id ~error_type ~location ~core_message)
       in
-      let spans = error_spans ~error_type ~location in
+      let spans =
+        let* location = location in
+        error_spans ~error_type ~location
+      in
       {
         (* LATER? seems to be either 2 (fatal) or 3 (invalid_code), so maybe
          * better to change the ATD spec and use a variant for cli_error.code
@@ -227,67 +264,16 @@ let cli_error_of_core_error (x : OutJ.core_error) : OutJ.cli_error =
 (*****************************************************************************)
 (* LATER: we should get rid of those intermediate Out.core_xxx *)
 
-(* This is a cursed function that calculates everything but the index part
- * of the match_based_id. It's cursed because we need hashes to be exactly
- * the same, but the algorithm used on the python side to generate
- * the final string thats hashed has some python specific quirks.
- *
- * The way match based ID is calculated on the python side
- * is as follows:
- * (see https://github.com/returntocorp/semgrep/blob/2d34ce584d16c4e954349690a5f12fae877a94d6/cli/src/semgrep/rule.py#L289-L334)
- * 1. Sort all top level keys (i.e pattern, patterns etc.) alphabetically
- * 2. For each key: DFS the tree and find all pattern values (i.e. the rhs of pattern: <THING>)
- * 3. Sort all pattern values alphabetically and concatenate them with a space
- * 4. Concatenate all the sorted pattern values with a space
- * 5. Hash the tuple `(sorted_pattern_values, path, rule_id)` w/ blake2b
- * 6. Append the index of the match in the list of matches for the rule (see [index_match_based_ids])
- *
- * Austin: I wrote the initial match based ID, and this one below is a port of it.
- * Looking back it seems like I ended up writing a roundabout version of the below algorithm
- * which is how this function works
- * 1. Same as before
- * 2. for each rule: get all xpatterns, then sort them, and concatenate them with a space
- * 3. Sort all of step 2 results alphabetically and concatenate them with a space
- * 4. Same as step 5 and 6
- *
- * Assumptions:
- * Somewhere it seems that all keys are already sorted alphabetically when the rule is parsed.
- * I have not seen this code. I simply have faith that it is true and this will not change.
- *
- * I'm also hoping that [interpolate_metavariables] works similar to what we do on the python side
- *
- * I have not tested this code beyond checking a bunch of examples manually.
- *
- * There's some weird thing we do w/ join mode. I am hoping that this doesn't matter irl
- *)
-let match_based_id_partial (rule : Rule.t) (rule_id : Rule_ID.t) metavars path :
-    string =
-  let xpats = Rule.xpatterns_of_rule rule in
-  let xpat_strs =
-    xpats |> List_.map (fun (xpat : Xpattern.t) -> fst xpat.pstr)
+let make_fixed_lines fixes_env fix path (start : Out.position)
+    (end_ : Out.position) =
+  let edit =
+    Textedit.
+      { path; start = start.offset; end_ = end_.offset; replacement_text = fix }
   in
-  let sorted_xpat_strs = List.sort String.compare xpat_strs in
-  let xpat_str = String.concat " " sorted_xpat_strs in
-  let metavars = Option.value ~default:[] metavars in
-  let xpat_str_interp =
-    Metavar_replacement.interpolate_metavars xpat_str
-      (Metavar_replacement.of_out metavars)
-    |> String.escaped
-  in
-  (* Python doesn't escape the double quote character, but ocaml does :/ so we need this monstrosity *)
-  let py_esc_reg = Str.regexp "\\\\\\\"" in
-  let xpat_str_interp = Str.global_replace py_esc_reg "\"" xpat_str_interp in
-  (* We have been hashing w/ this PosixPath thing in python so we must recreate it here  *)
-  (* We also have been hashing a tuple formatted as below *)
-  let string =
-    spf "('%s', PosixPath('%s'), '%s')" xpat_str_interp path
-      (Rule_ID.to_string rule_id)
-  in
-  let hash = Digestif.BLAKE2B.digest_string string |> Digestif.BLAKE2B.to_hex in
-  hash
+  Fixed_lines.make_fixed_lines fixes_env edit
 
-let cli_match_of_core_match (hrules : Rule.hrules) (m : OutJ.core_match) :
-    OutJ.cli_match =
+let cli_match_of_core_match ~fips_mode (fixed_env_opt : Fixed_lines.env option)
+    (rule : Rule.t) (m : Out.core_match) : Out.cli_match =
   match m with
   | {
    check_id = rule_id;
@@ -303,15 +289,13 @@ let cli_match_of_core_match (hrules : Rule.hrules) (m : OutJ.core_match) :
        engine_kind;
        extra_extra;
        validation_state;
+       historical_info;
        fix;
        is_ignored;
        dataflow_trace;
+       sca_match;
      };
   } ->
-      let rule =
-        try Hashtbl.find hrules rule_id with
-        | Not_found -> raise Impossible
-      in
       let rule_message = rule.message in
       let message =
         match message with
@@ -322,24 +306,45 @@ let cli_match_of_core_match (hrules : Rule.hrules) (m : OutJ.core_match) :
       in
       let check_id = rule_id in
       let metavars = Some metavars in
+      let metadata =
+        match metadata with
+        | None -> `Assoc []
+        | Some json -> json
+      in
+      let module Fingerprint_hash =
+        (val if fips_mode then (module Digestif.SHA256)
+             else (module Digestif.BLAKE2B)
+            : Digestif.S)
+      in
       (* LATER: this should be a variant in semgrep_output_v1.atd
        * and merged with Constants.rule_severity
        *)
       let severity = severity ||| rule.severity in
-      let metadata =
-        match rule.metadata with
-        | None -> `Assoc []
-        | Some json -> (
-            JSON.to_yojson json |> fun rule_metadata ->
-            match metadata with
-            | Some metadata -> JSON.update rule_metadata metadata
-            | None -> rule_metadata)
+      let fixed_lines =
+        match (fix, fixed_env_opt) with
+        | None, _
+        | _, None ->
+            None
+        | Some fix, Some fixed_env ->
+            make_fixed_lines fixed_env fix path start end_
       in
-      (* TODO? at this point why not using content_of_file_at_range since
-       * we concatenate the lines after? *)
+      (* Can't use content_of_file_at_range because we want to include the
+       * entirety of every line involved in the match, not just the text that
+       * matched. *)
       let lines =
-        Semgrep_output_utils.lines_of_file_at_range (start, end_) path
-        |> String.concat "\n"
+        match
+          Semgrep_output_utils.lines_of_file_at_range (start, end_) path
+        with
+        | Ok xs -> xs |> String.concat "\n"
+        | Error err ->
+            Logs.warn (fun m ->
+                m
+                  "error on accessing lines of %s; match was with rule %s; \
+                   skipping lines field for this match (error was %s)"
+                  !!path
+                  (Rule_ID.to_string rule_id)
+                  err);
+            ""
       in
       {
         check_id;
@@ -356,36 +361,20 @@ let cli_match_of_core_match (hrules : Rule.hrules) (m : OutJ.core_match) :
             metadata;
             fix;
             is_ignored = Some is_ignored;
-            (* TODO: extra fields *)
-            fingerprint = match_based_id_partial rule rule_id metavars !!path;
-            sca_info = None;
-            fixed_lines = None;
+            fingerprint =
+              Semgrep_hashing_functions.match_based_id_partial
+                (module Fingerprint_hash)
+                rule rule_id metavars !!path;
+            sca_info = sca_match;
+            fixed_lines;
             dataflow_trace;
-            (* It's optional in the CLI output, but not in the core match results!
-             *)
+            (* It's optional in the CLI output, but not in core match results!*)
             engine_kind = Some engine_kind;
             validation_state;
+            historical_info;
             extra_extra;
           };
       }
-
-(*
- # Sort results so as to guarantee the same results across different
- # runs. Results may arrive in a different order due to parallelism
- # (-j option).
- TOPORT: return {rule: sorted(matches) for rule, matches in findings.items()}
-*)
-let dedup_and_sort (xs : OutJ.cli_match list) : OutJ.cli_match list =
-  let seen = Hashtbl.create 101 in
-  xs
-  |> List.filter (fun x ->
-         if Hashtbl.mem seen x then false
-         else
-           (* TOPORT: use rule_match.cli_unique_key to dedup (not the whole x) *)
-           let key = x in
-           Hashtbl.replace seen key true;
-           true)
-  |> Semgrep_output_utils.sort_cli_matches
 
 (* This is the same algorithm for indexing as in pysemgrep. We shouldn't need to update this *)
 (* match based ids have an index appended at the end which indicates what
@@ -399,52 +388,152 @@ bad_function() # 2nd call
  * will be different. So the first will be <match_based_id>_0 and the second
  * will be <match_based_id>_1.
  *)
-let index_match_based_ids (matches : OutJ.cli_match list) : OutJ.cli_match list
-    =
+let index_match_based_ids (matches : Out.cli_match list) : Out.cli_match list =
   matches
   (* preserve order *)
-  |> List_.mapi (fun i x -> (i, x))
+  |> List.mapi (fun i x -> (i, x))
   (* Group by rule and path *)
-  |> Assoc.group_by (fun (_, (x : OutJ.cli_match)) -> (x.path, x.check_id))
+  (* XXX: can we do with grouping by fingerprint only? *)
+  |> Assoc.group_by (fun (_, (x : Out.cli_match)) ->
+      (x.path, x.check_id, x.extra.fingerprint))
   (* Sort by start line *)
-  |> List_.map (fun (path_and_rule_id, matches) ->
-         ( path_and_rule_id,
-           List.sort
-             (fun (_, (a : OutJ.cli_match)) (_, (b : OutJ.cli_match)) ->
-               compare a.start.offset b.start.offset)
-             matches ))
+  |> List.map (fun (path_and_rule_id, matches) ->
+      ( path_and_rule_id,
+        List.sort
+          (fun (_, (a : Out.cli_match)) (_, (b : Out.cli_match)) ->
+            compare a.start.offset b.start.offset)
+          matches ))
   (* Index per file *)
-  |> List_.map (fun (path_and_rule_id, matches) ->
-         let matches =
-           List_.mapi
-             (fun i (i', (x : OutJ.cli_match)) ->
-               ( i',
-                 {
-                   x with
-                   extra =
-                     {
-                       x.extra with
-                       fingerprint = spf "%s_%d" x.extra.fingerprint i;
-                     };
-                 } ))
-             matches
-         in
-         (path_and_rule_id, matches))
+  |> List.map (fun (path_and_rule_id, matches) ->
+      let matches =
+        List.mapi
+          (fun i (i', (x : Out.cli_match)) ->
+            ( i',
+              {
+                x with
+                extra =
+                  {
+                    x.extra with
+                    fingerprint = spf "%s_%d" x.extra.fingerprint i;
+                  };
+              } ))
+          matches
+      in
+      (path_and_rule_id, matches))
   (* Flatten *)
   |> List.concat_map snd
   |> List.sort (fun (a, _) (b, _) -> a - b)
-  |> List_.map snd
+  |> List.map snd
 
 (*****************************************************************************)
-(* Entry point *)
+(* Gated logged-in fields *)
 (*****************************************************************************)
 
-(* The 3 parameters are mostly Core_runner.result but we don't want
- * to depend on cli_scan/ from reporting/ here, hence the duplication.
- * alt: we could move Core_runner.result type in core/
+(* coupling: if you modify which fields are gated by ctx.is_logged_in update also
+ * https://semgrep.dev/docs/semgrep-appsec-platform/json-and-sarif#json
+ * alt: move in Gated_data.ml
  *)
-let cli_output_of_core_results ~logging_level (core : OutJ.core_output)
-    (hrules : Rule.hrules) (scanned : Fpath.t Set_.t) : OutJ.cli_output =
+let adjust_fields_cli_output_logged_out (x : Out.cli_output) : Out.cli_output =
+  (* note: I could use { x with ... } but better to explicitely list the fields
+   * here so we see explicitely what we filter and what we do not.
+   *)
+  let {
+    version;
+    results;
+    errors;
+    paths;
+    skipped_rules;
+    explanations;
+    interfile_languages_used = _;
+    time;
+    rules_by_engine;
+    engine_requested;
+    subprojects = _;
+    mcp_scan_results = _;
+    profiling_results;
+  } : Out.cli_output =
+    x
+  in
+  let interfile_languages_used = None in
+  let results =
+    results
+    |> List.map (fun (res : Out.cli_match) : Out.cli_match ->
+        let { check_id; extra; path; start; end_ } : Out.cli_match = res in
+        let {
+          metavars = _;
+          message;
+          fix;
+          fixed_lines;
+          metadata;
+          severity;
+          fingerprint = _;
+          lines = _;
+          is_ignored = _;
+          sca_info;
+          dataflow_trace = _;
+          engine_kind;
+          validation_state;
+          historical_info;
+          extra_extra;
+        } : Out.cli_match_extra =
+          extra
+        in
+        let metadata =
+          match metadata with
+          | `Assoc xs ->
+              let xs =
+                xs
+                |> List_.exclude (fun (fld, _v) ->
+                    List.mem fld [ "semgrep.dev"; "semgrep.policy" ])
+              in
+              `Assoc xs
+          | _else_ -> metadata
+        in
+
+        let extra : Out.cli_match_extra =
+          {
+            metavars = None;
+            message;
+            fix;
+            fixed_lines;
+            metadata;
+            severity;
+            fingerprint = Gated_data.msg;
+            lines = Gated_data.msg;
+            is_ignored = None;
+            sca_info;
+            dataflow_trace = None;
+            engine_kind;
+            validation_state;
+            historical_info;
+            extra_extra;
+          }
+        in
+        { check_id; extra; path; start; end_ })
+  in
+  {
+    version;
+    results;
+    errors;
+    paths;
+    skipped_rules;
+    explanations;
+    interfile_languages_used;
+    time;
+    rules_by_engine;
+    engine_requested;
+    subprojects = None;
+    mcp_scan_results = None;
+    profiling_results;
+  }
+
+(*****************************************************************************)
+(* Cli_output builder *)
+(*****************************************************************************)
+
+(* The core/hrules/scanned params are essentially Core_runner.result *)
+let cli_output_of_runner_result ~fips_mode ~fixed_lines (core : Out.core_output)
+    (hrules : Rule.hrules) (scanned : Fpath_.Fpath_set.t) : Out.cli_output =
   match core with
   | {
    version;
@@ -458,46 +547,46 @@ let cli_output_of_core_results ~logging_level (core : OutJ.core_output)
      };
    skipped_rules;
    explanations;
-   (* LATER *)
-   time = _;
-   rules_by_engine = _;
-   engine_requested = _;
+   engine_requested;
    interfile_languages_used;
+   time;
+   (* LATER *)
+   rules_by_engine = _;
+   (* We deliberately choose not to embed the symbol analysis into the CLI
+      output, as it is conceivably quite large and irrelevant information
+      for the actual Semgrep scan.
+   *)
+   symbol_analysis = _;
+   subprojects = _;
+   mcp_scan_results = _;
+   profiling_results;
   } ->
       (* TODO: not sure how it's sorted. Look at rule_match.py keys? *)
       let matches =
         matches
-        |> List.sort (fun (a : OutJ.core_match) (b : OutJ.core_match) ->
-               compare a.check_id b.check_id)
+        |> List.sort (fun (a : Out.core_match) (b : Out.core_match) ->
+            compare a.check_id b.check_id)
       in
-      (* TODO: not sure how it's sorted, but Set_.elements return
-       * elements in OCaml compare order (=~ lexicographic for strings)
-       * python: scanned=[str(path) for path in sorted(self.all_targets)]
+      (* Sorted via Fpath.compare.
+       * python: scanned=[str(path) for path in sorted(self.all_targets)] *)
+      let scanned = scanned |> Fpath_.Fpath_set.elements in
+      (* Skipping the python intermediate FileTargetingLog for now.
+       * We used to have a cli_skipped_target and core_skipped_target type,
+       * but now they are merged so this function is the identity.
+       * In theory we could remove the details: and rule_id: from it
+       * because they used to not be included in the final JSON output
+       * (but the info was used in the text output to display skipping
+       * information).
+       *
+       * Still? skipped targets are coming from the FileIgnoreLog which is
+       * populated from many places in the code.
+       * Still? see _make_failed_to_analyze() in output.py,
+       * core_failure_lines_by_file in target_manager.py
+       * Still? need to sort
        *)
-      let scanned = scanned |> Set_.elements in
-      let (paths : OutJ.scanned_and_skipped) =
-        match logging_level with
-        | Some (Logs.Info | Logs.Debug) ->
-            (* Skipping the python intermediate FileTargetingLog for now.
-             * We used to have a cli_skipped_target and core_skipped_target type,
-             * but now they are merged so this function is the identity.
-             * In theory we could remove the details: and rule_id: from it
-             * because they used to not be included in the final JSON output
-             * (but the info was used in the text output to display skipping
-             * information).
-             *
-             * Still? skipped targets are coming from the FileIgnoreLog which is
-             * populated from many places in the code.
-             * Still? see _make_failed_to_analyze() in output.py,
-             * core_failure_lines_by_file in target_manager.py
-             * Still? need to sort
-             *)
-            { scanned; skipped }
-        | _else_ -> { scanned; skipped = None }
-      in
+      let (paths : Out.scanned_and_skipped) = { scanned; skipped } in
       let skipped_rules =
         (* TODO: return skipped_rules with --develop
-
            if maturity = Develop then
              invalid_rules
            else
@@ -506,22 +595,42 @@ let cli_output_of_core_results ~logging_level (core : OutJ.core_output)
         ignore skipped_rules;
         []
       in
+      let fixed_env_opt =
+        if fixed_lines then Some (Fixed_lines.mk_env ()) else None
+      in
       {
-        version;
-        (* Skipping the python intermediate RuleMatchMap for now.
-         * TODO: handle the rule_match.cli_unique_key to dedup matches
-         *)
+        version = Some version;
+        (* Skipping the python intermediate RuleMatchMap for now *)
         results =
           matches
-          |> List_.map (cli_match_of_core_match hrules)
-          |> dedup_and_sort;
-        errors = errors |> List_.map cli_error_of_core_error;
+          |> List.map (fun (cm : Out.core_match) ->
+              let rule =
+                try Hashtbl_.Base.find hrules cm.check_id with
+                | Not_found -> raise Impossible
+              in
+              cli_match_of_core_match ~fips_mode fixed_env_opt rule cm)
+          |> Semgrep_output_utils.sort_cli_matches;
+        errors = errors |> List.map cli_error_of_core_error;
         paths;
         skipped_rules;
         explanations;
+        engine_requested;
         interfile_languages_used;
+        time;
         (* LATER *)
-        time = None;
         rules_by_engine = None;
-        engine_requested = None;
+        subprojects = None;
+        mcp_scan_results = None;
+        profiling_results;
       }
+
+(*****************************************************************************)
+(* Entry point *)
+(*****************************************************************************)
+
+let json_output (ctx : Out.format_context) (cli_output : Out.cli_output) =
+  let cli_output =
+    if ctx.is_logged_in then cli_output
+    else adjust_fields_cli_output_logged_out cli_output
+  in
+  Out.string_of_cli_output cli_output

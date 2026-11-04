@@ -1,19 +1,36 @@
 (*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    'semgrep test' command-line parsing.
 *)
 
-(*
-   The result of parsing a 'semgrep test' command.
-   This is also used in Scan_CLI.ml to transform legacy
-   commands such as 'semgrep scan --tests <dir>' into the
-   new 'semgrep test <dir>'
-*)
+(* The result of parsing a 'semgrep test' command. This is also used in
+ * Scan_CLI.ml to transform legacy commands such as 'semgrep scan --tests <dir>'
+ * into the new 'semgrep test <dir>'
+ *)
 type conf = {
   target : target_kind;
+  pro : bool;
   ignore_todo : bool;
+  override_expectations : Fpath.t option;
   json : bool;
   optimizations : bool;
   strict : bool;
+  (* Whether to emit "matching diagnosis", which analyzes failing
+     test annotation cases and matching explanations to determine
+     why a rule did or did not match.
+  *)
+  matching_diagnosis : bool;
   common : CLI_common.conf;
 }
 

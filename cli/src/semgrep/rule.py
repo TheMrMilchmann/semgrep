@@ -1,5 +1,18 @@
+#
+# Copyright (c) 2020-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import hashlib
 import json
+from functools import cached_property
 from typing import Any
 from typing import AnyStr
 from typing import cast
@@ -13,9 +26,12 @@ from typing import Union
 import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 from semgrep.constants import RuleScanSource
 from semgrep.error import InvalidRuleSchemaError
+from semgrep.error_location import Span
 from semgrep.rule_lang import EmptySpan
+from semgrep.rule_lang import has_patterns_key
+from semgrep.rule_lang import INTERNAL_DEPENDS_ON_KEY
+from semgrep.rule_lang import project_depends_on
 from semgrep.rule_lang import RuleValidation
-from semgrep.rule_lang import Span
 from semgrep.rule_lang import YamlMap
 from semgrep.rule_lang import YamlTree
 from semgrep.semgrep_interfaces.semgrep_output_v1 import Ecosystem
@@ -23,6 +39,10 @@ from semgrep.semgrep_types import JOIN_MODE
 from semgrep.semgrep_types import LANGUAGE
 from semgrep.semgrep_types import Language
 from semgrep.semgrep_types import SEARCH_MODE
+
+_PRODUCT_SCA = out.Product(out.SCA())
+_PRODUCT_SECRETS = out.Product(out.Secrets())
+_PRODUCT_SAST = out.Product(out.SAST())
 
 
 class Rule:
@@ -45,12 +65,12 @@ class Rule:
         def resolve_language_string(language_str: str) -> Language:
             # Replace "generic" in the "languages" list by the engine specified
             # in the options section.
-            xlang_str = (
+            analyzer_str = (
                 self.options_dict.get("generic_engine", "spacegrep")
                 if language_str == "generic"
                 else language_str
             )
-            return LANGUAGE.resolve(xlang_str, lang_span)
+            return LANGUAGE.resolve(analyzer_str, lang_span)
 
         rule_languages: Set[Language] = {
             resolve_language_string(l) for l in self._raw.get("languages", [])
@@ -150,6 +170,13 @@ class Rule:
         """
         Returns if this rule indicates matches should block CI
         """
+
+        validation_state_metadata = self.metadata.get(
+            "dev.semgrep.validation_state.actions"
+        )
+        if validation_state_metadata:
+            return "block" in validation_state_metadata.values()
+
         return "block" in self.metadata.get("dev.semgrep.actions", ["block"])
 
     @property
@@ -164,20 +191,12 @@ class Rule:
 
     @property
     def project_depends_on(self) -> List[Dict[str, str]]:
-        if "r2c-internal-project-depends-on" in self._raw:
-            depends_on = self._raw["r2c-internal-project-depends-on"]
-            if "depends-on-either" in depends_on:
-                dependencies: List[Dict[str, str]] = depends_on["depends-on-either"]
-                return dependencies
-            else:
-                return [depends_on]
-        else:
-            return []
+        return project_depends_on(self._raw)
 
     @property
     def ecosystems(self) -> Set[Ecosystem]:
-        if "r2c-internal-project-depends-on" in self._raw:
-            depends_on = self._raw["r2c-internal-project-depends-on"]
+        if INTERNAL_DEPENDS_ON_KEY in self._raw:
+            depends_on = self._raw[INTERNAL_DEPENDS_ON_KEY]
             if "depends-on-either" in depends_on:
                 dependencies: List[Dict[str, str]] = depends_on["depends-on-either"]
                 return {
@@ -240,19 +259,19 @@ class Rule:
         (beyond Python-handled patterns, like `project-depends-on`).
         Remove this code once all rule runnning is done in the core and the answer is always 'yes'
         """
-        return any(key in RuleValidation.PATTERN_KEYS for key in self._raw)
+        return has_patterns_key(self._raw)
 
-    @property
+    @cached_property
     def product(self) -> out.Product:
         if "r2c-internal-project-depends-on" in self._raw:
-            return out.Product(out.SCA())
+            return _PRODUCT_SCA
         elif "product" in self.metadata:
             if self.metadata.get("product") == "secrets":
-                return out.Product(out.Secrets())
+                return _PRODUCT_SECRETS
             else:
-                return out.Product(out.SAST())
+                return _PRODUCT_SAST
         else:
-            return out.Product(out.SAST())
+            return _PRODUCT_SAST
 
     @property
     def scan_source(self) -> RuleScanSource:
@@ -307,9 +326,12 @@ class Rule:
             for k in sorted(RuleValidation.PATTERN_KEYS):
                 next_raw = self.raw.get(k)
                 if next_raw is not None:
+                    # print(k)
+                    # print(next_raw)
                     patterns_to_add.append(get_subrules(next_raw))
                     if k == "join" and "on" in next_raw:
                         patterns_to_add += get_subrules(next_raw["on"])
+            # print(patterns_to_add)
             res = " ".join(sorted(patterns_to_add))
             if not res:
                 raise ValueError(f"This rule contains no hashable patterns: {self.id}")

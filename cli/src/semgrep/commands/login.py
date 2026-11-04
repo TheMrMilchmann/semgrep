@@ -1,3 +1,16 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
+import re
 import sys
 import time
 import uuid
@@ -26,8 +39,22 @@ def make_login_url() -> Tuple[uuid.UUID, str]:
 
 
 @click.command()
+# Cursor can call `semgrep login` and pop a window up for users to login without being in a
+# TTY. So, we need to add a flag to the command to allow for this.
+@click.option(
+    "--force",
+    "force",
+    is_flag=True,
+    help="Ignore saved login/provided token and force login (opens browser window)",
+)
+@click.option(
+    "--override-tty",
+    "override_tty",
+    is_flag=True,
+    help="Login from a non-interactive terminal. Used by agents calling to our MCP server.",
+)
 @handle_command_errors
-def login() -> NoReturn:
+def login(override_tty: bool, force: bool) -> NoReturn:
     """
     Obtain and save credentials for semgrep.dev
 
@@ -36,27 +63,28 @@ def login() -> NoReturn:
     Once token is found, saves it to global settings file
     """
     state = get_state()
-    saved_login_token = auth._read_token_from_settings_file()
-    if saved_login_token and saved_login_token != state.env.app_token:
-        click.echo(
-            f"API token already exists in {state.settings.path}. To login with a different token logout use `semgrep logout`"
-        )
-        sys.exit(FATAL_EXIT_CODE)
+    if not force:
+        saved_login_token = auth._read_token_from_settings_file()
+        if saved_login_token and saved_login_token != state.env.app_token:
+            click.echo(
+                f"API token already exists in {state.settings.path}. To login with a different token logout use `semgrep logout`"
+            )
+            sys.exit(0)
 
-    # If the token is provided as an environment variable, save it to the settings file.
-    if state.env.app_token is not None and len(state.env.app_token) > 0:
-        if not save_token(state.env.app_token, echo_token=False):
+        # If the token is provided as an environment variable, save it to the settings file.
+        if state.env.app_token is not None and len(state.env.app_token) > 0:
+            if not save_token(state.env.app_token, echo_token=False):
+                sys.exit(FATAL_EXIT_CODE)
+            sys.exit(0)
+
+        # If token doesn't already exist in the settings file or as an environment variable,
+        # interactively prompt the user to supply it (if we are in a TTY).
+        if not auth.is_a_tty() and not override_tty:
+            click.echo(
+                f"Error: semgrep login is an interactive command: run in an interactive terminal (or define SEMGREP_APP_TOKEN)",
+                err=True,
+            )
             sys.exit(FATAL_EXIT_CODE)
-        sys.exit(0)
-
-    # If token doesn't already exist in the settings file or as an environment variable,
-    # interactively prompt the user to supply it (if we are in a TTY).
-    if not auth.is_a_tty():
-        click.echo(
-            f"Error: semgrep login is an interactive command: run in an interactive terminal (or define SEMGREP_APP_TOKEN)",
-            err=True,
-        )
-        sys.exit(FATAL_EXIT_CODE)
 
     session_id, url = make_login_url()
     click.echo(
@@ -114,15 +142,11 @@ def save_token(login_token: Optional[str], echo_token: bool) -> bool:
         )
         return True
     else:
-        click.echo("Login token is not valid. Please try again.", err=True)
+        token_message = "Login token is not not valid."
+        if login_token is not None:
+            if len(login_token) != 64:
+                token_message = f"Login token in SEMGREP_APP_TOKEN is not valid (wrong length, should be 64)."
+            elif re.match(r"^[0-9a-f]*$", login_token) is None:
+                token_message = f"Login token in SEMGREP_APP_TOKEN is not valid (bad contents, should be hex)."
+        click.echo(f"{token_message} Please try again.", err=True)
         return False
-
-
-@click.command()
-@handle_command_errors
-def logout() -> None:
-    """
-    Remove locally stored credentials to semgrep.dev
-    """
-    auth.delete_token()
-    click.echo("Logged out (log back in with `semgrep login`)")

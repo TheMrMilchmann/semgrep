@@ -1,13 +1,20 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2022, 2023 r2c
+ * Copyright (C) 2022, 2023 Semgrep Inc.
  *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * version 2.1 as published by the Free Software Foundation, with the
+ * special exception on linking described in file LICENSE.
+ *
+ * This library is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
+ * LICENSE for more details.
  *)
 open Common
 open Sexplib.Std
 module G = AST_generic
-
-let logger = Logging.get_logger [ __MODULE__ ]
 
 (*****************************************************************************)
 (* Prelude *)
@@ -29,6 +36,9 @@ let logger = Logging.get_logger [ __MODULE__ ]
  *
  * These types are polymorphic to support the Pro Engine, which represents
  * resolved names differently.
+ *
+ * history: this used to be in semgrep-pro but was simpler to move it in
+ * OSS because ???
  *)
 
 (*****************************************************************************)
@@ -40,7 +50,7 @@ class virtual ['self] map_parent =
     (* Could inherit from the AST_generic visitor but we just need this one
      * thing, and it's just a string list so there's not really a need to
      * recurse down. We should put alternate names in the type parameter anyway.
-     * *)
+     *)
     method visit_alternate_name _env x = x
     method visit_parsed_int _env x = x
   end
@@ -78,13 +88,16 @@ and 'resolved t =
    * in SAST.ml? *)
   (* int option for the cases where we know the size of the array *)
   | Array of (Parsed_int.t[@name "parsed_int"]) option * 'resolved t
+  | Record of 'resolved record
   | Function of 'resolved function_type
   | Pointer of 'resolved t
+  | Superclass of 'resolved t option
   (* todos (bailout) *)
   (* NoType is to avoid some Type.t option and use of let* everywhere.
    * See also of_opt() below.
    *)
   | NoType
+  (* should we merge `NoType` and `Todo`? *)
   | Todo of todo_kind
 
 and builtin_type =
@@ -96,6 +109,7 @@ and builtin_type =
   | Number
   | OtherBuiltins of string
 
+and 'resolved record = (string * 'resolved t) list
 and 'resolved function_type = 'resolved parameter list * 'resolved t
 
 and 'resolved parameter =
@@ -109,9 +123,9 @@ and 'resolved parameter_classic = {
 }
 [@@deriving
   show { with_path = false },
-    eq,
-    sexp,
-    visitors { variety = "map"; ancestors = [ "map_parent" ] }]
+  eq,
+  sexp,
+  visitors { variety = "map"; ancestors = [ "map_parent" ] }]
 
 (*****************************************************************************)
 (* Helpers *)
@@ -170,13 +184,17 @@ let todo_kind_to_ast_generic_todo_kind (x : todo_kind) : G.todo_kind =
 let builtin_type_of_string _langTODO str =
   match str with
   | "int"
-  | "long"
+  | "Int"
   | "Integer"
+  | "short"
+  | "Short"
+  | "long"
   | "Long" ->
       Some Int
   | "float"
   | "double"
-  | "Float" ->
+  | "Float"
+  | "Double" ->
       Some Float
   | "str"
   | "string"
@@ -223,8 +241,8 @@ let builtin_type_of_type lang t =
  * If provided, `tok` is used in place of a fake tokens in most contexts where a
  * token is needed. This allows the resulting synthetic AST to be used in places
  * that require location information.
- * *)
-let rec to_ast_generic_type_ ?(tok = None) lang
+ *)
+let rec to_ast_generic_type_ ?tok lang
     (f : 'a -> G.alternate_name list -> G.name) (x : 'a t) : G.type_ option =
   let make_tok str =
     match tok with
@@ -254,36 +272,59 @@ let rec to_ast_generic_type_ ?(tok = None) lang
       let size = Option.map (fun pi -> G.L (G.Int pi) |> G.e) size in
       let* ty = to_ast_generic_type_ lang f ty in
       Some (G.TyArray (Tok.unsafe_fake_bracket size, ty) |> G.t)
+  | Record fields ->
+      let kind = (G.Object, G.fake "object") in
+      let fields =
+        fields
+        |> List.map (fun (fld_label, fld_type) ->
+            let entity : G.entity =
+              {
+                name =
+                  EN (Id ((fld_label, G.fake fld_label), G.empty_id_info ()));
+                attrs = [];
+                tparams = None;
+              }
+            in
+            let var_def : G.variable_definition =
+              {
+                vinit = None;
+                vtype = to_ast_generic_type_ lang f fld_type;
+                vtok = None;
+              }
+            in
+            G.F (DefStmt (entity, VarDef var_def) |> G.s))
+      in
+      Some (G.TyRecordAnon (kind, fields |> Tok.unsafe_fake_bracket) |> G.t)
   | Function (params, tret) ->
       let params =
         params
-        |> List_.map (function
-             | Param { pident; ptype } -> (
-                 let topt = to_ast_generic_type_ lang f ptype in
-                 match topt with
-                 | Some t ->
-                     let classic =
-                       {
-                         G.pname =
-                           pident |> Option.map (fun s -> (s, make_tok s));
-                         ptype = Some t;
-                         pattrs = [];
-                         pinfo = G.empty_id_info ();
-                         pdefault = None;
-                       }
-                     in
-                     G.Param classic
-                 | _else_ ->
-                     G.OtherParam
-                       (("to_ast_generic_type for param", make_tok ""), []))
-             | OtherParam x ->
-                 G.OtherParam (todo_kind_to_ast_generic_todo_kind x, []))
+        |> List.map (function
+          | Param { pident; ptype } -> (
+              let topt = to_ast_generic_type_ lang f ptype in
+              match topt with
+              | Some t ->
+                  let classic =
+                    {
+                      G.pname = pident |> Option.map (fun s -> (s, make_tok s));
+                      ptype = Some t;
+                      pattrs = [];
+                      pinfo = G.empty_id_info ();
+                      pdefault = None;
+                    }
+                  in
+                  G.Param classic
+              | _else_ ->
+                  G.OtherParam
+                    (("to_ast_generic_type for param", make_tok ""), []))
+          | OtherParam x ->
+              G.OtherParam (todo_kind_to_ast_generic_todo_kind x, []))
       in
       let* tret = to_ast_generic_type_ lang f tret in
       Some (G.TyFun (params, tret) |> G.t)
   | Pointer ty ->
       let* ty = to_ast_generic_type_ lang f ty in
       Some (G.TyPointer (make_tok "Pointer", ty) |> G.t)
+  | Superclass _ (* TODO do better *)
   | NoType
   | Todo _ ->
       None

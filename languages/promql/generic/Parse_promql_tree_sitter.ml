@@ -12,6 +12,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
+open Fpath_.Operators
 module CST = Tree_sitter_promql.CST
 module H = Parse_tree_sitter_helpers
 module H2 = AST_generic_helpers
@@ -163,9 +164,8 @@ let map_series_matcher (env : env) (x : CST.series_matcher) =
       ( G.Tuple,
         fb
           [
-            G.N (G.Id (("__name__", tok), G.empty_id_info ~hidden:true ()))
-            |> G.e;
-            G.N (G.Id (("=", tok), G.empty_id_info ~hidden:true ())) |> G.e;
+            G.N (G.Id (("__name__", tok), G.empty_id_info ~fake:true ())) |> G.e;
+            G.N (G.Id (("=", tok), G.empty_id_info ~fake:true ())) |> G.e;
             n;
           ] )
     |> G.e
@@ -369,7 +369,7 @@ and map_operator_expression (env : env) (x : CST.operator_expression) =
   in
   let l = map_query env v1 in
   let r = map_query env v4 in
-  G.Call (G.IdSpecial (G.Op op, tok) |> G.e, fb [ G.arg l; G.arg r ]) |> G.e
+  G.Call (G.Special (G.Op op, tok) |> G.e, fb [ G.arg l; G.arg r ]) |> G.e
 
 and map_query_expression (env : env) (x : CST.query_expression) =
   match x with
@@ -395,8 +395,8 @@ and map_query (env : env) (x : CST.query) =
 
 let parse file =
   H.wrap_parser
-    (fun () -> Tree_sitter_promql.Parse.file file)
-    (fun cst ->
+    (fun () -> Tree_sitter_promql.Parse.file !!file)
+    (fun cst _extras ->
       let env = { H.file; conv = H.line_col_to_pos file; extra = () } in
       let x = map_query env cst in
       [ x |> G.exprstmt ])
@@ -404,8 +404,8 @@ let parse file =
 let parse_pattern str =
   H.wrap_parser
     (fun () -> Tree_sitter_promql.Parse.string str)
-    (fun cst ->
-      let file = "<pattern>" in
-      let env = { H.file; conv = Hashtbl.create 0; extra = () } in
+    (fun cst _extras ->
+      let file = Fpath.v "<pattern>" in
+      let env = { H.file; conv = H.line_col_to_pos_pattern str; extra = () } in
       let e = map_query env cst in
       G.E e)

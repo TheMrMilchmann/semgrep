@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2021-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Avoid segfaults when the process runs out of memory.
 *)
 
@@ -29,7 +41,7 @@ exception ExceededMemoryLimit of string
    on Linux/x86_64 where we'd get a 'Stack_overflow' exception.
    See:
    - https://discuss.ocaml.org/t/is-there-any-value-in-having-a-maximum-stack-size/8214/10
-   - https://github.com/returntocorp/semgrep/issues/3640
+   - https://github.com/semgrep/semgrep/issues/3640
 
    The limits set by this function call should be lower than the system
    limits so as to get exceptions instead of segfaults.

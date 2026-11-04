@@ -1,12 +1,20 @@
-(* alt: use Login_subcommand.caps *)
-val tests : < Cap.network ; Cap.stdout > -> Alcotest_ext.test list
+(*
+   Copyright (c) 2021-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+val tests : unit -> Testo.t list
 
 (* to be reused in other tests *)
 
-type result = { exit_code : Exit_code.t; logs : string }
-
-val with_logs : f:(unit -> Exit_code.t) -> final:(result -> unit) -> unit
-val with_login_test_env : (unit -> 'a) -> unit -> 'a
-val with_fake_deployment_response : string -> (unit -> unit) -> unit
+val with_fake_deployment_response : string -> (unit -> 'a) -> 'a
+val with_semgrep_logged_in : (unit -> 'a) -> 'a
 val fake_token : string
 val fake_deployment : string

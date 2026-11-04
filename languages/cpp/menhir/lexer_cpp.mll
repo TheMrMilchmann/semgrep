@@ -16,11 +16,9 @@
  * license.txt for more details.
  *
  *)
-
 open Parser_cpp
 open Ast_cpp (* to factorise tokens with OpAssign, ... *)
 
-module Flag = Flag_parsing
 module Flag_cpp = Flag_parsing_cpp
 module Ast = Ast_cpp
 
@@ -63,7 +61,7 @@ let tok_add_s = Tok.tok_add_s
 (* ---------------------------------------------------------------------- *)
 
 (* opti: less convenient, but using a hash is faster than using a match *)
-let keyword_table = Hashtbl_.hash_of_list [
+let keyword_table = Hashtbl_.Base.hash_of_list [
 
   "void",   (fun ii -> Tvoid ii);
   "char",   (fun ii -> Tchar ii);
@@ -473,8 +471,8 @@ rule token = parse
   | letter (letter | digit) *
       { let info = tokinfo lexbuf in
         let s = tok lexbuf in
-        Profiling.profile_code "C parsing.lex_ident" (fun () ->
-          match Common2.optionise (fun () -> Hashtbl.find keyword_table s) with
+        Profiling.measure "C parsing.lex_ident" (fun () ->
+          match Base.Hashtbl.find keyword_table s with
           | Some f -> f info
 
            (* typedef_hack. note: now this is no more useful, cos
@@ -499,13 +497,13 @@ rule token = parse
   | (letter | '$') (letter | digit | '$')*
       {
         let s = tok lexbuf in
-        if not !Flag_parsing.sgrep_mode
+        if not (Hook.get Flag_parsing.sgrep_mode)
         then error ("identifier with dollar: "  ^ s) lexbuf;
         TIdent (s, tokinfo lexbuf)
       }
   (* sgrep-ext: *)
   | '$' "..." ['A'-'Z''_']['A'-'Z''_''0'-'9']*
-     { Flag.sgrep_guard (TIdent (tok lexbuf, tokinfo lexbuf)) }
+     { Flag_parsing.sgrep_guard (TIdent (tok lexbuf, tokinfo lexbuf)) }
 
 
   (* ----------------------------------------------------------------------- *)

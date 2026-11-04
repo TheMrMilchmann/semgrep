@@ -1,9 +1,20 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* python: was in constants.py, but those are type defs, not constants ...
- *
- * LATER: factorize code with Matching_report.match_format
- * and Runner_config.output_format.
+ * The constructors are repeated so we can use Output_format.Text instead
+ * of having to refactor the OCaml code to use Semgrep_output_v1_t.Text.
  *)
-type t =
+type t = Semgrep_output_v1_t.output_format =
   | Text
   | Json
   | Emacs
@@ -12,8 +23,27 @@ type t =
   | Gitlab_sast
   | Gitlab_secrets
   | Junit_xml
+  (* osemgrep-only *)
+  | Files_with_matches
   (* used to disable the final display of match results because
    * we displayed them incrementally instead
    *)
-  | TextIncremental
+  | Incremental
 [@@deriving show]
+
+let keep_ignores (format : t) : bool =
+  match format with
+  (* SARIF output includes ignored findings, but labels them as suppressed.
+   * https://docs.oasis-open.org/sarif/sarif/v2.1.0/csprd01/sarif-v2.1.0-csprd01.html#_Toc10541099
+   *)
+  | Sarif -> true
+  | Text
+  | Json
+  | Emacs
+  | Vim
+  | Gitlab_sast
+  | Gitlab_secrets
+  | Junit_xml
+  | Files_with_matches
+  | Incremental ->
+      false

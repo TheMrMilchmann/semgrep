@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* Why parsed integers?
  * This is a library for "parsed ints", which are a type that correspond to
  * literal integers that have been parsed from source text.
@@ -11,7 +23,7 @@
  * purposes.
  *)
 
-type t = int64 option * Tok.t [@@deriving hash, show, eq, sexp]
+type t = int64 option * Tok.t [@@deriving hash, show, eq, ord, sexp]
 
 (* These are the main functions you need to create a Parsed_int.t.
    The other ones are less important.

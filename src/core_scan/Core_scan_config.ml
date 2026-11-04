@@ -1,17 +1,53 @@
-(* in JSON mode, we might need to display intermediate '.' in the
- * output for pysemgrep to track progress as well as extra targets
- * found by extract rules.
- * LATER: osemgrep: not needed after osemgrep migration done
- *)
-type output_format = Text | Json of bool (* dots *) [@@deriving show]
+(*
+   Copyright (c) 2021-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(* LATER: osemgrep: not needed after osemgrep migration done *)
+type output_format =
+  | Text
+  (* In JSON mode, we might need to display intermediate '.' in the
+   * output for pysemgrep to track progress as well as extra targets
+   * found by extract-mode rules, hence the bool below.
+   *)
+  | Json of bool (* dots *)
+  (* for osemgrep *)
+  | NoOutput
+[@@deriving show]
 
 (*
-   'Rule_file' is for the semgrep-core CLI.
+   'Rule_files' is for the semgrep-core CLI. A single rule file is represented
+   as a singleton list; pysemgrep may pass multiple generated shards so core can
+   parse them in parallel.
    'Rules' is for osemgrep or when for some reason the rules had to be
     preparsed.
 *)
-type rule_source = Rule_file of Fpath.t | Rules of Rule.t list
-[@@deriving show]
+type rule_source = Rule_files of Fpath.t list | Rules of Rule.t list
+
+(* old: was [@@deriving show] but when using --config p/default
+ * the logs were getting too big
+ *)
+let pp_rule_source (fmt : Format.formatter) (x : rule_source) : unit =
+  match x with
+  | Rule_files xs ->
+      let pp_sep fmt () = Format.fprintf fmt ";@ " in
+      Format.fprintf fmt "Rule_files (%a)"
+        (Format.pp_print_list ~pp_sep Fpath.pp)
+        xs
+  | Rules xs ->
+      (* TODO: we should use Scan_CLI max_log_list_entries
+       * and Output.too_much_data, but hard to pass that in
+       *)
+      if List.length xs > 100 then
+        Format.fprintf fmt "<TOO MANY RULES TO DISPLAY (%d)>" (List.length xs)
+      else Format.fprintf fmt "Rules (%a)" Rule.pp_rules xs
 
 (*
    'Target_file' is for the semgrep-core CLI which gets a list of
@@ -21,37 +57,60 @@ type rule_source = Rule_file of Fpath.t | Rules of Rule.t list
    targets but doesn't have to put them in a file since we stay in the
    same process and we bypass the semgrep-core CLI.
 *)
-type target_source =
-  | Target_file of Fpath.t
-  | Targets of Input_to_core_t.targets
+type target_source = Target_file of Fpath.t | Targets of Target.t list
 [@@deriving show]
 
-(* TODO: similar to osemgrep Scan_CLI.conf; should be merged with it *)
+(**
+   Settings for '-j'
+
+   Most scan operations will use the specified number of jobs but
+   some will override the default (e.g. interfile).
+   We need to keep track of whether the setting can be overridden.
+
+   If we wanted to centralize the default settings, the Default case
+   could be extended to contain defaults for different situations e.g.
+     Default of {
+       regular_scan: int;
+       interfile_scan: int;
+       ...
+     }
+*)
+type num_jobs =
+  | Default of int
+      (** Default can be overridden by another Default or
+                       by Force *)
+  | Force of int  (** Force cannot be overridden *)
+[@@deriving show]
+
+(** Convert [num_jobs] into the number of jobs to execute.
+    There's no more overriding after this. *)
+let finalize_num_jobs = function
+  | Default n
+  | Force n ->
+      n
+
+(* This is mostly the flags of the semgrep-core program.
+ * LATER: should delete or merge with osemgrep Core_runner.conf
+ *)
 type t = {
-  (* Debugging/profiling/logging flags *)
-  log_config_file : Fpath.t;
-  log_to_file : Fpath.t option;
-  nosem : bool;
-  strict : bool;
-  test : bool;
-  debug : bool;
-  profile : bool;
-  report_time : bool;
-  error_recovery : bool;
-  profile_start : float;
-  matching_explanations : bool;
-  (* Main flags *)
-  pattern_string : string option;
-  pattern_file : Fpath.t option;
-  rule_source : rule_source option;
-  equivalences_file : Fpath.t option;
-  lang : Xlang.t option;
-  roots : Fpath.t list;
+  (* Main flags, input *)
+  rule_source : rule_source;
+  target_source : target_source;
+  (* output and result tweaking *)
   output_format : output_format;
-  match_format : Core_text_output.match_format;
-  mvars : Metavariable.mvar list;
-  (* Tweaking *)
+  report_time : bool;
+  matching_explanations : bool;
+  strict : bool;
+  (* respect or not the paths: directive in a rule. Useful to set to false
+   * in a testing context as in `semgrep test`
+   *)
   respect_rule_paths : bool;
+  (* Hook to display match results incrementally, after a file has been fully
+   * processed. Note that this hook run in a child process of Parmap
+   * in Core_scan.scan(), so the hook should not rely on shared memory!
+   * This is also now used in Runner_service.ml and Git_remote.ml.
+   *)
+  file_match_hook : (Fpath.t -> Core_result.matches_single_file -> unit) option;
   (* Limits *)
   (* maximum time to spend running a rule on a single file *)
   timeout : float;
@@ -59,77 +118,49 @@ type t = {
   timeout_threshold : int;
   max_memory_mb : int;
   max_match_per_file : int;
-  ncores : int;
-  parsing_cache_dir : Fpath.t option;
+  num_jobs : num_jobs;
+  (* a.k.a -fast (on by default) *)
   filter_irrelevant_rules : bool;
-  (* Hook to display match results incrementally, after a file has been fully
-   * processed. Note that this hook run in a child process of Parmap
-   * in Run_semgrep, so the hook should not rely on shared memory!
-   *)
-  file_match_results_hook :
-    (Fpath.t -> Core_result.matches_single_file -> unit) option;
-  (* Flag used by pysemgrep *)
-  target_source : target_source option;
-  (* Common.ml action for the -dump_xxx *)
-  action : string;
-  (* Other *)
-  version : string;
+  (* telemetry *)
+  telemetry : Telemetry.config option;
+  symbol_analysis : bool;
+  fips_mode : bool;
+  (* Rely on a multicore ocaml impl of `-j` v.s Parmap
+   * logic redundancy: par_conf is [Effect _] only if [use_parmap] was
+   * not set to true. *)
+  use_parmap : bool;
+  par_conf : Parallelism_config.t;
 }
 [@@deriving show]
 
-(*
-   Default values for all the semgrep-core command-line arguments and options.
-
+(* Default values for all the semgrep-core command-line arguments and options.
    Its values can be inherited using the 'with' syntax:
-
-    let my_config = {
-      Runner_config.default with
-      debug = true;
-      ncores = 3;
-    }
+      let my_config = { Core_scan_config.default with ncores = 3 }
 *)
 let default =
   {
-    (* Debugging/profiling/logging flags *)
-    log_config_file = Fpath.v "log_config.json";
-    log_to_file = None;
-    nosem = true;
-    strict = false;
-    test = false;
-    debug = false;
-    profile = false;
-    report_time = false;
-    error_recovery = false;
-    profile_start = 0.;
-    matching_explanations = false;
     (* Main flags *)
-    pattern_string = None;
-    pattern_file = None;
-    rule_source = None;
-    equivalences_file = None;
-    lang = None;
-    roots = [];
+    rule_source = Rules [];
+    target_source = Targets [];
+    (* alt: NoOutput but then would need a -text in Core_CLI.ml *)
     output_format = Text;
-    match_format = Core_text_output.Normal;
-    mvars = [];
-    (* tweaking *)
+    report_time = false;
+    matching_explanations = false;
+    strict = false;
     respect_rule_paths = true;
+    file_match_hook = None;
     (* Limits *)
-    (* maximum time to spend running a rule on a single file *)
     timeout = 0.;
-    (* maximum number of rules that can timeout on a file *)
     timeout_threshold = 0;
     max_memory_mb = 0;
     max_match_per_file = 10_000;
-    ncores = 1;
-    parsing_cache_dir = None;
+    num_jobs = Default Resources.resources.cpu.recommended_multicore_domains;
     (* a.k.a -fast, on by default *)
     filter_irrelevant_rules = true;
-    file_match_results_hook = None;
-    (* Flag used by the semgrep-python wrapper *)
-    target_source = None;
-    (* Common.ml action for the -dump_xxx *)
-    action = "";
-    (* Other *)
-    version = "";
+    (* debugging and telemetry flags *)
+    telemetry = None;
+    symbol_analysis = false;
+    fips_mode = false;
+    use_parmap = false;
+    par_conf = Parallelism_config.Process;
   }

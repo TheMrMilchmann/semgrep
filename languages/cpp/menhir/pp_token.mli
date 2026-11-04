@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* Expanding or extracting macros, at the token level *)
 
 (* the either is to differentialte macro-variables from macro-functions *)
@@ -52,6 +64,6 @@ val apply_macro_defs :
   ?evaluate_concatop:bool ->
   ?inplace_when_single:bool ->
 *)
-  (string, define_body (* define_def *)) Hashtbl.t ->
+  (string, define_body (* define_def *)) Base.Hashtbl.t ->
   Token_views_cpp.paren_grouped list ->
   unit

@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import json
 import tempfile
 from collections import defaultdict
@@ -23,7 +35,6 @@ from ruamel.yaml import YAML
 
 import semgrep.run_scan
 import semgrep.semgrep_interfaces.semgrep_output_v1 as out
-from semgrep.config_resolver import Config
 from semgrep.config_resolver import resolve_config
 from semgrep.error import ERROR_MAP
 from semgrep.error import FATAL_EXIT_CODE
@@ -230,11 +241,9 @@ def create_config_map(semgrep_config_strings: List[str]) -> Dict[str, Rule]:
     """
     config = {}
     for config_string in semgrep_config_strings:
-        resolved = resolve_config(config_string, get_project_url())
-        # Some code-fu to get single rules
-        config.update(
-            {config_string: list(Config._validate(resolved)[0].values())[0][0]}
-        )
+        resolved, config_errors, _ = resolve_config(config_string, get_project_url())
+        # resolved is Dict[str, List[Rule]], get the first rule
+        config.update({config_string: list(resolved.values())[0][0]})
     return config
 
 
@@ -261,7 +270,7 @@ def rename_metavars_in_place(
 
 
 def create_model_map(
-    semgrep_results: List[Dict[str, Any]]
+    semgrep_results: List[Dict[str, Any]],
 ) -> Dict[str, Type[BaseModel]]:
     """
     Dynamically create 'peewee' model classes directly from Semgrep results.
@@ -364,7 +373,9 @@ def generate_recursive_cte(model: Type[BaseModel], column1: str, column2: str) -
 # For join mode, we get the final output of Semgrep and then need to construct
 # RuleMatches from that. Ideally something would be refactored so that we don't
 # need to move backwards in the pipeline like this.
-def json_to_rule_match(join_rule: Dict[str, Any], match: Dict[str, Any]) -> RuleMatch:
+def json_to_rule_match(
+    join_rule: Dict[str, Any], match: Dict[str, Any], fips_mode: bool
+) -> RuleMatch:
     cli_match_extra = out.CliMatchExtra.from_json(match.get("extra", {}))
     extra = out.CoreMatchExtra(
         message=cli_match_extra.message,
@@ -374,17 +385,10 @@ def json_to_rule_match(join_rule: Dict[str, Any], match: Dict[str, Any]) -> Rule
         dataflow_trace=cli_match_extra.dataflow_trace,
         engine_kind=cli_match_extra.engine_kind
         if cli_match_extra.engine_kind
-        else out.EngineKind(out.OSS()),
+        else out.EngineOfFinding(out.OSS()),
         is_ignored=False,
     )
     return RuleMatch(
-        message=join_rule.get(
-            "message", match.get("extra", {}).get("message", "[empty]")
-        ),
-        metadata=join_rule.get("metadata", match.get("extra", {}).get("metadata", {})),
-        severity=out.MatchSeverity.from_json(
-            join_rule.get("severity", match.get("severity", "INFO"))
-        ),
         match=out.CoreMatch(
             check_id=out.RuleId(join_rule.get("id", match.get("check_id", "[empty]"))),
             path=out.Fpath(match.get("path", "[empty]")),
@@ -392,15 +396,23 @@ def json_to_rule_match(join_rule: Dict[str, Any], match: Dict[str, Any]) -> Rule
             end=out.Position.from_json(match["end"]),
             extra=extra,
         ),
-        # still needed?
-        extra=match.get("extra", {}),
-        fix=None,
+        message=join_rule.get(
+            "message", match.get("extra", {}).get("message", "[empty]")
+        ),
+        severity=out.MatchSeverity.from_json(
+            join_rule.get("severity", match.get("severity", "INFO"))
+        ),
+        metadata=join_rule.get("metadata", match.get("extra", {}).get("metadata", {})),
+        fips_mode=fips_mode,
     )
 
 
 def run_join_rule(
     join_rule: Dict[str, Any],
-    targets: List[Path],
+    scanning_roots: List[Path],
+    fips_mode: bool,
+    allow_local_builds: bool = False,
+    ptt_enabled: bool = False,
 ) -> Tuple[List[RuleMatch], List[SemgrepError]]:
     """
     Run a 'join' mode rule.
@@ -429,7 +441,7 @@ def run_join_rule(
     These are the conditions which must be satisfied for this rule to report results.
     All conditions must be satisfied.
 
-    See cli/tests/e2e/rules/join_rules/user-input-with-unescaped-extension.yaml
+    See cli/tests/default/e2e/rules/join_rules/user-input-with-unescaped-extension.yaml
     for an example.
     """
     join_contents = join_rule.get("join", {})
@@ -484,13 +496,16 @@ def run_join_rule(
         rule_path.seek(0)
 
         logger.debug(
-            f"Running join mode rule {join_rule.get('id')} on {len(targets)} files."
+            f"Running join mode rule {join_rule.get('id')} on {len(scanning_roots)} files."
         )
         output = semgrep.run_scan.run_scan_and_return_json(
             config=Path(rule_path.name),
-            targets=targets,
+            scanning_roots=scanning_roots,
             no_rewrite_rule_ids=True,
             optimizations="all",
+            allow_local_builds=allow_local_builds,
+            ptt_enabled=ptt_enabled,
+            record_scan_product_attrs=False,
         )
 
     assert isinstance(output, dict)  # placate mypy
@@ -518,7 +533,7 @@ def run_join_rule(
             parsed_errors.append(
                 ERROR_MAP[error_dict.get(errortype)].from_dict(error_dict)
             )
-        except KeyError:
+        except (KeyError, TypeError):
             logger.warning(
                 f"Could not reconstitute Semgrep error: {error_dict}.\nSkipping processing of error"
             )
@@ -567,7 +582,9 @@ def run_join_rule(
             except AttributeError:
                 matches.append(json.loads(match.raw))
 
-    rule_matches = [json_to_rule_match(join_rule, match) for match in matches]
+    rule_matches = [
+        json_to_rule_match(join_rule, match, fips_mode) for match in matches
+    ]
 
     db.close()
     return rule_matches, parsed_errors

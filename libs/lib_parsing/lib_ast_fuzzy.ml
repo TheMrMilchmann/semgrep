@@ -82,12 +82,12 @@ let mk_trees h xs =
   let xs =
     xs
     |> List_.exclude (fun t ->
-           let kind = h.kind t in
-           match kind with
-           | Esthet _
-           | Eof ->
-               true
-           | _ -> false)
+        let kind = h.kind t in
+        match kind with
+        | Esthet _
+        | Eof ->
+            true
+        | _ -> false)
   in
 
   let rec consume x xs =
@@ -106,7 +106,7 @@ let mk_trees h xs =
         let body' = split_comma body in
         (Ast_fuzzy.Parens (h.tokf x, body', h.tokf closing), rest)
     | tok -> (Ast_fuzzy.Tok (Tok.content_of_tok (h.tokf tok), h.tokf x), xs)
-    (*
+  (*
     (match Ast.str_of_info (tokext tok) with
     | "..." -> Ast_fuzzy.Dots (tokext tok)
     | s when Ast_fuzzy.is_metavar s -> Ast_fuzzy.Metavar (s, tokext tok)
@@ -158,7 +158,7 @@ let mk_trees h xs =
   aux xs
 
 let mk_tokens hooks toks =
-  toks |> List_.map (fun tok -> (hooks.kind tok, hooks.tokf tok))
+  toks |> List.map (fun tok -> (hooks.kind tok, hooks.tokf tok))
 
 (*****************************************************************************)
 (* Visitor *)

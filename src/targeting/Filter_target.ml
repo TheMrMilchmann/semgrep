@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (*************************************************************************)
 (* Prelude *)
 (*************************************************************************)
@@ -24,8 +36,8 @@
 (*************************************************************************)
 
 (* Used by Core_runner.split_jobs_by_language() *)
-let filter_target_for_xlang (xlang : Xlang.t) (path : Fpath.t) : bool =
-  match xlang with
+let filter_target_for_analyzer (analyzer : Analyzer.t) (path : Fpath.t) : bool =
+  match analyzer with
   | L (lang, langs) ->
       (* ok if the file appears to be in one of rule's languages *)
       lang :: langs
@@ -35,60 +47,29 @@ let filter_target_for_xlang (xlang : Xlang.t) (path : Fpath.t) : bool =
   | LAliengrep ->
       true
 
-(* Used by Run_semgrep.semgrep_with_rules().
- * See also https://semgrep.dev/docs/writing-rules/rule-syntax/#paths
- * TODO: according to the doc,
- * "Paths [in include: and exclude: patterns] are relative to the root
- * directory of the scanned project" but it seems pysemgrep does not honor
- * this thing because adding an exclude such as "metachecking/*" will
- * filter code even in subdirs calls metachecking. The glob is not anchored,
- * even when it contains a '/'.
- * LESS: there used to be a time where semgrep-core was handling the
- * include/exclude too. Can we find back this code?
- *)
-let filter_paths (paths : Rule.paths) (path : Fpath.t) : bool =
-  let match_glob (pat : Rule.glob) (path : Fpath.t) : bool =
-    (* ugly: pysemgrep adds a leading **/ and a suffix /** to each pattern.
-     * See target_manager.py preprocess_path_patterns()
-     * python:
-     *    Convert semgrep's path include/exclude patterns to wcmatch's glob
-     *    patterns. In semgrep, pattern "foo/bar" should match paths
-     *    "x/foo/bar", "foo/bar/x", and "x/foo/bar/x". It implicitly matches
-     *    zero or more directories at the beginning and the end
-     *    of the pattern. In contrast, we have to explicitly specify the
-     *    globstar (**) patterns in wcmatch. This function will converts
-     *    a pattern "foo/bar" into "**/foo/bar" and "**/foo/bar/**". We need
-     *    the pattern without the trailing "/**" because "foo/bar.py/**"
-     *    won't match "foo/bar.py".
-     * LATER? compute the ppath instead? and use a Gitignore like semantic?
+let filter_paths (paths : Rule.path_filter) (path : Fppath.t) : bool =
+  if Fppath.is_filterable_DEPRECATED path then
+    let ppath = path.ppath in
+    let match_glob (glob : Rule.glob) (path : Ppath.t) : bool =
+      Glob.Match.run glob.compiled_pattern (Ppath.to_string_fast path)
+    in
+    let { Rule.require; exclude } = paths in
+    let is_excluded =
+      exclude |> List.exists (fun glob -> match_glob glob ppath)
+    in
+    (* from the doc: "when mixing inclusion and exclusion filters,
+     * the exclusion ones take precedence."
      *)
-    let pat1 = Glob.Pattern.(append [ Any_subpath ] (snd pat)) in
-    let pat2 =
-      Glob.Pattern.(append [ Any_subpath ] (append (snd pat) [ Any_subpath ]))
-    in
-
-    let cpat1 =
-      Glob.Match.(compile ~source:(string_loc ~source_kind:None (fst pat)) pat1)
-    in
-    let cpat2 =
-      Glob.Match.(compile ~source:(string_loc ~source_kind:None (fst pat)) pat2)
-    in
-    Glob.Match.run cpat1 (Fpath.to_string path)
-    || Glob.Match.run cpat2 (Fpath.to_string path)
-  in
-
-  let { Rule.require; exclude } = paths in
-  let is_excluded = exclude |> List.exists (fun pat -> match_glob pat path) in
-  (* from the doc: "when mixing inclusion and exclusion filters,
-   * the exclusion ones take precedence."
-   *)
-  if is_excluded then false
+    if is_excluded then false
+    else
+      let is_required =
+        match require with
+        (* no require patterns means no constraints *)
+        | [] -> true
+        | _ -> require |> List.exists (fun glob -> match_glob glob ppath)
+      in
+      is_required
   else
-    let is_required =
-      match require with
-      (* no require patterns means no constraints *)
-      | [] -> true
-      | _xs -> require |> List.exists (fun pat -> match_glob pat path)
-    in
-    is_required
+    (* bypass all filters! *)
+    true
 [@@profiling]

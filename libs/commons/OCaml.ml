@@ -197,7 +197,7 @@ let vof_int64 x = VInt x
 let vof_float x = VFloat x
 let vof_string x = VString x
 let vof_bool b = VBool b
-let vof_list ofa x = VList (List_.map ofa x)
+let vof_list ofa x = VList (List.map ofa x)
 
 let vof_option ofa x =
   match x with
@@ -262,7 +262,7 @@ let option_ofv a__of_sexp sexp =
 (* Format pretty printers *)
 (*****************************************************************************)
 let add_sep xs =
-  xs |> List_.map (fun x -> Either.Right x) |> List_.join_gen (Either.Left ())
+  xs |> List.map (fun x -> Either.Right x) |> List_.join_gen (Either.Left ())
 
 (*
  * OCaml value pretty printer. A similar functionnality is provided by
@@ -303,17 +303,17 @@ let string_of_v ?(max_depth = max_int) v =
               Format.fprintf ppf "(@[";
               xs |> add_sep
               |> List.iter (function
-                   | Either.Left _ -> Format.fprintf ppf ",@ "
-                   | Either.Right v -> aux (max_depth - 1) v);
+                | Either.Left _ -> Format.fprintf ppf ",@ "
+                | Either.Right v -> aux (max_depth - 1) v);
               Format.fprintf ppf "@])"
           | VDict xs ->
               Format.fprintf ppf "{@[";
               xs
               |> List.iter (fun (s, v) ->
-                     (* less: could open a box there too? *)
-                     Format.fprintf ppf "@,%s=" s;
-                     aux (max_depth - 1) v;
-                     Format.fprintf ppf ";@ ");
+                  (* less: could open a box there too? *)
+                  Format.fprintf ppf "@,%s=" s;
+                  aux (max_depth - 1) v;
+                  Format.fprintf ppf ";@ ");
               Format.fprintf ppf "@]}"
           | VSum (s, xs) -> (
               match xs with
@@ -322,8 +322,8 @@ let string_of_v ?(max_depth = max_int) v =
                   Format.fprintf ppf "@[<hov 2>%s(@," s;
                   xs |> add_sep
                   |> List.iter (function
-                       | Either.Left _ -> Format.fprintf ppf ",@ "
-                       | Either.Right v -> aux (max_depth - 1) v);
+                    | Either.Left _ -> Format.fprintf ppf ",@ "
+                    | Either.Right v -> aux (max_depth - 1) v);
                   Format.fprintf ppf "@])")
           | VVar (s, i64) -> Format.fprintf ppf "%s_%Ld" s i64
           | VArrow _v1 -> failwith "Arrow TODO"
@@ -340,8 +340,8 @@ let string_of_v ?(max_depth = max_int) v =
               Format.fprintf ppf "[@[<hov>";
               xs |> add_sep
               |> List.iter (function
-                   | Either.Left _ -> Format.fprintf ppf ";@ "
-                   | Either.Right v -> aux (max_depth - 1) v);
+                | Either.Left _ -> Format.fprintf ppf ";@ "
+                | Either.Right v -> aux (max_depth - 1) v);
               Format.fprintf ppf "@]]"
           | VTODO _v1 -> Format.fprintf ppf "VTODO"
       in

@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 type parsing_mode =
   | Python2
   | Python3
@@ -10,11 +22,10 @@ type parsing_mode =
  *)
 val parse :
   ?parsing_mode:parsing_mode (* default mode is Python *) ->
-  string (* filename *) ->
+  Fpath.t ->
   (AST_python.program, Parser_python.token) Parsing_result.t
 
-val parse_program :
-  ?parsing_mode:parsing_mode -> string (* filename *) -> AST_python.program
+val parse_program : ?parsing_mode:parsing_mode -> Fpath.t -> AST_python.program
 
 (* other parsers *)
 

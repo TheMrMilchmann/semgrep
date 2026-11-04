@@ -1,50 +1,22 @@
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 let with_setenv envvar str f =
-  let old = USys.getenv_opt envvar in
-  UUnix.putenv envvar str;
+  let old = Sys.getenv_opt envvar in
+  Unix.putenv envvar str;
   Common.finalize f (fun () ->
       match old with
-      | Some str -> UUnix.putenv envvar str
+      | Some str -> Unix.putenv envvar str
       (* ugly: Unix does not provide unsetenv,
        * see https://discuss.ocaml.org/t/unset-environment-variable/9025
        *)
-      | None -> UUnix.putenv envvar "")
-
-let with_mocked_logs ~f ~final =
-  let buffer = Buffer.create 1000 in
-  let (ppf : Format.formatter) =
-    (* old: I was using Format.str_formatter but
-     * some libraries like Cmdliner are also using it
-     * and so parsing arguments with cmdliner has the side
-     * effect of cleaning Format.stdbuf used by str_formatter,
-     * so better to use a separate buffer
-     *)
-    Format.formatter_of_buffer buffer
-  in
-  let reporter_to_format_strbuf =
-    {
-      Logs.report =
-        (fun (_src : Logs.src) (_level : Logs.level) ~over k msgf ->
-          let k _ =
-            over ();
-            k ()
-          in
-          msgf (fun ?header:_ ?tags:_ fmt -> Format.kfprintf k ppf fmt));
-    }
-  in
-  let old_reporter = Logs.reporter () in
-  Common.finalize
-    (fun () ->
-      Logs.set_reporter reporter_to_format_strbuf;
-      Common.save_excursion Logs_.in_mock_context true (fun () ->
-          (* f() might call Logs_helpers.setup_logging() internally, but this will not
-           * call Logs.set_reporter and override the reporter we set above
-           * thx to disable_set_reporter
-           *)
-          let res =
-            try Ok (f ()) with
-            | exn -> Error exn
-          in
-          Format.pp_print_flush ppf ();
-          let content = Buffer.contents buffer in
-          final content res))
-    (fun () -> Logs.set_reporter old_reporter)
+      | None -> Unix.putenv envvar "")

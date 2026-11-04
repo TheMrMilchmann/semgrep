@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2021-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Convert Bash-specific AST to generic AST.
 
    A Bash program is organized into the following hierarchy:
@@ -128,7 +140,7 @@ let block : stmt_or_expr list -> stmt_or_expr = function
   | [ x ] -> x
   | several ->
       let loc = Tok_range.of_list stmt_or_expr_loc several in
-      let stmts = List_.map as_stmt several in
+      let stmts = List.map as_stmt several in
       Stmt (loc, G.s (G.Block (bracket loc stmts)))
 
 let mk_name (str_wrap : string wrap) : G.name =
@@ -149,7 +161,7 @@ let mk_var_expr (var : variable_name) : G.expr =
 module C = struct
   let mk (loc : loc) (name : string) =
     let id = "!sh_" ^ name ^ "!" in
-    let id_info = G.empty_id_info ~hidden:true () in
+    let id_info = G.empty_id_info ~fake:true () in
     G.N (G.Id ((id, fst loc), id_info)) |> G.e
 
   (* For simple commands, e.g.
@@ -191,6 +203,12 @@ module C = struct
   (* Process substitution: <(...) *)
   let proc_subst loc = mk loc "proc_subst"
 
+  (* Arithmetic expansion: $(( ... )), with the expression as argument *)
+  let arith_expansion loc = mk loc "arith_expansion"
+
+  (* Arithmetic evaluation: (( ... )), with the expression as argument *)
+  let arith loc = mk loc "arith"
+
   (* Subshell: (...) *)
   let subshell loc = mk loc "subshell"
 end
@@ -202,7 +220,7 @@ end
    Usage: call C.cmd args
 *)
 let call loc name exprs =
-  G.Call (name loc, bracket loc (List_.map (fun e -> G.Arg e) exprs)) |> G.e
+  G.Call (name loc, bracket loc (List.map (fun e -> G.Arg e) exprs)) |> G.e
 
 let todo_tokens ((start, end_) : loc) =
   let wrap tok = (Tok.content_of_tok tok, tok) in
@@ -217,6 +235,60 @@ let todo_expr (loc : loc) : G.expr =
   G.e (G.OtherExpr (("BashTodo", t), todo_tokens loc))
 
 let todo_expr2 (loc : loc) : stmt_or_expr = Expr (loc, todo_expr loc)
+
+let is_variable_name (s : string) : bool =
+  s <> ""
+  && (not ('0' <= s.[0] && s.[0] <= '9'))
+  && String.for_all
+       (function
+         | 'a' .. 'z'
+         | 'A' .. 'Z'
+         | '0' .. '9'
+         | '_' ->
+             true
+         | _ -> false)
+       s
+
+(* Integer literals that bash and Parsed_int read the same way: decimal
+   without a leading zero, or hexadecimal. Others ('010' is octal 8 in bash,
+   '2#101', ...) stay strings rather than get a wrong value. *)
+let is_portable_int_literal (s : string) : bool =
+  let is_digit c = '0' <= c && c <= '9' in
+  let is_hex c =
+    is_digit c || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F')
+  in
+  let len = String.length s in
+  s = "0"
+  || (len > 0 && (not (s.[0] =$= '0')) && String.for_all is_digit s)
+  || len > 2
+     && s.[0] =$= '0'
+     && (s.[1] =$= 'x' || s.[1] =$= 'X')
+     && String.for_all is_hex (String.sub s 2 (len - 2))
+
+(* Binary arithmetic operators other than assignments and ',' *)
+let arithmetic_operator (op : string) : G.operator option =
+  match op with
+  | "+" -> Some G.Plus
+  | "-" -> Some G.Minus
+  | "*" -> Some G.Mult
+  | "/" -> Some G.Div
+  | "%" -> Some G.Mod
+  | "**" -> Some G.Pow
+  | "<<" -> Some G.LSL
+  | ">>" -> Some G.ASR
+  | "&" -> Some G.BitAnd
+  | "|" -> Some G.BitOr
+  | "^" -> Some G.BitXor
+  | "&&" -> Some G.And
+  | "||" -> Some G.Or
+  | "==" -> Some G.Eq
+  | "!=" -> Some G.NotEq
+  | "<" -> Some G.Lt
+  | "<=" -> Some G.LtE
+  | ">" -> Some G.Gt
+  | ">=" -> Some G.GtE
+  | "=~" -> Some G.RegexpMatch
+  | _ -> None
 
 (*****************************************************************************)
 (* Converter from bash AST to generic AST *)
@@ -235,7 +307,7 @@ let redirect_pipeline_stderr_to_stdout pip =
 let rec blist (env : env) (l : blist) : stmt_or_expr list =
   match l with
   | Seq (_loc, left, right) -> blist env left @ blist env right
-  | Pipelines (_loc, pl) -> List_.map (fun x -> pipeline env x) pl
+  | Pipelines (_loc, pl) -> List.map (fun x -> pipeline env x) pl
   | Empty _loc -> []
 
 and pipeline (env : env) (x : pipeline) : stmt_or_expr =
@@ -284,7 +356,7 @@ and command (env : env) (cmd : command) : stmt_or_expr =
       (* TODO: fix the tree-sitter grammar so it doesn't insert a "MISSING"
          node set to the empty string when there's no command following
          multiple assignments. *)
-      List_.map (assignment env) assignments |> block
+      List.map (assignment env) assignments |> block
   | Simple_command { loc; assignments = _; arguments } -> (
       match arguments with
       | [ (Expr_semgrep_ellipsis tok as e) ] ->
@@ -292,7 +364,7 @@ and command (env : env) (cmd : command) : stmt_or_expr =
       | [ (String_fragment (loc, Frag_semgrep_named_ellipsis _) as e) ] ->
           Expr (loc, expression env e)
       | arguments ->
-          let args = List_.map (expression env) arguments in
+          let args = List.map (expression env) arguments in
           Expr (loc, call loc C.cmd args))
   | And (loc, left, and_tok, right) ->
       let left = pipeline env left |> as_expr in
@@ -309,7 +381,8 @@ and command (env : env) (cmd : command) : stmt_or_expr =
       stmt_group env loc (blist env bl)
   | Sh_test (loc, _) -> todo_expr2 loc
   | Bash_test (loc, _) -> todo_expr2 loc
-  | Arithmetic_expression (loc, _) -> todo_expr2 loc
+  | Arithmetic_expression (loc, (_open, e, _close)) ->
+      Expr (loc, call loc C.arith [ arithmetic env e ])
   | For_loop (loc, for_, loop_var, opt_in, do_, body, _done_) ->
       let header =
         let in_tk, expr =
@@ -317,7 +390,7 @@ and command (env : env) (cmd : command) : stmt_or_expr =
           | Some (in_tk, vals) ->
               ( in_tk,
                 G.Container
-                  (List, fb (List_.map (fun x -> expression env x) vals))
+                  (List, fb (List.map (fun x -> expression env x) vals))
                 |> G.e )
           | None ->
               (*
@@ -349,19 +422,27 @@ and command (env : env) (cmd : command) : stmt_or_expr =
       in
       let body = stmt_group env loc (blist env body) |> as_stmt in
       Stmt (loc, G.For (for_, header, body) |> G.s)
-  | For_loop_c_style (loc, bl) ->
-      (* TODO: loop *) stmt_group env loc (blist env bl)
+  | For_loop_c_style (loc, for_, (init, cond, next), body) ->
+      let clause = Option.map (arithmetic env) in
+      let init =
+        clause init |> Option.to_list |> List.map (fun e -> G.ForInitExpr e)
+      in
+      let body = stmt_group env loc (blist env body) |> as_stmt in
+      Stmt
+        ( loc,
+          G.For (for_, G.ForClassic (init, clause cond, clause next), body)
+          |> G.s )
   | Select (loc, _select, _loop_var, _opt_in, _do_, body, _done_) ->
       (* TODO *)
       stmt_group env loc (blist env body)
   | Case (loc, case, subject, _in_, clauses, _esac) ->
       let subject = expression env subject in
       let clauses =
-        List_.map
+        List.map
           (fun (_loc, patterns, _paren, stmts, _opt_term) ->
             (* TODO: handle the different kinds of terminators. Insert breaks. *)
             let patterns =
-              List_.map
+              List.map
                 (fun e ->
                   let tok, _ = AST_bash_loc.expression_loc e in
                   let pat =
@@ -384,7 +465,7 @@ and command (env : env) (cmd : command) : stmt_or_expr =
             Some (blist env body |> block |> as_stmt)
       in
       let opt_stmt =
-        List.fold_right
+        List_.fold_right
           (fun if_ (else_stmt : G.stmt option) ->
             let _loc1, if_, cond, _then_, body = if_ in
             (* pad: TODO:  use more complex CondDecl when ready? *)
@@ -414,7 +495,7 @@ and command (env : env) (cmd : command) : stmt_or_expr =
   | Coprocess (_loc, _opt_name, cmd) -> (* TODO: coproc *) command env cmd
   | Assignment ass -> assignment env ass
   | Declaration x ->
-      let assignments = List_.map (assignment env) x.assignments in
+      let assignments = List.map (assignment env) x.assignments in
       (* TODO: don't ignore the "unknown" arguments that contain variables
          and such. *)
       assignments |> block
@@ -458,7 +539,7 @@ and assignment (env : env) ass =
    is needed for matching. We can't simplify it into a single expression
    if there's only one statement. *)
 and stmt_group (_env : env) (loc : loc) (l : stmt_or_expr list) : stmt_or_expr =
-  let stmts = List_.map as_stmt l in
+  let stmts = List.map as_stmt l in
   let start, end_ = loc in
   Stmt (loc, G.s (G.Block (start, stmts, end_)))
 
@@ -476,7 +557,7 @@ and expression (env : env) (e : expression) : G.expr =
           G.L (G.String (fb wrap)) |> G.e
       | _ ->
           let loc = (open_, close) in
-          List_.map (string_fragment env) frags |> call loc C.quoted_concat)
+          List.map (string_fragment env) frags |> call loc C.quoted_concat)
   | String_fragment (_loc, frag) -> string_fragment env frag
   | Raw_string (* 'foo' *) (str, tok) ->
       (* normalization to enable matching of e.g. 'foo' against foo *)
@@ -490,8 +571,7 @@ and expression (env : env) (e : expression) : G.expr =
       G.L (G.String (fb (without_quotes, tok))) |> G.e
   | Ansii_c_string str -> G.L (G.String (fb str)) |> G.e
   | Special_character str -> G.L (G.String (fb str)) |> G.e
-  | Concatenation (loc, el) ->
-      List_.map (expression env) el |> call loc C.concat
+  | Concatenation (loc, el) -> List.map (expression env) el |> call loc C.concat
   | Expr_semgrep_ellipsis tok -> G.Ellipsis tok |> G.e
   | Expr_semgrep_deep_ellipsis (_loc, (open_, e, close)) ->
       G.DeepEllipsis (open_, expression env e, close) |> G.e
@@ -499,11 +579,94 @@ and expression (env : env) (e : expression) : G.expr =
   | Equality_test (loc, _, _) -> (* don't know what this is *) todo_expr loc
   | Empty_expression loc -> G.L (G.String (fb ("", fst loc))) |> G.e
   | Array (_loc, (open_, elts, close)) ->
-      let elts = List_.map (expression env) elts in
+      let elts = List.map (expression env) elts in
       G.Container (G.Array, (open_, elts, close)) |> G.e
   | Process_substitution (loc, (_open_, x, _close)) ->
       let arg = blist env x |> block |> as_expr in
       call loc C.proc_subst [ arg ]
+  | Command_expression (_loc, cmd) -> command env cmd |> as_expr
+
+(* Arithmetic is C-like: operators become generic operator calls. *)
+and arithmetic (env : env) (x : arithmetic_expression) : G.expr =
+  match x with
+  | A_operand e -> arithmetic_operand env e
+  | A_unary ((op, tok), e) -> (
+      match op with
+      | "++" ->
+          G.special
+            (G.IncrDecr (G.Incr, G.Prefix), tok)
+            [ arithmetic_lvalue env e ]
+      | "--" ->
+          G.special
+            (G.IncrDecr (G.Decr, G.Prefix), tok)
+            [ arithmetic_lvalue env e ]
+      | "!" -> G.opcall (G.Not, tok) [ arithmetic env e ]
+      | "~" -> G.opcall (G.BitNot, tok) [ arithmetic env e ]
+      | "+" -> G.opcall (G.Plus, tok) [ arithmetic env e ]
+      | "-" -> G.opcall (G.Minus, tok) [ arithmetic env e ]
+      | _ -> todo_expr (AST_bash_loc.arithmetic_expression_loc x))
+  | A_postfix (e, (op, tok)) -> (
+      let e = arithmetic_lvalue env e in
+      match op with
+      | "++" -> G.special (G.IncrDecr (G.Incr, G.Postfix), tok) [ e ]
+      | "--" -> G.special (G.IncrDecr (G.Decr, G.Postfix), tok) [ e ]
+      | _ -> todo_expr (AST_bash_loc.arithmetic_expression_loc x))
+  | A_binary (e1, (",", _), e2) ->
+      let left =
+        match arithmetic env e1 with
+        | { G.e = G.Seq es; _ } -> es
+        | e -> [ e ]
+      in
+      G.Seq (left @ [ arithmetic env e2 ]) |> G.e
+  | A_binary (e1, ("=", tok), e2) ->
+      G.Assign (arithmetic_lvalue env e1, tok, arithmetic env e2) |> G.e
+  | A_binary (e1, (op, tok), e2) -> (
+      let e2 = arithmetic env e2 in
+      match arithmetic_operator op with
+      | Some op -> G.opcall (op, tok) [ arithmetic env e1; e2 ]
+      | None -> (
+          (* compound assignment e.g. '+=' or '<<=' *)
+          let len = String.length op in
+          let base =
+            if len >= 2 && op.[len - 1] =$= '=' then
+              arithmetic_operator (String.sub op 0 (len - 1))
+            else None
+          in
+          match base with
+          | Some op ->
+              G.AssignOp (arithmetic_lvalue env e1, (op, tok), e2) |> G.e
+          | None -> todo_expr (AST_bash_loc.arithmetic_expression_loc x)))
+  | A_ternary (cond, _, e1, _, e2) ->
+      G.Conditional (arithmetic env cond, arithmetic env e1, arithmetic env e2)
+      |> G.e
+  | A_paren (_, e, _) -> arithmetic env e
+  | A_array_cell (array, (open_, index, close)) ->
+      G.ArrayAccess
+        ( arithmetic_lvalue env (A_operand array),
+          (open_, arithmetic env index, close) )
+      |> G.e
+
+(* The target of an assignment or of '++'/'--', or an array: the variable
+   itself rather than its value, as in ordinary assignments *)
+and arithmetic_lvalue (env : env) (x : arithmetic_expression) : G.expr =
+  match x with
+  | A_operand (Word ((name, _) as var)) when is_variable_name name ->
+      G.N (mk_name var) |> G.e
+  | _ -> arithmetic env x
+
+(* In arithmetic, a bare name denotes a variable's value like '$x' does,
+   and integer literals are numbers. *)
+and arithmetic_operand (env : env) (e : expression) : G.expr =
+  match e with
+  | Word (name, tok) when is_variable_name name ->
+      let loc = (tok, tok) in
+      expansion env (Simple_expansion (loc, Simple_variable_name (name, tok)))
+  | Word ((s, _) as num) when is_portable_int_literal s ->
+      G.L (G.Int (Parsed_int.parse num)) |> G.e
+  | Expr_semgrep_deep_ellipsis (_loc, (open_, e, close)) ->
+      (* '<... x ...>' *)
+      G.DeepEllipsis (open_, arithmetic_operand env e, close) |> G.e
+  | _ -> expression env e
 
 and string_fragment (env : env) (frag : string_fragment) : G.expr =
   match frag with
@@ -516,6 +679,8 @@ and string_fragment (env : env) (frag : string_fragment) : G.expr =
       let loc = (open_, close) in
       let arg = blist env x |> block |> as_expr in
       call loc C.cmd_subst [ arg ]
+  | Arithmetic_expansion (open_, e, close) ->
+      call (open_, close) C.arith_expansion [ arithmetic env e ]
   | Frag_semgrep_metavar mv -> G.N (mk_name mv) |> G.e
   | Frag_semgrep_named_ellipsis x -> G.N (mk_name x) |> G.e
 
@@ -533,7 +698,7 @@ and expansion (_env : env) (x : expansion) : G.expr =
 
 and expand loc (var_expr : G.expr) : G.expr = call loc C.expand [ var_expr ]
 
-let program_with_env (env : env) x = blist (env : env) x |> List_.map as_stmt
+let program_with_env (env : env) x = blist (env : env) x |> List.map as_stmt
 
 (*****************************************************************************)
 (* Entry points *)

@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2022-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 ##############################################################################
 # Prelude
 ##############################################################################
@@ -13,8 +25,11 @@
 # TODO: The option is still kept because a few of our tests still rely on
 # Click-specific features (e.g., mocking)  that the regular
 # call-semgrep-in-a-subprocess does not provide yet.
+import io
 import os
+import platform
 import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import PIPE
@@ -31,27 +46,46 @@ from click.testing import CliRunner
 # Constants
 ##############################################################################
 
+IS_WINDOWS = platform.system() == "Windows"
+
 # Environment variable that trigger the use of osemgrep
-_USE_OSEMGREP = "PYTEST_USE_OSEMGREP" in os.environ
+USE_OSEMGREP = "PYTEST_USE_OSEMGREP" in os.environ
 
 # The --experimental is to force the use of osemgrep.
 _OSEMGREP_EXTRA_ARGS = ["--experimental"]
 
-# The --project-root option is used to prevent the .semgrepignore
-# at the root of the git project to be taken into account when testing,
-# which is a new behavior in osemgrep.
-_OSEMGREP_SCAN_EXTRA_ARGS = _OSEMGREP_EXTRA_ARGS + ["--project-root", "."]
+_SEMGREP_PATH = str(
+    (
+        Path(__file__).parent.parent
+        / "src"
+        / "semgrep"
+        / "console_scripts"
+        / "entrypoint.py"
+    ).absolute()
+)
 
-_SEMGREP_PATH = str((Path(__file__).parent.parent / "bin" / "semgrep").absolute())
+# On POSIX systems, the entrypoint script is executed with python via
+# the shebang `#!/usr/bin/env python` but shebangs don't work on Windows
+# via Popen, so we need to explicitly specify what program to run the
+# entrypoint script with.
+#
+# `sys.executable` gives an absolute path to the running python
+# interpreter. See
+# https://docs.python.org/3.14/library/subprocess.html#subprocess.Popen
+PYTHON_EXECUTABLE: List[str] = [sys.executable] if IS_WINDOWS else []
 
+# Deprecated. Use 'mk_semgrep_base_command("scan", args)'
+#
 # Exported constant, convenient to use in a list context.
 # This is not safe to use if you are going to append any subcommands after!
 # For instance, SEMGREP_BASE_SCAN_COMMAND + ["logout"] will fail with osemgrep,
 # because the subcommand must come first.
-SEMGREP_BASE_SCAN_COMMAND: List[str] = (
-    [_SEMGREP_PATH] + _OSEMGREP_SCAN_EXTRA_ARGS if _USE_OSEMGREP else [_SEMGREP_PATH]
+SEMGREP_BASE_SCAN_COMMAND: List[str] = (PYTHON_EXECUTABLE + [_SEMGREP_PATH]) + (
+    _OSEMGREP_EXTRA_ARGS if USE_OSEMGREP else []
 )
 
+# Deprecated. Use 'mk_semgrep_base_command("scan", args)'
+#
 SEMGREP_BASE_SCAN_COMMAND_STR: str = " ".join(SEMGREP_BASE_SCAN_COMMAND)
 
 ##############################################################################
@@ -60,8 +94,12 @@ SEMGREP_BASE_SCAN_COMMAND_STR: str = " ".join(SEMGREP_BASE_SCAN_COMMAND)
 
 
 def mk_semgrep_base_command(subcommand: str, args: List[str]):
-    args = _OSEMGREP_EXTRA_ARGS + args if _USE_OSEMGREP else args
-    return [_SEMGREP_PATH] + [subcommand] + args
+    # Insert osemgrep-specific arguments for the subcommands that support
+    # '--experimental':
+    if USE_OSEMGREP:
+        if subcommand in ["ci", "install-semgrep-pro", "lsp", "scan"]:
+            args = _OSEMGREP_EXTRA_ARGS + args
+    return PYTHON_EXECUTABLE + [_SEMGREP_PATH] + [subcommand] + args
 
 
 # TODO: this should be removed as we don't want to run tests with Click
@@ -89,11 +127,26 @@ class Result:
         return self.stdout
 
 
+def _update_and_del_dict(mapping: dict[str, str], updates: dict[str, str | None]):
+    """Updates `mapping` with `updates` but with deletion as well.
+
+    That is, for each key in `updates`, the corresponding value is inserted into `mapping` if non-None, but removed from
+    `mapping` if the value is None.
+
+    """
+
+    for key, val in updates.items():
+        if val is not None:
+            mapping[key] = val
+        elif key in mapping:
+            del mapping[key]
+
+
 # Run semgrep in an external process
 def fork_semgrep(
     subcommand: Optional[str],
     args: Optional[List[str]],
-    env: Optional[Dict[str, str]] = None,
+    env: Optional[Dict[str, str | None]] = None,
 ) -> Result:
     argv: List[str] = []
 
@@ -107,18 +160,31 @@ def fork_semgrep(
 
     # ugly: adding --project-root for --help would trigger the wrong help message
     if "-h" in args or "--help" in args:
-        argv = [_SEMGREP_PATH] + args
+        argv = PYTHON_EXECUTABLE + [_SEMGREP_PATH] + args
 
-    # env preparation
-    env_dict = {}
+    # Inherit from the process's environment, but override with the given variables
+    full_env = dict(os.environ)
     if env:
-        env_dict = env
-    full_env = dict(os.environ, **env_dict)
+        _update_and_del_dict(full_env, env)
 
     # let's fork and use a pipe to communicate with the external semgrep
+    print(f"[fork] semgrep command: {' '.join(argv)}", file=sys.stderr)
     proc = Popen(argv, stdout=PIPE, stderr=PIPE, env=full_env)
-    stdout, stderr = proc.communicate()
-    return Result(proc.returncode, stdout.decode("utf-8"), stderr.decode("utf-8"))
+
+    # When run on Windows, we expect the semgrep executable to output standard
+    # Windows line endings (CLRF), but if we left these line endings then the
+    # results we capture wouldn't match the outputs produced on Linux and MacOS.
+    # Running the output buffers thru `io.TextIOWrapper` with `newline=None`
+    # ensures we always normalize line endings to LF.
+    #
+    # See https://docs.python.org/3/library/io.html#io.TextIOWrapper
+    assert proc.stdout is not None  # Guaranteed by PIPE arg, but not known to mypy
+    assert proc.stderr is not None  # Guaranteed by PIPE arg, but not known to mypy
+    stdout = io.TextIOWrapper(proc.stdout, encoding="utf-8", newline=None).read()
+    stderr = io.TextIOWrapper(proc.stderr, encoding="utf-8", newline=None).read()
+    proc.wait()
+
+    return Result(proc.returncode, stdout, stderr)
 
 
 ##############################################################################
@@ -133,16 +199,21 @@ class SemgrepRunner:
     If a property is missing on the runner object, please add it here.
     """
 
-    def __init__(self, env=None, mix_stderr=True, use_click_runner=False):
-        if use_click_runner and _USE_OSEMGREP:
+    def __init__(
+        self,
+        env: dict[str, str | None] | None = None,
+        mix_stderr=True,
+        use_click_runner=False,
+    ):
+        if use_click_runner and USE_OSEMGREP:
             use_click_runner = False
             print("disabling Click_runner use because of PYTEST_USE_OSEMGREP")
         self._use_click_runner = use_click_runner
         self._output = ""
-        self._env = env
+        self._env = env if env is not None else {}
         self._mix_stderr = mix_stderr
         if self._use_click_runner:
-            self._runner = CliRunner(env=env, mix_stderr=mix_stderr)
+            self._runner = CliRunner(env=env)
 
     def invoke(
         self,
@@ -150,7 +221,7 @@ class SemgrepRunner:
         args: Union[str, Sequence[str]],
         subcommand: Optional[str] = None,
         input: Optional[str] = None,
-        env=None,
+        env: dict[str, str | None] | None = None,
     ) -> Result:
         # argv preparation
         arg_list: List[str] = []
@@ -163,9 +234,15 @@ class SemgrepRunner:
         if self._use_click_runner:
             if subcommand:
                 arg_list = [subcommand] + arg_list
+            print(
+                f"[click] semgrep command args: {' '.join(arg_list)}", file=sys.stderr
+            )
             result = self._runner.invoke(python_cli, arg_list, input=input, env=env)
-            stderr = result.stderr if not self._mix_stderr else ""
-            return Result(result.exit_code, result.stdout, stderr)
+            # `result.output` interleaves stdout and stderr; when not mixing,
+            # keep the two streams separate.
+            if self._mix_stderr:
+                return Result(result.exit_code, result.output, "")
+            return Result(result.exit_code, result.stdout, result.stderr)
         else:
             # TODO: do we need to support 'input' i.e. passing a string
             # to the program's stdin?

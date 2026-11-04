@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2020 r2c
+ * Copyright (C) 2020 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -12,7 +12,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
-open Common
 
 (*****************************************************************************)
 (* Prelude *)
@@ -43,6 +42,22 @@ type t = { start : charpos; end_ : charpos } [@@deriving show]
 exception NotValidRange of string
 
 (*****************************************************************************)
+(* Comparisons *)
+(*****************************************************************************)
+
+let equal r1 r2 =
+  let { start = a1; end_ = b1 } = r1 in
+  let { start = a2; end_ = b2 } = r2 in
+  Int.equal a1 a2 && Int.equal b1 b2
+
+let compare r1 r2 =
+  let { start = a1; end_ = b1 } = r1 in
+  let { start = a2; end_ = b2 } = r2 in
+  match Int.compare a1 a2 with
+  | 0 -> Int.compare b1 b2
+  | cmp -> cmp
+
+(*****************************************************************************)
 (* Set operations *)
 (*****************************************************************************)
 (* is r1 included or equal to r2 *)
@@ -61,69 +76,20 @@ let rec ( $<>$ ) r1 r2 =
 (* Converters *)
 (*****************************************************************************)
 
-(* ex: "line1-line2" *)
-(* This is useful for generating from git diffs,
-   because git diffs only include the lines *)
-let range_of_line_spec str file =
-  if str =~ "\\([0-9]+\\)-\\([0-9]+\\)" then (
-    let a, b = Common.matched2 str in
-    let line1 = s_to_i a in
-    let line2 = s_to_i b in
-    (* quite inefficient, but should be ok *)
-    let converters = Pos.full_converters_large file in
-    let start = ref (-1) in
-    let end_ = ref (-1) in
-    for i = 0 to UFile.filesize (Fpath.v file) do
-      let l, _ = converters.bytepos_to_linecol_fun i in
-      if l =|= line1 then start := i;
-      if l =|= line2 then end_ := i
-    done;
-    if !start <> -1 && !end_ <> -1 then { start = !start; end_ = !end_ }
-    else failwith (spf "could not find range %s in %s" str file))
-  else failwith (spf "wrong format for linecol range spec: %s" str)
-
-(* ex: "line1:col1-line2:col2" *)
-let range_of_linecol_spec str file =
-  if str =~ "\\([0-9]+\\):\\([0-9]+\\)-\\([0-9]+\\):\\([0-9]+\\)" then (
-    let a, b, c, d = Common.matched4 str in
-    let line1, col1 = (s_to_i a, s_to_i b) in
-    let line2, col2 = (s_to_i c, s_to_i d) in
-    (* quite inefficient, but should be ok *)
-    let converters = Pos.full_converters_large file in
-    let start = ref (-1) in
-    let end_ = ref (-1) in
-    for i = 0 to UFile.filesize (Fpath.v file) do
-      let l, c = converters.bytepos_to_linecol_fun i in
-      if (l, c) =*= (line1, col1) then start := i;
-      if (l, c) =*= (line2, col2) then end_ := i
-    done;
-    if !start <> -1 && !end_ <> -1 then { start = !start; end_ = !end_ }
-    else failwith (spf "could not find range %s in %s" str file))
-  else failwith (spf "wrong format for linecol range spec: %s" str)
-
 let range_of_token_locations (start_loc : Tok.location) (end_loc : Tok.location)
     =
   let start = start_loc.pos.bytepos in
   let end_ = end_loc.pos.bytepos + String.length end_loc.str - 1 in
   { start; end_ }
 
-let range_of_tokens xs =
-  try
-    let xs = List.filter Tok.is_origintok xs in
-    let mini, maxi = Tok_range.min_max_toks_by_pos xs in
-    let start = Tok.bytepos_of_tok mini in
-    let end_ =
-      Tok.bytepos_of_tok maxi + (String.length (Tok.content_of_tok maxi) - 1)
-    in
-    Some { start; end_ }
-  with
-  | Tok.NoTokenLocation _ -> None
-
-let hmemo = Hashtbl.create 101
+let rf_cache = SharedMemo.create ()
+let read_file_memoed = SharedMemo.make_with_state rf_cache UFile.read_file
 
 let () =
-  Common2.register_tmp_file_cleanup_hook (fun file -> Hashtbl.remove hmemo file)
+  (* nosemgrep: forbid-tmp *)
+  UTmp.register_temp_file_cleanup_hook (fun file ->
+      SharedMemo.remove rf_cache file)
 
 let content_at_range file r =
-  let str = Common.memoized hmemo file (fun () -> UCommon.read_file file) in
+  let str = read_file_memoed file in
   String.sub str r.start (r.end_ - r.start + 1)

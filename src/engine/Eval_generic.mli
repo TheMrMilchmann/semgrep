@@ -1,3 +1,16 @@
+(*
+   Copyright (c) 2020-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(* this is the (partially parsed/evaluated) content of a metavariable. *)
 type value =
   | Bool of bool
   | Int of int64
@@ -7,6 +20,7 @@ type value =
   | List of value list
   (* any AST, e.g., "x+1" *)
   | AST of string
+[@@deriving show]
 
 type env
 type code = AST_generic.expr
@@ -33,7 +47,8 @@ val eval_regexp_matches :
 (* This function will swallow exns and always return a bool.
  * This is the function called by Match_rules.ml
  *)
-val eval_bool : env -> code -> bool
+val eval_bool :
+  env -> code -> AST_generic.facts -> Metavariable.bindings -> bool
 
 (* for -test_eval *)
 val test_eval : string (* filename *) -> unit

@@ -8,6 +8,9 @@
   (name osemgrep_core)
   (wrapped false)
   (libraries
+    base
+    collections
+
     cmdliner
     uri
     uuidm
@@ -16,6 +19,7 @@
     commons
 
     semgrep_core
+    semgrep.core_scan
   )
  (preprocess
    (pps
@@ -33,7 +37,7 @@
 (rule
  (targets semgrep_metrics_j.ml semgrep_metrics_j.mli)
  (deps    semgrep_metrics.atd)
- (action  (run atdgen -j -j-std %{deps})))
+ (action  (run atdgen -j %{deps})))
 (rule
  (targets semgrep_metrics_t.ml semgrep_metrics_t.mli)
  (deps    semgrep_metrics.atd)

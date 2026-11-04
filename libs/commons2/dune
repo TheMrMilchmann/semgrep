@@ -1,9 +1,9 @@
 (library
  (public_name commons2)
  (wrapped false)
- (flags (:standard -open TCB))
  (libraries
-    TCB
+    base
+    collections
     commons
  )
  (preprocess

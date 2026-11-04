@@ -1,18 +1,30 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 open Common
 open Ast_cpp
 open Either_
 module Ast = Ast_cpp
 module Flag = Flag_parsing
-
-let logger = Logging.get_logger [ __MODULE__ ]
+module Log = Log_parser_cpp.Log
 
 (*****************************************************************************)
 (* Wrappers *)
 (*****************************************************************************)
 
-(* TODO: switch to use logger *)
 let warning s v =
-  if !Flag.verbose_parsing then Common2.warning ("PARSING: " ^ s) v else v
+  if Hook.get Flag.verbose_parsing then
+    Log.warn (fun m -> m "PARSING: %s; value = %s" s (Dumper.dump v));
+  v
 
 let error s tok = raise (Parsing_error.Other_error (s, tok))
 let fake s = Tok.fake_tok s
@@ -249,17 +261,17 @@ let fixOldCDecl ii (ty : type_) : type_ =
       | params ->
           params
           |> List.iter (fun param ->
-                 match param with
-                 | P { p_name = None; p_type = _ty2; _ } ->
-                     (* see above
+              match param with
+              | P { p_name = None; p_type = _ty2; _ } ->
+                  (* see above
                         let info = Lib_parsing_cpp.ii_of_any (Type ty2) +> Common.hd_exn "unexpected empty list" in
                         (* if majuscule, then certainly macro-parameter *)
                         pr2 (spf "SEMANTIC: parameter name omitted (but I continue) at %s"
                             (Parse_info.string_of_info info)
                         );
                      *)
-                     ()
-                 | _ -> ());
+                  ()
+              | _ -> ());
           ty)
   (* todo? can we declare prototype in the decl or structdef,
    *  ... => length <> but good kan meme
@@ -286,12 +298,13 @@ let fixFunc ((name, ty, _stoTODO), cp) : func_definition =
         | params ->
             params
             |> List.iter (function
-                 | P { p_name = Some _s; _ } -> ()
-                 (* failwith "internal errror: fixOldCDecl not good" *)
-                 | _ -> ()));
+              | P { p_name = Some _s; _ } -> ()
+              (* failwith "internal errror: fixOldCDecl not good" *)
+              | _ -> ()));
         ftyp
     | _ ->
-        logger#error "weird, not a functionType. Got %s" (Ast_cpp.show_type_ ty);
+        Log.warn (fun m ->
+            m "weird, not a functionType. Got %s" (Ast_cpp.show_type_ ty));
         (* this is possible if someone used a typedef to a function type, or
          * when tree-sitter-cpp did some error recovery and wrongly parsed
          * something as a function when it's really not

@@ -19,16 +19,24 @@ let wrap_type_expr lang str =
   | Lang.Java -> Some (spf "(%s x)" str)
   | Lang.Python -> Some (spf "x: %s" str)
   | Lang.Go -> Some (spf "var x %s" str)
-  | Lang.Kotlin -> Some (spf "x as %s" str)
+  | Lang.Kotlin ->
+      (* HACK: Due to a (likely) parser bug, we parse `x as javax.crypto.Cipher`
+        incorrectly as `(x as javax).crypto.Cipher`, but we can parse the type
+        correctly if we just add parentheses around the type:
+        `x as (javax.crypto.Cipher)`. *)
+      Some (spf "x as (%s)" str)
   | Lang.Scala -> Some (spf "x.asInstanceOf[%s]" str)
   (* for php, casting expression only allows primitive types so we use func def instead. *)
   | Lang.Php -> Some (spf "function foo(%s $x) {}" str)
   | Lang.Ts -> Some (spf "x as %s" str)
   | Lang.Csharp -> Some (spf "x as %s" str)
   | Lang.Rust -> Some (spf "x as %s" str)
+  | Lang.Move_on_sui -> Some (spf "(x : %s)" str)
+  | Lang.Move_on_aptos -> Some (spf "(x : %s)" str)
   | Lang.Julia -> Some (spf "x :: %s" str)
   | Lang.Cpp -> Some (spf "(%s) x" str)
   | Lang.C -> Some (spf "(%s) x" str)
+  | Lang.Dart -> Some (spf "x as %s" str)
   | _ -> None
 
 let unwrap_type_expr lang expr =
@@ -39,6 +47,8 @@ let unwrap_type_expr lang expr =
   | Lang.Go, G.S { s = G.DefStmt (_, VarDef { vtype = Some t; _ }); _ } ->
       Some t
   | Lang.Kotlin, G.E { e = G.Cast (t, _, _); _ } -> Some t
+  | Lang.Scala, G.E { e = G.Cast (t, _, _); _ } -> Some t
+  (* pfff fallback produces OtherExpr for asInstanceOf *)
   | Lang.Scala, G.E { e = OtherExpr (_, _ :: T t :: _); _ } -> Some t
   | ( Lang.Php,
       G.S
@@ -54,7 +64,10 @@ let unwrap_type_expr lang expr =
   | Lang.Ts, G.E { e = G.Cast (t, _, _); _ } -> Some t
   | Lang.Csharp, G.E { e = G.Cast (t, _, _); _ } -> Some t
   | Lang.Rust, G.E { e = G.Cast (t, _, _); _ } -> Some t
+  | Lang.Move_on_sui, G.E { e = G.Cast (t, _, _); _ } -> Some t
+  | Lang.Move_on_aptos, G.E { e = G.Cast (t, _, _); _ } -> Some t
   | Lang.Julia, G.E { e = G.Cast (t, _, _); _ } -> Some t
   | Lang.Cpp, G.E { e = G.Cast (t, _, _); _ } -> Some t
   | Lang.C, G.E { e = G.Cast (t, _, _); _ } -> Some t
+  | Lang.Dart, G.E { e = G.Cast (t, _, _); _ } -> Some t
   | _ -> None

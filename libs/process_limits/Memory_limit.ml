@@ -1,6 +1,6 @@
 (* Martin Jambon
  *
- * Copyright (C) 2021-2023 r2c
+ * Copyright (C) 2021-2023 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -13,9 +13,7 @@
  * license.txt for more details.
  *)
 open Common
-
-let logger = Logging.get_logger [ __MODULE__ ]
-
+module Log = Log_process_limits.Log
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
@@ -23,6 +21,11 @@ let logger = Logging.get_logger [ __MODULE__ ]
    Avoid segfaults when the process runs out of memory.
 
    See also https://gitlab.com/gadmm/memprof-limits/.
+
+  NOTE: Be careful when adding logging, tracing, or other kinds of
+  opentelmetry!!! This module uses a GC alarm to do its work, and our telemetry
+  library can and will deadlock if it is called from the gc alarm. See the
+  comment above the GC alarm function `limit_memory` for more info.
 *)
 
 (*****************************************************************************)
@@ -80,44 +83,55 @@ let run_with_memory_limit ?get_context
     (* If there is a memory limit, and we reach 80% of that limit, then we
      * also warn. Whatever happens first. *)
     let mem_limit_warning = int_of_float (float_of_int mem_limit *. 0.8) in
-    if mem_limit_mb =|= 0 || heap_warning_mb < mem_limit_warning then
-      heap_warning_mb * mb
+    if heap_warning_mb < mem_limit_warning then heap_warning_mb * mb
     else mem_limit_warning
   in
   let heap_warning = ref heap_warning_start in
+  (* NOTE: DO NOT TRACE LIMIT MEMORY!!!
+     NOTE: DO NOT LOG ANYTHING HERE WITHOUT APPLYING THE NO TELEMETRY TAG
+     SET!!!
+     NOTE: DO NOT DO ANY SORT OF OPENTELEMETRY METRICS HERE!!
+     Doing ANY sort of telemetry within a gc alarm can cause deadlocks!!! the no
+     telemetry tag set will disable telemetry for logs and so they will be
+     reported to the user, just not to any sort of telemetry backend.
+  *)
   let limit_memory () =
     let stat = Gc.quick_stat () in
     let heap_bytes = stat.heap_words * (Sys.word_size / 8) in
     let stack_bytes = stat.stack_size * (Sys.word_size / 8) in
     let mem_bytes = heap_bytes + stack_bytes in
     if mem_limit > 0 && mem_bytes > mem_limit then (
-      logger#info
-        "%sexceeded heap+stack memory limit: %d bytes (stack=%d, heap=%d)"
-        (context ()) mem_bytes stack_bytes heap_bytes;
+      Logs.err (fun m ->
+          m ~tags:Logging.no_telemetry_tag_set
+            "%sexceeded heap+stack memory limit: %d bytes (stack=%d, heap=%d)"
+            (context ()) mem_bytes stack_bytes heap_bytes);
       raise (ExceededMemoryLimit "Exceeded memory limit"))
     else if !heap_warning > 0 && heap_bytes > !heap_warning then (
-      logger#warning
-        "%slarge heap size: %d MiB (memory limit is %d MiB). If a crash \
-         follows, you could suspect OOM."
-        (context ()) (heap_bytes / mb) mem_limit_mb;
+      Logs.warn (fun m ->
+          m ~tags:Logging.no_telemetry_tag_set
+            "%slarge heap size: %d MiB (memory limit is %d MiB). If a crash \
+             follows, you could suspect OOM."
+            (context ()) (heap_bytes / mb) mem_limit_mb);
       heap_warning := max (2 * !heap_warning) !heap_warning)
     else if
       stack_warning > 0
       && stack_bytes > stack_warning
       && not !stack_already_warned
     then (
-      logger#warning
-        "%slarge stack size: %d bytes. If a crash follows, you should suspect \
-         a stack overflow. Make sure the maximum stack size is set to \
-         'unlimited' or to a value greater than %d bytes so as to obtain an \
-         exception rather than a segfault."
-        (context ()) stack_bytes mem_limit;
+      Logs.warn (fun m ->
+          m ~tags:Logging.no_telemetry_tag_set
+            "%slarge stack size: %d bytes. If a crash follows, you should \
+             suspect a stack overflow. Make sure the maximum stack size is set \
+             to 'unlimited' or to a value greater than %d bytes so as to \
+             obtain an exception rather than a segfault."
+            (context ()) stack_bytes mem_limit);
       stack_already_warned := true)
   in
   let alarm = Gc.create_alarm limit_memory in
-  try Common.protect f ~finally:(fun () -> Gc.delete_alarm alarm) with
-  | Out_of_memory as exn ->
-      (*
+  let res =
+    try Common.protect f ~finally:(fun () -> Gc.delete_alarm alarm) with
+    | (Out_of_memory | ExceededMemoryLimit _) as exn ->
+        (*
          Is it bad to collect a full stack backtrace when we're out of memory?
          Fun.protect does it systematically so we'll assume it's fine.
 
@@ -126,7 +140,9 @@ let run_with_memory_limit ?get_context
            https://github.com/ocaml/ocaml/blob/357b42accc160c699219575ab8b952be9594e1d9/stdlib/fun.ml
          - latest: https://github.com/ocaml/ocaml/blob/trunk/stdlib/fun.ml
       *)
-      let e = Exception.catch exn in
-      (* Try to free up some space. Expensive operation. *)
-      Gc.compact ();
-      Exception.reraise e
+        let e = Exception.catch exn in
+        (* Try to free up some space. Expensive operation. *)
+        Gc.compact ();
+        Exception.reraise e
+  in
+  res

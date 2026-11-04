@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2023-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    'semgrep login' command-line parsing.
 *)
 
@@ -12,8 +24,6 @@ type conf = {
 }
 [@@deriving show]
 
-val login_cmdline_info : Cmdliner.Cmd.info
-
 (*
    Usage: parse_argv cmd_info [| "semgrep-login"; <args> |]
 
@@ -22,4 +32,4 @@ val login_cmdline_info : Cmdliner.Cmd.info
    This function may raise an exn in case of an error parsing argv
    but this should be caught by CLI.safe_run.
 *)
-val parse_argv : Cmdliner.Cmd.info -> string array -> conf
+val parse_argv : string array -> conf

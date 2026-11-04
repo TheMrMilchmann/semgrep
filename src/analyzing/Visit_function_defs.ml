@@ -24,24 +24,23 @@ class ['self] visitor =
       match def_kind with
       | G.FuncDef fdef ->
           f (Some ent) fdef;
-          (* go into nested functions
-             but do NOT revisit the function definition again
-             with `kfunction_definition` below! *)
+          (* Go into nested functions
+             but do NOT revisit the function definition again! *)
           let body = H.funcbody_to_stmt fdef.G.fbody in
           self#visit_stmt f body
       | __else__ -> super#visit_definition f def
 
-    method! visit_function_definition f def =
-      f None def;
+    method! visit_function_definition f fdef =
+      f None fdef;
       (* go into nested functions *)
-      super#visit_function_definition f def
+      super#visit_function_definition f fdef
   end
 
-let visitor_instance = lazy (new visitor)
+let visitor_instance = lazy_safe (new visitor)
 
 (* Visit all function definitions in an AST. *)
 let visit (f : G.entity option -> G.function_definition -> unit)
     (ast : G.program) : unit =
-  let (lazy v) = visitor_instance in
+  let v = Lazy_safe.force visitor_instance in
   (* Check each function definition. *)
   v#visit_program f ast

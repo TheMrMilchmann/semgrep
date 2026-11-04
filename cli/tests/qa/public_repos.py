@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2022-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 from typing import NamedTuple
 from typing import Optional
 
@@ -23,7 +35,8 @@ class Repo(NamedTuple):
 
 
 REPOS = [
-    Repo("https://github.com/apache/airflow"),
+    # FIXME: Syntax errors in typescript. I made a linear task.
+    # Repo("https://github.com/apache/airflow"),
     Repo("https://github.com/coinbase/bifrost"),
     Repo("https://github.com/coinbase/bip38"),
     Repo("https://github.com/coinbase/btcexport"),
@@ -42,10 +55,7 @@ REPOS = [
     Repo("https://github.com/coinbase/fenrir"),
     Repo("https://github.com/coinbase/node-process-lock"),
     Repo("https://github.com/coinbase/odin"),
-    Repo("https://github.com/coinbase/protoc-gen-rbi"),
     Repo("https://github.com/coinbase/pwnbot"),
-    Repo("https://github.com/coinbase/rosetta-cli"),
-    Repo("https://github.com/coinbase/rosetta-sdk-go"),
     Repo("https://github.com/coinbase/self-service-iam"),
     Repo("https://github.com/coinbase/solidity-workshop"),
     Repo("https://github.com/coinbase/step"),
@@ -67,7 +77,6 @@ REPOS = [
     Repo("https://github.com/dropbox/dropbox-sdk-python"),
     Repo("https://github.com/dropbox/dropbox_hook"),
     Repo("https://github.com/dropbox/emmer"),
-    Repo("https://github.com/dropbox/firebase-dropbox-oauth"),
     Repo("https://github.com/dropbox/git-rbr"),
     Repo("https://github.com/dropbox/PyHive"),
     Repo("https://github.com/dropbox/goebpf"),
@@ -113,7 +122,7 @@ REPOS = [
     Repo("https://github.com/preset-io/elasticsearch-dbapi"),
     Repo("https://github.com/apache/libcloud"),
     Repo("https://github.com/keybase/pykeybasebot"),
-    Repo("https://gitbox.apache.org/repos/asf/cassandra"),
+    Repo("https://github.com/apache/cassandra"),
     Repo("https://github.com/keybase/python-triplesec"),
     Repo("https://github.com/psycopg/psycopg2"),
     Repo("https://github.com/preset-io/flask-jwt-extended"),

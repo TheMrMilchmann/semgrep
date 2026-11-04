@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    'semgrep show' command-line parsing.
 *)
 
@@ -9,6 +21,7 @@
    new 'semgrep show supported-languages'
 *)
 type conf = {
+  common : CLI_common.conf;
   (* mix of --dump-ast/--dump-rule/... *)
   show_kind : show_kind;
   json : bool;
@@ -19,13 +32,33 @@ and show_kind =
   | SupportedLanguages
   | Identity
   | Deployment
+  | ProjectRoot of { scan_root : Fpath.t }
+  | Resources
   (* dumpers *)
   | DumpPattern of string * Lang.t
+  | DumpCST of Fpath.t * Lang.t
   | DumpAST of Fpath.t * Lang.t
   | DumpConfig of Rules_config.config_string
-  | DumpRuleV2 of Fpath.t
+  | DumpTargets of
+      Scanning_root.t * Find_targets.conf * Rules_config.config_string option
   | DumpEnginePath of bool (* pro = true *)
   | DumpCommandForCore
+  | FilePrefilterOfRules of Fpath.t
+  (* pro-only commands *)
+  | Debug of debug_settings  (** Open an interactive debugging view. *)
+  | DumpLockfile of Fpath.t (* lockfile *) * Fpath.t option (* manifest *)
+  | ProjectPrefilterOfRules of Fpath.t
+
+and debug_settings = {
+  output_dir : Fpath.t;
+      (** Directory to save the output to. If not specified on command line,
+          defaults to a temporary directory. *)
+  targeting_conf : Find_targets.conf;
+      (** Configuration for finding target files to debug. Built from the root
+          argument with default settings. *)
+  rules_source : Rules_source.t;
+      (** Configuration for rules to use when debugging *)
+}
 [@@deriving show]
 
 (*

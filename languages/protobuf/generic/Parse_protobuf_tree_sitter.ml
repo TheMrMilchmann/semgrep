@@ -12,6 +12,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
+open Fpath_.Operators
 module CST = Tree_sitter_proto.CST
 module H = Parse_tree_sitter_helpers
 module G = AST_generic
@@ -682,20 +683,19 @@ let map_source_file (env : env) ((v1, v2) : CST.source_file) : G.raw_tree =
 (*****************************************************************************)
 let parse file =
   H.wrap_parser
-    (fun () -> Tree_sitter_proto.Parse.file file)
-    (fun cst ->
+    (fun () -> Tree_sitter_proto.Parse.file !!file)
+    (fun cst _extras ->
       let env = { H.file; conv = H.line_col_to_pos file; extra = () } in
       let raw = map_source_file env cst in
-      let e = G.RawExpr raw |> G.e in
-      let st = G.exprstmt e in
+      let st = G.stmt_of_raw raw in
       [ st ])
 
 (* todo: special mode to convert Ellipsis in the right construct! *)
 let parse_pattern str =
   H.wrap_parser
     (fun () -> Tree_sitter_proto.Parse.string str)
-    (fun cst ->
-      let file = "<pattern>" in
-      let env = { H.file; conv = Hashtbl.create 0; extra = () } in
+    (fun cst _extras ->
+      let file = Fpath.v "<pattern>" in
+      let env = { H.file; conv = H.line_col_to_pos_pattern str; extra = () } in
       let xs = map_source_file env cst in
       G.Raw xs)

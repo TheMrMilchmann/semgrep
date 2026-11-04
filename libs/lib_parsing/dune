@@ -3,8 +3,12 @@
  (name lib_parsing)
  (wrapped false)
  (libraries
+   base
+   collections
    fpath
    sexplib
+   paths
+   git_wrapper
 
    commons
    commons2

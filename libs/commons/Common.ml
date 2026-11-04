@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 1998-2023 Yoann Padioleau
+ * Copyright (C) 1998-2024 Yoann Padioleau
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -12,8 +12,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * license.txt for more details.
  *)
-
-let logger = Logging.get_logger [ __MODULE__ ]
+module Log = Log_commons.Log
 
 (*###########################################################################*)
 (* Prelude *)
@@ -22,17 +21,9 @@ let logger = Logging.get_logger [ __MODULE__ ]
 (* if set, certain functions like unwind_protect will not
  * do a try and finalize and instead just call the function, which
  * helps in ocamldebug and also in getting better backtraces.
- * This is also useful to set in a js_of_ocaml (jsoo) context to
- * again get better backtraces.
  *)
+(* nosemgrep: no-ref-declarations-at-top-scope *)
 let debugger = ref false
-
-(* You should set this to true when you run code compiled by js_of_ocaml
- * so some functions can change their implementation and rely
- * less on non-portable API like Unix which does not work well under
- * node or in the browser.
- *)
-let jsoo = ref false
 
 (*****************************************************************************)
 (* Circular dependencies *)
@@ -64,23 +55,18 @@ let protect ~finally work =
       (* Just re-raise whatever exception was raised during a 'finally',
        * drop 'Finally_raised'.
        *)
-      logger#error "protect: %s" (exn |> Exception.catch |> Exception.to_string);
+      Log.err (fun m ->
+          m "protect: %s" (exn |> Exception.catch |> Exception.to_string));
       Exception.catch_and_reraise exn1
 
 (*****************************************************************************)
 (* Equality *)
 (*****************************************************************************)
-let ( =|= ) : int -> int -> bool = ( = )
-let ( =$= ) : char -> char -> bool = ( = )
-let ( =:= ) : bool -> bool -> bool = ( = )
 
-(* dangerous, do not use, see the comment in Common.mli *)
-let ( =*= ) = ( = )
+include Eq.Operators
 
-(* To forbid people to use the polymorphic '='.
- * See https://blog.janestreet.com/the-perils-of-polymorphic-compare/
- *)
-let ( = ) = String.equal
+let phys_equal = Eq.phys_equal
+let phys_not_equal = Eq.phys_not_equal
 
 (* Used to give choice whether id_info fields should be checked in semgrep *)
 let equal_ref_option equal_f a b =
@@ -94,73 +80,12 @@ let equal_ref_option equal_f a b =
 (*****************************************************************************)
 (* Disable physical equality/inequality operators *)
 (*****************************************************************************)
-
-let phys_equal = ( == )
-let phys_not_equal = ( != )
-
-type hidden_by_your_nanny = unit
-
-let ( == ) : hidden_by_your_nanny = ()
-let ( != ) : hidden_by_your_nanny = ()
+(* now in Eq.ml *)
 
 (*****************************************************************************)
 (* Comparison *)
 (*****************************************************************************)
-
-type order = Less | Equal | Greater
-
-(* We use this to be able to factorize our code for binary search, by
-   instantiating our code against different kinds of containers and
-   element types.
-   In particular, this is an improvement over functorization, because the
-   type of Bigarray.Array1.t is actually triply-polymorphic. By making the
-   container type itself unspecified, we are able to abstract over even
-   multiply-polymorphic containers.
-*)
-type ('elt, 'container) binary_searchable = {
-  length : 'container -> int;
-  get : 'container -> int -> 'elt;
-}
-
-let create_binary_search (searchable : ('elt, 'container) binary_searchable) =
-  let binary_search ~f arr =
-    let arr_lo = 0 in
-    let arr_hi = searchable.length arr in
-
-    let rec aux lo hi =
-      if Int.equal lo hi then Error lo
-      else
-        let mid = (lo + hi) / 2 in
-        match f mid (searchable.get arr mid) with
-        | Equal -> Ok (mid, searchable.get arr mid)
-        | Less -> aux lo mid
-        | Greater -> aux (mid + 1) hi
-    in
-    aux arr_lo arr_hi
-  in
-  binary_search
-
-let arr_searchable = { length = Array.length; get = Array.get }
-
-let bigarr1_searchable =
-  { length = Bigarray.Array1.dim; get = Bigarray.Array1.get }
-
-let binary_search_arr ~f x = create_binary_search arr_searchable ~f x
-let binary_search_bigarr1 ~f x = create_binary_search bigarr1_searchable ~f x
-
-let to_comparison f x y =
-  let res = f x y in
-  if res < 0 then Less else if res > 0 then Greater else Equal
-
-let cmp target _i x = to_comparison Int.compare target x
-let%test _ = binary_search_arr ~f:(cmp 1) [| 1; 2; 4; 5 |] =*= Ok (0, 1)
-let%test _ = binary_search_arr ~f:(cmp 2) [| 1; 2; 4; 5 |] =*= Ok (1, 2)
-let%test _ = binary_search_arr ~f:(cmp 5) [| 1; 2; 4; 5 |] =*= Ok (3, 5)
-
-(* out of bounds or not in the array returns the position it should be inserted at *)
-let%test _ = binary_search_arr ~f:(cmp 6) [| 1; 2; 4; 5 |] =*= Error 4
-let%test _ = binary_search_arr ~f:(cmp 3) [| 1; 2; 4; 5 |] =*= Error 2
-let%test _ = binary_search_arr ~f:(cmp 0) [| 1; 2; 4; 5 |] =*= Error 0
+(* now in Ord.ml *)
 
 (*****************************************************************************)
 (* Debugging/logging *)
@@ -177,10 +102,17 @@ let before_return f v =
 
 (* Report the time a function takes. *)
 let with_time f =
-  let t1 = UUnix.gettimeofday () in
+  let t1 = Unix.gettimeofday () in
   let res = f () in
-  let t2 = UUnix.gettimeofday () in
+  let t2 = Unix.gettimeofday () in
   (res, t2 -. t1)
+
+let force_lazy_with_time lazy_x =
+  let had_to_force = not (Lazy_safe.is_val lazy_x) in
+  let x, time = with_time (fun () -> Lazy_safe.force lazy_x) in
+  let time = if had_to_force then Some time else None in
+  (x, time)
+[@@profiling]
 
 (*****************************************************************************)
 (* Exn *)
@@ -218,19 +150,20 @@ let save_excursion reference newv f =
   reference := newv;
   finalize f (fun _ -> reference := old)
 
+let save_excursion_atomic atom newv f =
+  let old = Atomic.get atom in
+  Atomic.set atom newv;
+  finalize f (fun _ -> Atomic.set atom old)
+
 let memoized ?(use_cache = true) h k f =
-  if not use_cache then f ()
-  else
-    try Hashtbl.find h k with
-    | Not_found ->
-        let v = f () in
-        Hashtbl.add h k v;
-        v
+  (* TODO(SAF-1940): experiment with weak refs *)
+  if not use_cache then f () else Base.Hashtbl.find_or_add h k ~default:f
 
 exception Todo
 exception Impossible
 exception Multi_found (* to be consistent with Not_found *)
-exception UnixExit of int
+exception UnixExit of (int * string)
+exception ErrorOnFile of string * Fpath.t
 
 let exn_to_s exn = Printexc.to_string exn
 
@@ -263,7 +196,7 @@ let const x _y = x
 let do_nothing () = ()
 let rec applyn n f o = if n =|= 0 then o else applyn (n - 1) f (f o)
 
-(* I think Brandon added that, not sure where it comes from *)
+(* I think Brandon or Robur added that, not sure where it comes from *)
 let on g f x y = g (f x) (f y)
 
 (*****************************************************************************)
@@ -283,7 +216,7 @@ let on g f x y = g (f x) (f y)
 (*****************************************************************************)
 (* Test *)
 (*****************************************************************************)
-(* See Alcotest_ext. and Testutil_* modules *)
+(* See Testo. and Testutil_* modules *)
 
 (*###########################################################################*)
 (* Basic types *)
@@ -325,6 +258,19 @@ let ( ||| ) a b =
   | Some x -> x
   | None -> b
 
+let combine_opt f opt_a opt_b =
+  match (opt_a, opt_b) with
+  | None, None -> None
+  | Some x, None
+  | None, Some x ->
+      Some x
+  | Some a, Some b -> Some (f a b)
+
+(*****************************************************************************)
+(* Result *)
+(*****************************************************************************)
+let ( let/ ) = Result.bind
+
 (*****************************************************************************)
 (* Either *)
 (*****************************************************************************)
@@ -355,17 +301,33 @@ let matched7 s =
     matched 6 s,
     matched 7 s )
 
-let _memo_compiled_regexp = Hashtbl.create 101
+let _memo_compiled_regexp = Base.Hashtbl.Poly.create ~size:101 ()
 
-let candidate_match_func s re =
-  (* old: Str.string_match (Str.regexp re) s 0 *)
+(* Ideally this would be a use of a [SharedMemo].  However, TSAN reports possibly-
+ * spurious data races within `strstubs.c` when regexps are shared between threads.
+ * Therefore, we are conservative here and make our backing hashtable per-domain. *)
+let _memo_compiled_regexp =
+  Domain.DLS.new_key (fun () -> Base.Hashtbl.Poly.create ~size:101 ())
+
+let match_func s re =
   let compile_re =
-    memoized _memo_compiled_regexp re (fun () -> Str.regexp re)
+    memoized (Domain.DLS.get _memo_compiled_regexp) re (fun () -> Str.regexp re)
   in
   Str.string_match compile_re s 0
 
-let match_func s re = candidate_match_func s re
 let ( =~ ) s re = match_func s re
+
+let ( =/~ ) (p : Fpath.t) re =
+  let s =
+    if Sys.win32 then
+      (* Replace windows path separaters with '/' for consistent regex matching.
+         E.g., a path `Fpath.v "a\b\c"` is converted to the string '"a/b/c"' so
+         it can be matched against a regex pattern like `.*/b/.*`, just as would
+         a unix path. *)
+      Fpath.segs p |> String.concat "/"
+    else Fpath.to_string p
+  in
+  match_func s re
 
 (*****************************************************************************)
 (* Strings *)
@@ -437,8 +399,8 @@ let s_to_i = int_of_string
 *)
 let input_text_line ic =
   let s = input_line ic in
-  let len = String.length s in
-  if len > 0 && s.[len - 1] =$= '\r' then String.sub s 0 (len - 1) else s
+  String_.trim_cr s
+
 (*###########################################################################*)
 (* Containers *)
 (*###########################################################################*)
@@ -479,14 +441,6 @@ let input_text_line ic =
 (*****************************************************************************)
 (* Tree *)
 (*****************************************************************************)
-
-(*****************************************************************************)
-(* Maps *)
-(*****************************************************************************)
-
-module SMap = Map.Make (String)
-
-type 'a smap = 'a SMap.t
 
 (*****************************************************************************)
 (* Graph *)

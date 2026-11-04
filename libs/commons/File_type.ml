@@ -15,6 +15,7 @@
  *)
 open Common
 open Fpath_.Operators
+module Log = Log_commons.Log
 
 (*****************************************************************************)
 (* Prelude *)
@@ -35,6 +36,7 @@ type file_type =
   | Media of media_type
   | Archive of string (* tgz, rpm, etc *)
   | Other of string
+[@@deriving yojson]
 
 (* programming languages *)
 and pl_type =
@@ -69,6 +71,7 @@ and pl_type =
   | Erlang
   | Go
   | Rust
+  | Move
   | Beta
   | Pascal
   | Haxe
@@ -78,20 +81,26 @@ and pl_type =
   | IDL of idl_type
   | MiscPL of string
   | Elixir
+  | Dart
+[@@deriving yojson]
 
 and config_type =
   | Makefile
-  | Dockerfile
+  | Dockerfile (* Dockerfile, Containerfile *)
   (* note: XML is in webpl_type below *)
   | Json
   | Jsonnet
+  | Properties (* Java config *)
+  | Ignore of string (* any sort of .gitignore *)
+  | RC of string (* Usually key value, .yarnrc, .npmrc etc. *)
   (* kinda pl_type *)
   | Yaml
   | Terraform
   | Sexp (* e.g., dune files *)
   | Toml
+[@@deriving yojson]
 
-and lisp_type = CommonLisp | Elisp | Scheme | Clojure
+and lisp_type = CommonLisp | Elisp | Scheme | Clojure [@@deriving yojson]
 
 and webpl_type =
   | Php of string (* php or phpt or script *)
@@ -101,14 +110,18 @@ and webpl_type =
   | Coffee
   | Vue
   | Css
+  | Scss
   | Html
   | Xml
   | Opa
   | Flash
   | Sql
+[@@deriving yojson]
 
-and idl_type = Thrift | ATD | Protobuf
+and idl_type = Thrift | ATD | Protobuf [@@deriving yojson]
+
 and media_type = Sound of string | Picture of string | Video of string
+[@@deriving yojson]
 
 (*****************************************************************************)
 (* Main entry point *)
@@ -118,7 +131,9 @@ and media_type = Sound of string | Picture of string | Video of string
  * filenames, so it has to be fast!
  *)
 let file_type_of_file file =
-  let _d, b, e = Filename_.dbe_of_filename_noext_ok !!file in
+  let _d, b, e = Filename_.dbe_of_filename !!file in
+  (* extensions are not case sensitive, at least on windows! *)
+  let e = String.lowercase_ascii e in
   match e with
   | "ml"
   | "mli"
@@ -177,6 +192,7 @@ let file_type_of_file file =
   | "mm" ->
       PL (ObjectiveC e)
   | "swift" -> PL Swift
+  | "dart" -> PL Dart
   | "java" -> PL Java
   | "kt" -> PL Kotlin
   | "cs" -> PL Csharp
@@ -237,6 +253,7 @@ let file_type_of_file file =
   | "hack" (* | "hh" *) ->
       (* ".hh" is also a popular choice for C++ header files *)
       PL (Web Hack)
+  | "scss" -> PL (Web Scss)
   | "css" -> PL (Web Css)
   (* "javascript" | "es" | ? *)
   | "js" -> PL (Web Js)
@@ -249,6 +266,7 @@ let file_type_of_file file =
   | "htm" ->
       PL (Web Html)
   | "xml" -> PL (Web Xml)
+  | "properties" -> Config Properties
   | "json" -> Config Json
   | "jsonnet"
   | "libsonnet" ->
@@ -256,10 +274,14 @@ let file_type_of_file file =
   | "yml"
   | "yaml" ->
       Config Yaml
-  | "tf" -> Config Terraform
+  | "tf"
+  | "tofu" ->
+      Config Terraform
   | "toml" -> Config Toml
   (* sometimes people use foo.Dockerfile *)
-  | "Dockerfile" -> Config Dockerfile
+  | "Dockerfile"
+  | "Containerfile" ->
+      Config Dockerfile
   | "sql" -> PL (Web Sql)
   | "sqlite" -> PL (Web Sql)
   (* apple stuff ? *)
@@ -270,9 +292,12 @@ let file_type_of_file file =
   | "sql3" -> PL (Web Sql)
   | "fbobj" -> PL (MiscPL "fbobj")
   | "png"
+  | "psd" (* photoshop *)
+  | "ai" (* adobe illustrator *)
   | "jpg"
-  | "JPG"
   | "gif"
+  | "svg"
+  | "tif"
   | "tiff" ->
       Media (Picture e)
   | "xcf"
@@ -284,11 +309,13 @@ let file_type_of_file file =
       Media (Picture e)
   | "ppm" -> Media (Picture e)
   | "tga" -> Media (Picture e)
+  | "woff2"
   | "ttf"
   | "font" ->
       Media (Picture e)
   | "wav" -> Media (Sound e)
   | "swf" -> Media (Picture e)
+  | "indd" (* indesign document *)
   | "ps"
   | "pdf" ->
       Doc e
@@ -364,6 +391,7 @@ let file_type_of_file file =
   | "clang2" ->
       Obj e
   (* was Archive *)
+  | "xlsx" -> Archive e (* excel spreadsheets. They're zip files! *)
   | "jar" -> Archive e
   | "bz2" -> Archive e
   | "gz" -> Archive e
@@ -372,23 +400,40 @@ let file_type_of_file file =
   | "exe" -> Binary e
   | "mk" -> Config Makefile
   | "rs" -> PL Rust
-  | "go" -> PL Go
+  | "move" -> PL Move
+  | "mod"
+  | "go" ->
+      PL Go
   | "lua" -> PL Lua
-  | "r"
-  | "R" ->
-      PL R
+  | "r" -> PL R
   | "ex" -> PL Elixir
   | _ when UFile.is_executable file -> Binary e
   | _ when b = "Makefile" || b = "mkfile" || b = "Imakefile" -> Config Makefile
-  | _ when b = "Dockerfile" -> Config Dockerfile
+  | _ when b = "Dockerfile" || b = "Containerfile" -> Config Dockerfile
   | _ when b = "dune" -> Config Sexp
   | _ when b = "README" -> Text "txt"
+  | _ when b = "CODEOWNERS" -> Text "txt"
+  | _ when b = "LICENSE" -> Text "txt"
   | _ when b = "TAGS" -> Binary e
   | _ when b = "TARGETS" -> Config Makefile
   | _ when b = ".depend" -> Obj "depend"
   | _ when b = ".emacs" -> PL (Lisp Elisp)
-  | _ when UFile.filesize file > 300_000 -> Obj e
-  | _ -> Other e
+  | _ when b = ".gitattributes" -> Text b
+  | _ when b = ".gitkeep" -> Text b
+  | _ when String.starts_with "." b && String.ends_with "ignore" b ->
+      Config (Ignore b)
+  | _ when String.starts_with "." b && String.ends_with "rc" b -> Config (RC b)
+  | _ -> (
+      match UFile.filesize file with
+      | Ok n when n > 300_000 -> Obj e
+      | Ok _ -> Other e
+      | Error (code, _func, info) ->
+          Log.warn (fun m ->
+              m
+                "file_type_of_file: unexpected error when reading %s: %s (code \
+                 %s)"
+                !!file info (Unix.error_message code));
+          Other e)
 
 (*****************************************************************************)
 (* Misc *)

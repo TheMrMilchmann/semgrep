@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2023 Semgrep Inc.
+ * Copyright (C) 2019-2024 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -15,18 +15,35 @@
 open Common
 open Fpath_.Operators
 open AST_generic
-module E = Core_error
 module J = JSON
+module E = Core_error
 module MV = Metavariable
-module RP = Core_result
-module PM = Pattern_match
-open Pattern_match
-module OutJ = Semgrep_output_v1_j
+module QProf = Core_quick_profiling
+module Out = Semgrep_output_v1_j
 module OutUtils = Semgrep_output_utils
+module Log = Log_reporting.Log
+
+(*****************************************************************************)
+(* Prelude *)
+(*****************************************************************************)
+(* semgrep-core -json output.
+ *
+ * See semgrep_output_v1.atd and its [core_output] for the JSON spec of this
+ * output. This "core" output is then read by pysemgrep in core_runner.py
+ * (or by osemgrep in Core_runner.ml) and transform in a "CLI" output
+ * (see [cli_output] in semgrep_output_v1.atd) which is then finally printed
+ * out to the user (see Cli_json_output.ml and Output.ml).
+ *)
 
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
+let max_truncated_length = 2048
+
+let truncate_for_output =
+  String_.truncate_with_message max_truncated_length
+    (* nosemgrep *)
+    (spf "%s... (truncated %d more characters)")
 
 let range_of_any_opt startp_of_match_range any =
   let empty_range = (startp_of_match_range, startp_of_match_range) in
@@ -81,6 +98,98 @@ let range_of_any_opt startp_of_match_range any =
       Some (startp, endp)
 
 (*****************************************************************************)
+(* Deduplication *)
+(*****************************************************************************)
+
+(* The actual type here isn't super important. We just feed it into Hashtbl
+ * which uses polymorphic hash and equals. It just needs to have a consistent
+ * representation and include anything relevant for deduplication. *)
+type key = string * string * int * int * string option * string option
+[@@deriving show]
+
+(* This is a port of the original pysemgrep cli_unique_key. This used to be in the CLI,
+   but has since been moved to core.
+*)
+let core_unique_key (c : Out.core_match) : key =
+  let name = Rule_ID.to_string c.check_id in
+  let path =
+    match c.extra.historical_info with
+    | Some { git_blob = Some sha; _ } -> ATD_string_wrap.Sha1.unwrap sha
+    | _ -> Fpath.to_string c.path
+  in
+  ( name,
+    path,
+    c.start.offset,
+    c.end_.offset,
+    c.extra.message,
+    (* TODO: Bring this back.
+       This is necessary so we don't deduplicate taint findings which
+       have different sources.
+
+       self.match.extra.dataflow_trace.to_json_string
+       if self.match.extra.dataflow_trace
+       else None,
+    *)
+    None
+    (* NOTE: previously, we considered self.match.extra.validation_state
+       here, but since in some cases (e.g., with `anywhere`) we generate
+       many matches in certain cases, we want to consider secrets
+       matches unique under the above set of things, but with a priority
+       associated with the validation state; i.e., a match with a
+       confirmed valid state should replace all matches equal under the
+       above key. We can't do that just by not considering validation
+       state since we would pick one arbitrarily, and if we added it
+       below then we would report _both_ valid and invalid (but we only
+       want to report valid, if a valid one is present and unique per
+       above fields). See also `should_report_instead`.
+    *)
+  )
+
+(*
+ # Sort results so as to guarantee the same results across different
+ # runs. Results may arrive in a different order due to parallelism
+ # (-j option).
+*)
+let dedup_and_sort (xs : Out.core_match list) : Out.core_match list =
+  (* Whether we prefer to report match x over match y.
+     This is currently only used for Secrets findings, which prefer a
+     finding with a confirmed validation status.
+  *)
+  let should_report_instead ((x : Out.core_match), (y : Out.core_match)) =
+    match (x, y) with
+    | { Out.extra = { validation_state = None; _ }; _ }, _ -> false
+    | _, { Out.extra = { validation_state = None; _ }; _ } -> true
+    | { Out.extra = { validation_state = Some `Confirmed_valid; _ }; _ }, _ -> (
+        match y with
+        | { Out.extra = { validation_state = Some `Confirmed_valid; _ }; _ } ->
+            false
+        | _ -> true)
+    | _ -> false
+  in
+  let seen = Base.Hashtbl.Poly.create ~size:101 () in
+  xs |> OutUtils.sort_core_matches
+  (* This deduplication logic used to live in Pysemgrep, which would assume that
+     the matches had already been sorted via sort_core_matches.
+     If you run through this deduplication logic without that assumption, you'll
+     keep undesirable matches, such as those with less metavariables.
+  *)
+  |> List.iter (fun x ->
+      let key = core_unique_key x in
+      match Base.Hashtbl.find seen key with
+      | None -> Base.Hashtbl.set seen ~key ~data:x
+      | Some y when should_report_instead (x, y) ->
+          Base.Hashtbl.set seen ~key ~data:x
+      | _ -> ());
+  (* Here, we must sort again, though.
+     This is because we yet again need to enforce that when Pysemgrep receives these
+     matches, that they are sorted via sort_core_matches.
+     If we don't do this, then stuff like test_baseline will start breaking.
+     So we end up sorting twice. Such is life.
+     LATER: Can optimize if necessary
+  *)
+  Base.Hashtbl.data seen |> OutUtils.sort_core_matches
+
+(*****************************************************************************)
 (* Converters *)
 (*****************************************************************************)
 
@@ -94,7 +203,7 @@ let metavar_string_of_any any =
   any |> AST_generic_helpers.ii_of_any
   |> List.filter Tok.is_origintok
   |> List.sort Tok.compare_pos
-  |> List_.map Tok.content_of_tok
+  |> List.map Tok.content_of_tok
   |> Core_text_output.join_with_space_if_needed
 
 let get_propagated_value default_start mvalue =
@@ -102,7 +211,7 @@ let get_propagated_value default_start mvalue =
     match range_of_any_opt default_start any with
     | Some (start, end_) ->
         Some
-          OutJ.
+          Out.
             {
               svalue_start = Some start;
               svalue_end = Some end_;
@@ -110,7 +219,7 @@ let get_propagated_value default_start mvalue =
             }
     | None ->
         Some
-          OutJ.
+          Out.
             {
               svalue_start = None;
               svalue_end = None;
@@ -120,13 +229,11 @@ let get_propagated_value default_start mvalue =
   match mvalue with
   | E { e = N (Id (_, id_info)); _ } -> (
       match !(id_info.id_svalue) with
-      | Some (Lit x) ->
+      | Lit x ->
           let any = E (L x |> e) in
           any_to_svalue_value any
-      | Some (Sym x) -> any_to_svalue_value (E x)
-      | Some (Cst _) -> None
-      | Some NotCst -> None
-      | None -> None)
+      | Sym x -> any_to_svalue_value (E x)
+      | _ -> None)
   | __else__ -> None
 
 let metavars startp_of_match_range (s, mval) =
@@ -136,10 +243,10 @@ let metavars startp_of_match_range (s, mval) =
       raise
         (Tok.NoTokenLocation
            (spf "NoTokenLocation with metavar %s, close location = %s" s
-              (OutJ.string_of_position startp_of_match_range)))
+              (Out.string_of_position startp_of_match_range)))
   | Some (startp, endp) ->
       ( s,
-        OutJ.
+        Out.
           {
             start = startp;
             end_ = endp;
@@ -154,33 +261,32 @@ let metavars startp_of_match_range (s, mval) =
  * directly from semgrep-core (to avoid some boilerplate code in
  * pysemgrep).
  *)
-let content_of_loc (loc : OutJ.location) : string =
+let content_of_loc (loc : Out.location) : string =
   OutUtils.content_of_file_at_range (loc.start, loc.end_) loc.path
 
-let token_to_intermediate_var token : OutJ.match_intermediate_var option =
-  let* location = OutUtils.tokens_to_single_loc [ token ] in
-  Some
-    (OutJ.{ location; content = content_of_loc location }
-      : OutJ.match_intermediate_var)
+let token_to_intermediate_var token : Out.match_intermediate_var =
+  let location = OutUtils.location_of_token_location token in
+  (Out.{ location; content = content_of_loc location }
+    : Out.match_intermediate_var)
 
 let tokens_to_intermediate_vars tokens =
-  List_.map_filter token_to_intermediate_var tokens
+  List.map token_to_intermediate_var tokens
 
-let rec taint_call_trace (trace : PM.taint_call_trace) :
-    OutJ.match_call_trace option =
+let rec taint_call_trace (trace : Taint_trace.call_trace) :
+    Out.match_call_trace option =
   match trace with
   | Toks toks ->
       let* loc = OutUtils.tokens_to_single_loc toks in
-      Some (OutJ.CliLoc (loc, content_of_loc loc))
+      Some (Out.CliLoc (loc, content_of_loc loc))
   | Call { call_trace; intermediate_vars; call_toks } ->
       let* loc = OutUtils.tokens_to_single_loc call_toks in
       let intermediate_vars = tokens_to_intermediate_vars intermediate_vars in
       let* call_trace = taint_call_trace call_trace in
       Some
-        (OutJ.CliCall ((loc, content_of_loc loc), intermediate_vars, call_trace))
+        (Out.CliCall ((loc, content_of_loc loc), intermediate_vars, call_trace))
 
-let taint_trace_to_dataflow_trace (traces : PM.taint_trace_item list) :
-    OutJ.match_dataflow_trace =
+let taint_trace_to_dataflow_trace (traces : Taint_trace.item list) :
+    Out.match_dataflow_trace option =
   (* Here, we ignore all but the first taint trace, for source or sink.
      This is because we added support for multiple sources/sinks in a single
      trace, but only internally to semgrep-core. Externally, our CLI dataflow
@@ -192,172 +298,389 @@ let taint_trace_to_dataflow_trace (traces : PM.taint_trace_item list) :
      findings. It's possible that this could change the dataflow trace of
      an existing finding though.
   *)
-  let source_call_trace, tokens, sink_call_trace =
-    match traces with
-    | [] -> raise Common.Impossible
-    | { Pattern_match.source_trace; tokens; sink_trace } :: _ ->
-        (source_trace, tokens, sink_trace)
-  in
-  OutJ.
-    {
-      taint_source = taint_call_trace source_call_trace;
-      intermediate_vars = Some (tokens_to_intermediate_vars tokens);
-      taint_sink = taint_call_trace sink_call_trace;
-    }
+  match traces with
+  | [] -> None
+  | { Taint_trace.source_trace; tokens; sink_trace } :: _ ->
+      Some
+        Out.
+          {
+            taint_source = taint_call_trace source_trace;
+            intermediate_vars = Some (tokens_to_intermediate_vars tokens);
+            taint_sink = taint_call_trace sink_trace;
+          }
 
-let unsafe_match_to_match
-    ({ pm = x; is_ignored; autofix_edit } : Core_result.processed_match) :
-    OutJ.core_match =
-  let min_loc, max_loc = x.range_loc in
-  let startp, endp = OutUtils.position_range min_loc max_loc in
-  let dataflow_trace =
-    Option.map
-      (function
-        | (lazy trace) -> taint_trace_to_dataflow_trace trace)
-      x.taint_trace
-  in
-  let metavars = x.env |> List_.map (metavars startp) in
-  (* message where the metavars have been interpolated *)
-  (* TODO(secrets): apply masking logic here *)
-  let message =
-    Metavar_replacement.interpolate_metavars x.rule_id.message
-      (Metavar_replacement.of_bindings x.env)
-  in
+let path_and_historical (path : Target.path) ~(min_loc : Tok.location)
+    ~(max_loc : Tok.location) : Fpath.t * Out.historical_info option =
+  match path.origin with
   (* We need to do this, because in Terraform, we may end up with a `file` which
      does not correspond to the actual location of the tokens. This `file` is
      erroneous, and should be replaced by the location of the code of the match,
      if possible. Not if it's fake, though.
      In other languages, this should hopefully not happen.
   *)
-  let file =
-    if
-      (!!(x.file) <> min_loc.pos.file || !!(x.file) <> max_loc.pos.file)
-      && min_loc.pos.file <> "FAKE TOKEN LOCATION"
-    then min_loc.pos.file
-    else !!(x.file)
+  | Unfilterable_target_file path
+  | Target_file { fpath = path; _ } ->
+      if
+        (path <> min_loc.pos.file || path <> max_loc.pos.file)
+        && not (Fpath_.is_fake_file min_loc.pos.file)
+      then (min_loc.pos.file, None)
+      else (path, None)
+  (* TODO(cooper): if we can have a uri or something more general than a
+   * file path here then we can stop doing this hack. *)
+  | Git_blob { sha; paths } -> (
+      match paths with
+      | [] -> (path.internal_path_to_content (* no better path *), None)
+      | (commit, path) :: _ ->
+          let git_commit = Git_wrapper.commit_digest commit in
+          let timestamp, offset = (Git_wrapper.commit_author commit).date in
+          let offset =
+            Option.value offset
+              ~default:{ sign = `Plus; hours = 0; minutes = 0 }
+          in
+          ( path.fpath,
+            Some
+              ({
+                 git_commit;
+                 git_blob = Some sha;
+                 git_commit_timestamp =
+                   Datetime_.of_unix_int_time timestamp offset.sign offset.hours
+                     offset.minutes;
+               }
+                : Out.historical_info) ))
+
+let sca_pattern_to_sca_pattern (pat : SCA_pattern.t) : Out.sca_pattern =
+  let SCA_pattern.{ ecosystem; package_name = package; version_constraints } =
+    pat
   in
+  let semver_range =
+    SCA_pattern.version_constraints_to_string version_constraints
+  in
+  Out.{ ecosystem; package; semver_range }
+
+let sca_to_sca (rule_metadata : Yojson.Basic.t option) (m : SCA_match.t) :
+    Out.sca_match =
+  let SCA_match.{ dep; pat; kind } = m in
+  let sca_rule_kind =
+    let* rule_metadata = rule_metadata in
+    let* sca_kind =
+      Yojson.Basic.Util.member "sca-kind" rule_metadata |> function
+      | `String s -> Some s
+      | _ -> None
+    in
+    Some sca_kind
+  in
+  let reachable =
+    match kind with
+    | DirectReachable
+    | TransitiveReachable _ ->
+        true
+    | LockfileOnlyMatch _
+    | TransitiveUnreachable _
+    | TransitiveUndetermined _ ->
+        false
+  in
+  let reachability_rule =
+    match sca_rule_kind with
+    | Some "reachable" -> true
+    | _ -> false
+  in
+  let dependency_match : Out.dependency_match =
+    let dependency_pattern : Out.sca_pattern = sca_pattern_to_sca_pattern pat in
+    let lockfile =
+      let loc, _ = dep.loc in
+      loc.pos.file
+    in
+    let found_dependency : Out.found_dependency =
+      Dependency.to_found_dependency ~lockfile_path:lockfile dep None
+    in
+    (* dependency paths are computed in pysemgrep (dependency_aware_rule.py),
+     * not in semgrep-core; left unset here. *)
+    Out.
+      {
+        dependency_pattern;
+        found_dependency;
+        lockfile;
+        dependency_paths = None;
+      }
+  in
+  let kind =
+    match (kind, sca_rule_kind) with
+    | LockfileOnlyMatch _, Some "reachable" ->
+        Out.TransitiveUndetermined { explanation = None }
+    | LockfileOnlyMatch _, _ ->
+        Out.LockfileOnlyMatch dependency_match.found_dependency.transitivity
+    | _else_ -> kind
+  in
+  Out.
+    {
+      reachability_rule;
+      (* coupling: dependency_aware_rule.py:SCA_FINDING_SCHEMA *)
+      sca_finding_schema = 20220913;
+      dependency_match;
+      reachable;
+      kind = Some kind;
+    }
+
+(* "unsafe" because can raise NoTokenLocation which is captured in
+ * the safe match_to_match version further below
+ *)
+let unsafe_match_to_match
+    ({ pm; is_ignored; autofix_edit } : Core_result.processed_match) :
+    Out.core_match =
+  let min_loc, max_loc = pm.range_loc in
+  let startp, endp = OutUtils.position_range min_loc max_loc in
+  let dataflow_trace =
+    Option.bind pm.taint_trace (function trace ->
+        let trace = Lazy_safe.force trace in
+        taint_trace_to_dataflow_trace trace)
+  in
+
+  let metavars = pm.env |> List.map (metavars startp) in
+  let metadata =
+    let* json = pm.rule_id.metadata in
+    let rule_metadata = JSON.to_yojson json in
+    match pm.metadata_override with
+    | Some metadata_override ->
+        Some (JSON.update rule_metadata (JSON.to_yojson metadata_override))
+    | None -> Some rule_metadata
+  in
+  (* message where the metavars have been interpolated *)
+  (* TODO(secrets): apply masking logic here *)
+  let message =
+    Metavar_replacement.interpolate_metavars ~fmt:truncate_for_output
+      pm.rule_id.message
+      (Metavar_replacement.of_bindings pm.env)
+  in
+  let path, historical_info = path_and_historical pm.path ~min_loc ~max_loc in
   {
-    check_id = x.rule_id.id;
+    check_id = pm.rule_id.id;
     (* inherited location *)
-    path = Fpath.v file;
+    path;
     start = startp;
     end_ = endp;
     (* end inherited location *)
     extra =
       {
         message = Some message;
-        severity = x.severity_override;
-        metadata = Option.map JSON.to_yojson x.metadata_override;
+        (* the severity_override (set by e.g. secrets validators) takes
+           precedence over the rule's own declared severity *)
+        severity =
+          (match pm.severity_override with
+          | Some _ as overridden -> overridden
+          | None -> pm.rule_id.severity);
+        metadata;
         metavars;
         dataflow_trace;
         fix =
           Option.map (fun edit -> edit.Textedit.replacement_text) autofix_edit;
         is_ignored;
-        (* TODO *)
-        engine_kind = x.engine_kind;
-        validation_state = Some x.validation_state;
+        engine_kind = pm.engine_of_match;
+        sca_match = Option.map (sca_to_sca metadata) pm.sca_match;
+        validation_state = Some pm.validation_state;
+        historical_info;
         extra_extra = None;
       };
   }
 
 let match_to_match (x : Core_result.processed_match) :
-    (OutJ.core_match, Core_error.t) Either.t =
+    (Out.core_match, Core_error.t) result =
   try
-    Left (unsafe_match_to_match x)
+    Ok
+      (Logs_.with_debug_trace ~__FUNCTION__ ~src:Log_reporting.src
+         ~pp_input:(fun _ ->
+           "target: "
+           ^ !!(x.pm.path.internal_path_to_content)
+           ^ "\nruleid: "
+           ^ (x.pm.rule_id.id |> Rule_ID.to_string))
+         (fun () -> unsafe_match_to_match x))
     (* raised by min_max_ii_by_pos in range_of_any when the AST of the
      * pattern in x.code or the metavar does not contain any token
      *)
   with
   | Tok.NoTokenLocation s ->
-      let loc = Tok.first_loc_of_file !!(x.pm.file) in
+      let loc = Loc.first_loc_of_file x.pm.path.internal_path_to_content in
       let s =
         spf "NoTokenLocation with pattern %s, %s" x.pm.rule_id.pattern_string s
       in
-      let err = E.mk_error (Some x.pm.rule_id.id) loc s OutJ.MatchingError in
-      Right err
+      let err =
+        E.mk_error ~rule_id:x.pm.rule_id.id ~msg:s ~loc Out.MatchingError
+      in
+      Error err
 [@@profiling]
 
 (* less: Semgrep_error_code should be defined fully Output_from_core.atd
  * so we would not need those conversions
  *)
-let error_to_error (err : Core_error.t) : OutJ.core_error =
-  let file = err.loc.pos.file in
-  let startp, endp = OutUtils.position_range err.loc err.loc in
+let error_to_error (err : Core_error.t) : Out.core_error =
+  let location =
+    let* loc = err.loc in
+    let file = loc.pos.file in
+    let startp, endp = OutUtils.position_range loc loc in
+    Some { Out.path = file; start = startp; end_ = endp }
+  in
   let rule_id = err.rule_id in
   let error_type = err.typ in
   let severity = E.severity_of_error err.typ in
-  let message = err.msg in
+  (* A lot of times if a file is minified/1 or 2 lines, we'll not be able to
+     parse it, and raise a syntax error, and that error message contains the
+     content of the line it can't parse. this results in essentially including
+     the whole file in the json blob which is not good for security or perf
+     reasons. We've seen upwards of 4mb of text in these messages. So let's
+     truncate it *)
+  let message = truncate_for_output err.msg in
   let details = err.details in
+  { error_type; rule_id; severity; location; message; details }
+
+let extra_to_extra (extra : Matching_explanation.extra) :
+    Out.matching_explanation_extra =
   {
-    error_type;
-    rule_id;
-    severity;
-    location = { path = Fpath.v file; start = startp; end_ = endp };
-    message;
-    details;
+    before_negation_matches =
+      extra.before_negation_matches
+      |> Option.map
+           (List.map (fun pm ->
+                unsafe_match_to_match (Core_result.mk_processed_match pm)));
+    before_filter_matches =
+      extra.before_filter_matches
+      |> Option.map
+           (List.map (fun pm ->
+                unsafe_match_to_match (Core_result.mk_processed_match pm)));
   }
 
 let rec explanation_to_explanation (exp : Matching_explanation.t) :
-    OutJ.matching_explanation =
-  let { Matching_explanation.op; matches; pos; children } = exp in
+    Out.matching_explanation =
+  let { Matching_explanation.op; matches; pos; children; extra } = exp in
   let tloc = Tok.unsafe_loc_of_tok pos in
   {
     op;
-    children = children |> List_.map explanation_to_explanation;
+    children = children |> List.map explanation_to_explanation;
     matches =
       matches
-      |> List_.map (fun pm ->
-             unsafe_match_to_match (Core_result.mk_processed_match pm));
+      |> List.map (fun pm ->
+          unsafe_match_to_match (Core_result.mk_processed_match pm));
     loc = OutUtils.location_of_token_location tloc;
+    extra = Option.map extra_to_extra extra;
   }
 
-let profiling_to_profiling (profiling_data : Core_profiling.t) : OutJ.profile =
+let quick_profiling_to_prefiltering (quick_profiling : QProf.t) :
+    Out.prefiltering_stats =
+  QProf.Prefiltering_stats.to_ratio_stats quick_profiling.prefiltering_stats
+
+let quick_profiling_to_parsing_time (quick_profiling : QProf.t) :
+    Out.parsing_time =
+  let parsing_stats = quick_profiling.parsing_stats in
+  let per_file_time, very_slow_stats, very_slow_files =
+    parsing_stats
+    |> QProf.Parsing_stats.to_output_v1 ~to_out_time:Summary_stats.to_file_time
+  in
+  {
+    total_time = parsing_stats.sum;
+    per_file_time;
+    very_slow_stats = Some very_slow_stats;
+    very_slow_files;
+  }
+
+let quick_profiling_to_scanning_time (quick_profiling : QProf.t) :
+    Out.scanning_time =
+  let scanning_stats = quick_profiling.scanning_stats in
+  let per_file_time, very_slow_stats, very_slow_files =
+    scanning_stats
+    |> QProf.Scanning_stats.to_output_v1 ~to_out_time:Summary_stats.to_file_time
+  in
+  {
+    total_time = scanning_stats.sum;
+    per_file_time;
+    very_slow_stats;
+    very_slow_files;
+  }
+
+let quick_profiling_to_matching_time (quick_profiling : QProf.t) :
+    Out.matching_time =
+  let matching_stats = quick_profiling.matching_stats in
+  let per_file_and_rule_time, very_slow_stats, very_slow_rules_on_files =
+    matching_stats
+    |> QProf.Matching_stats.to_output_v1
+         ~to_out_time:Summary_stats.to_file_rule_time
+  in
+  {
+    total_time = matching_stats.sum;
+    per_file_and_rule_time;
+    very_slow_stats;
+    very_slow_rules_on_files;
+  }
+
+let quick_profiling_to_tainting_time (quick_profiling : QProf.t) :
+    Out.tainting_time =
+  let tainting_stats = quick_profiling.tainting_stats in
+  let per_def_and_rule_time, very_slow_stats, very_slow_rules_on_defs =
+    tainting_stats
+    |> QProf.Tainting_stats.to_output_v1
+         ~to_out_time:Summary_stats.to_def_rule_time
+  in
+  {
+    total_time = tainting_stats.sum;
+    per_def_and_rule_time;
+    very_slow_stats;
+    very_slow_rules_on_defs;
+  }
+
+let profiling_to_profiling (opt_quick_profiling : QProf.t option)
+    ~fixpoint_timeouts (profiling_data : Core_profiling.t) : Out.profile =
   let rule_ids : Rule_ID.t list =
-    profiling_data.rules |> List_.map (fun (rule : Rule.t) -> fst rule.id)
+    profiling_data.rules ||| [] |> List.map (fun (rule : Rule.t) -> fst rule.id)
   in
   {
     targets =
       profiling_data.file_times
-      |> List_.map
-           (fun { Core_profiling.file = target; rule_times; run_time } ->
-             let (rule_id_to_rule_prof
-                   : (Rule_ID.t, Core_profiling.rule_profiling) Hashtbl.t) =
-               rule_times
-               |> List_.map (fun (rp : Core_profiling.rule_profiling) ->
-                      (rp.rule_id, rp))
-               |> Hashtbl_.hash_of_list
-             in
+      |> List.map (fun { Core_profiling.file = target; rule_times; run_time } ->
+          let (rule_id_to_rule_prof
+                : (Rule_ID.t, Core_profiling.rule_profiling) Base.Hashtbl.t) =
+            rule_times ||| []
+            |> List.map (fun (rp : Core_profiling.rule_profiling) ->
+                (rp.rule_id, rp))
+            |> Hashtbl_.Base.hash_of_list
+          in
 
-             OutJ.
-               {
-                 path = target;
-                 match_times =
-                   rule_ids
-                   |> List_.map (fun rule_id ->
-                          try
-                            let rprof : Core_profiling.rule_profiling =
-                              Hashtbl.find rule_id_to_rule_prof rule_id
-                            in
-                            rprof.match_time
-                          with
-                          | Not_found -> 0.);
-                 (* TODO: we could probably just aggregate in a single
-                  * float instead of returning those list of parse_time
-                  * which don't really make sense; we just parse once a file.
-                  *)
-                 parse_times =
-                   rule_ids
-                   |> List_.map (fun rule_id ->
-                          try
-                            let rprof : Core_profiling.rule_profiling =
-                              Hashtbl.find rule_id_to_rule_prof rule_id
-                            in
-                            rprof.parse_time
-                          with
-                          | Not_found -> 0.);
-                 num_bytes = UFile.filesize target;
-                 run_time;
-               });
+          Out.
+            {
+              path = target;
+              match_times =
+                rule_ids
+                |> List.map (fun rule_id ->
+                    try
+                      let rprof : Core_profiling.rule_profiling =
+                        Hashtbl_.Base.find rule_id_to_rule_prof rule_id
+                      in
+                      rprof.rule_match_time
+                    with
+                    | Not_found -> 0.);
+              (* TODO: we could probably just aggregate in a single
+               * float instead of returning those list of parse_time
+               * which don't really make sense; we just parse once a file.
+               *)
+              parse_times =
+                rule_ids
+                |> List.map (fun rule_id ->
+                    try
+                      let rprof : Core_profiling.rule_profiling =
+                        Hashtbl_.Base.find rule_id_to_rule_prof rule_id
+                      in
+                      rprof.rule_parse_time
+                    with
+                    | Not_found -> 0.);
+              (* We really have to give back a number here. It's likely to be
+                    quite rare that a filesize call fails at this point in time. *)
+              num_bytes =
+                (match UFile.filesize target with
+                | Ok n -> n
+                | Error (code, _func, info) ->
+                    Log.warn (fun m ->
+                        m
+                          "profiling_to_profiling: unexpected error when \
+                           reading %s: %s (code %s)"
+                          !!target info (Unix.error_message code));
+                    -1);
+              run_time;
+            });
     rules = rule_ids;
     rules_parse_time = profiling_data.rules_parse_time;
     max_memory_bytes = Some profiling_data.max_memory_bytes;
@@ -366,12 +689,38 @@ let profiling_to_profiling (profiling_data : Core_profiling.t) : OutJ.profile =
      *)
     total_bytes =
       profiling_data.file_times
-      |> List_.map (fun { Core_profiling.file = target; _ } ->
-             UFile.filesize target)
+      |> List.filter_map (fun { Core_profiling.file = target; _ } ->
+          match UFile.filesize target with
+          | Ok n -> Some n
+          | Error (code, _func, info) ->
+              Log.warn (fun m ->
+                  m
+                    "profiling_to_profiling: unexpected error when reading %s: \
+                     %s (code %s)"
+                    !!target info (Unix.error_message code));
+              None)
       |> Common2.sum_int;
     (* those are filled later in pysemgrep from the Profiler class *)
     profiling_times = [];
+    prefiltering =
+      opt_quick_profiling |> Option.map quick_profiling_to_prefiltering;
+    parsing_time =
+      opt_quick_profiling |> Option.map quick_profiling_to_parsing_time;
+    scanning_time =
+      opt_quick_profiling |> Option.map quick_profiling_to_scanning_time;
+    matching_time =
+      opt_quick_profiling |> Option.map quick_profiling_to_matching_time;
+    tainting_time =
+      opt_quick_profiling |> Option.map quick_profiling_to_tainting_time;
+    fixpoint_timeouts = Some fixpoint_timeouts;
   }
+
+let make_simple_profiling_entry (entry : Profiling.entry) : Out.profiling_entry
+    =
+  { name = entry.name; total_time = entry.total_time; count = entry.count }
+
+let export_simple_profiling_results () : Out.profiling_entry list =
+  Profiling.export () |> List.map make_simple_profiling_entry
 
 (* TODO: We used to return some stats, should we generalize
    that and return what is currently in parsing_data.py instead?
@@ -379,7 +728,7 @@ let profiling_to_profiling (profiling_data : Core_profiling.t) : OutJ.profile =
    set to List.length res.scanned
 
    old code:
-    module StrSet = Common2.StringSet
+    module StrSet = Common2.String_set
     let core_output_of_matches_and_errors render_fix nfiles res =
       ...
      let files_with_errors =
@@ -398,61 +747,56 @@ let profiling_to_profiling (profiling_data : Core_profiling.t) : OutJ.profile =
 (* Final semgrep-core output *)
 (*****************************************************************************)
 
-let core_output_of_matches_and_errors (res : Core_result.t) : OutJ.core_output =
+let core_output_of_matches_and_errors (res : Core_result.t) : Out.core_output =
   let matches, new_errs =
-    Either_.partition_either match_to_match res.processed_matches
+    Result_.partition match_to_match res.processed_matches
   in
-  let errs = !E.g_errors @ new_errs @ res.errors in
-  E.g_errors := [];
-  let skipped_targets, profiling =
-    match res.extra with
-    | Core_profiling.Debug { skipped_targets; profiling } ->
-        (Some skipped_targets, Some profiling)
-    | Core_profiling.Time { profiling } -> (None, Some profiling)
-    | Core_profiling.No_info -> (None, None)
-  in
+  let errs = new_errs @ res.errors in
+  let errors = errs |> List.map error_to_error in
+  let fixpoint_timeouts = res.fixpoint_timeouts |> List.map error_to_error in
   {
-    results = matches |> OutUtils.sort_core_matches;
-    errors = errs |> List_.map error_to_error;
+    results = matches |> dedup_and_sort;
+    errors;
     paths =
       {
-        skipped = skipped_targets;
-        (* TODO: those are set later in Cli_json_output.ml,
-         * but should we compute scanned here instead?
-         *)
-        scanned = [];
+        (* It seems that we have two separate paths, one for osemgrep
+            (Cli_json_output.ml) and another for pysemgrep here. We
+            should update this section to output the results
+            specifically for pysemgrep. *)
+        skipped = None;
+        scanned = res.scanned |> List.map Target.internal_path;
       };
     skipped_rules =
       res.skipped_rules
-      |> List_.map (fun ((kind, rule_id, tk) : Rule.invalid_rule_error) ->
-             let loc = Tok.unsafe_loc_of_tok tk in
-             OutJ.
-               {
-                 rule_id;
-                 details = Rule.string_of_invalid_rule_error_kind kind;
-                 position = OutUtils.position_of_token_location loc;
-               });
-    time = profiling |> Option.map profiling_to_profiling;
+      |> List.map (fun ((kind, rule_id, tk) : Rule_error.invalid_rule) ->
+          let loc = Tok.unsafe_loc_of_tok tk in
+          Out.
+            {
+              rule_id;
+              details = Rule_error.string_of_invalid_rule_kind kind;
+              position = OutUtils.position_of_token_location loc;
+            });
+    time =
+      res.profiling
+      |> Option.map
+           (profiling_to_profiling res.quick_profiling ~fixpoint_timeouts);
     explanations =
-      res.explanations |> Option.map (List_.map explanation_to_explanation);
+      res.explanations |> Option.map (List.map explanation_to_explanation);
     rules_by_engine = Some res.rules_by_engine;
     interfile_languages_used =
-      Some (List_.map (fun l -> Xlang.to_string l) res.interfile_languages_used);
+      Some
+        (List.map (fun l -> Analyzer.to_string l) res.interfile_languages_used);
     engine_requested = Some `OSS;
-    version = Some Version.version;
+    version = Version.version;
+    symbol_analysis = res.symbol_analysis;
+    subprojects = None;
+    mcp_scan_results = None;
+    profiling_results = export_simple_profiling_results ();
   }
 [@@profiling]
 
-(*****************************************************************************)
-(* Error management *)
-(*****************************************************************************)
+(******************************************************************************)
+(* Exposed for testing *)
+(******************************************************************************)
 
-(* this is used only in the testing code, to reuse the
- * Semgrep_error_code.compare_actual_to_expected
- *)
-let push_error loc (rule : Pattern_match.rule_id) =
-  E.push_error rule.id loc rule.message OutJ.SemgrepMatchFound
-
-let match_to_push_error x =
-  let min_loc, _max_loc = x.range_loc in
-  push_error min_loc x.rule_id
+let test_core_unique_key = core_unique_key

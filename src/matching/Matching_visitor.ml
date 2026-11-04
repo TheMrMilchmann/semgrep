@@ -1,6 +1,6 @@
 (* Nat Mote
  *
- * Copyright (C) 2023 r2c
+ * Copyright (C) 2023 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -87,7 +87,7 @@ class ['self] matching_visitor =
       (* As opposed to v_stmts, we don't call v_fields recursively for sublists
        * of xs. Indeed, in semgrep, fields are matched in any order so calling
        * the visitor and matcher on the entire list of fields should also work.
-       * *)
+       *)
       self#visit_list self#visit_field env xs
 
     method v_vardef_as_assign_expr env ventity =
@@ -150,27 +150,27 @@ class ['self] matching_visitor =
        * in Generic so we cannot match statement patterns against these
        * expressions. This equivalence enables that.
        *
-       * We need an equivalence here, and we also need support in Generic_vs_generic
+       * We need an equivalence here, and we also need support in Pattern_vs_code
        * in order to handle 2 different cases.
        *
        * The equivalence here will result in comparing
        *   return $X
        * against
        *   return expr
-       * in Generic_vs_generic.
+       * in Pattern_vs_code.
        *
-       * On the other hand, in Generic_vs_generic, we would like to match
+       * On the other hand, in Pattern_vs_code, we would like to match
        *   return $X
        * against
        *   expr_stmt
        * which can happen when return $X and expr_stmt is nested within
        * some context.
        *
-       * Alt: we could add more special cases in Generic_vs_generic to handle
+       * Alt: we could add more special cases in Pattern_vs_code to handle
        * things like FBExpr (which is not visited when matching the pattern
        ' `return`, because FBExpr is an expression, not a statement), but the
        * equivalence feels more natural here, and it allows us to keep
-       * the cases in Generic_vs_generic not too complicated.
+       * the cases in Pattern_vs_code not too complicated.
        *)
       if env.implicit_return && e.is_implicit_return then
         let ret = Return (fake "return", Some e, sc) |> s in
@@ -203,28 +203,27 @@ class ['self] matching_visitor =
           | Dict ->
               v2 |> Tok.unbracket
               |> List.iter (fun e ->
-                     match e.e with
-                     | Container
-                         ( Tuple,
-                           (tok, [ { e = L (String (_, id, _)); _ }; e ], _) )
-                       ->
-                         let t = Tok.fake_tok tok ":" in
-                         self#v_partial ~recurse:false env
-                           (PartialSingleField (id, t, e))
-                     | _ -> ())
+                  match e.e with
+                  | Container
+                      (Tuple, (tok, [ { e = L (String (_, id, _)); _ }; e ], _))
+                    ->
+                      let t = Tok.fake_tok tok ":" in
+                      self#v_partial ~recurse:false env
+                        (PartialSingleField (id, t, e))
+                  | _ -> ())
           (* for Go where we use List for composite literals.
            * TODO? generate Dict in go_to_generic.ml instead directly?
            *)
           | List ->
               v2 |> Tok.unbracket
               |> List.iter (fun e ->
-                     match e.e with
-                     | Container
-                         (Tuple, (tok, [ { e = N (Id (id, _)); _ }; e ], _)) ->
-                         let t = Tok.fake_tok tok ":" in
-                         self#v_partial ~recurse:false env
-                           (PartialSingleField (id, t, e))
-                     | _ -> ())
+                  match e.e with
+                  | Container (Tuple, (tok, [ { e = N (Id (id, _)); _ }; e ], _))
+                    ->
+                      let t = Tok.fake_tok tok ":" in
+                      self#v_partial ~recurse:false env
+                        (PartialSingleField (id, t, e))
+                  | _ -> ())
           | _ -> ());
           let _v1 = self#visit_container_operator env v1
           and _v2 =
